@@ -1,0 +1,548 @@
+# Pooled clustering + top markers + ASPC/stroma specificity ratio per gene
+#
+# What this script does (per group):
+# 1) Pool samples (prefix cell barcodes with sample_id__)
+# 2) Cluster pooled data (resolution search to get ~8 clusters)
+# 3) Output top 100 marker genes per cluster
+# 4) Compute per-gene "aspc_specific_ratio" using a USER-SPECIFIED target cluster
+#    - For NEPC groups: target is "ASPC" (Adipose stem/progenitor)
+#    - For Adeno groups: target is "stroma/fibroblast" cluster (still written as aspc_specific_ratio for convenience)
+#
+# Ratio definition (per gene):
+#   ratio = mean(expr in target cluster) / max(mean(expr in other clusters))
+# using pseudo-bulk means on the log-normalized "data" layer.
+#
+# Outputs (cfg$out_dir):
+# - <group>_cluster_counts.csv
+# - <group>_cluster_markers_top100.csv
+# - <group>_aspc_specific_ratio.csv              (gene-level ratios + tau)
+# - <group>_seurat.rds                           (optional)
+
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(data.table)
+  library(dplyr)
+  library(readr)
+  library(stringr)
+})
+
+if (!requireNamespace("Seurat", quietly = TRUE)) stop("Please install Seurat.")
+library(Seurat)
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+cfg <- list(
+  out_dir = "ratio_results",
+
+  # Seurat preprocessing / clustering
+  min_cells = 3,
+  min_features = 200,
+  nfeatures = 2000,
+  dims = 1:30,
+
+  # target number of clusters
+  target_k = 8,
+  resolution_grid = seq(0.1, 2.0, by = 0.1),
+
+  # marker calling
+  top_n_markers = 100,
+  only_pos = TRUE,
+  test_use = "wilcox",
+  min_pct = 0.10,
+  logfc_threshold = 0.25,
+
+  # outputs
+  write_seurat_rds = TRUE
+)
+
+dir.create(cfg$out_dir, showWarnings = FALSE, recursive = TRUE)
+msg <- function(...) cat("[INFO]", sprintf(...), "\n")
+warn_msg <- function(...) cat("[WARN]", sprintf(...), "\n")
+
+# -----------------------------
+# Helpers
+# -----------------------------
+sanitize_gene_names <- function(x) {
+  x <- as.character(x)
+  x <- str_trim(x)
+  x <- gsub("\uFEFF", "", x, fixed = TRUE)
+  x <- gsub("\r", "", x, fixed = TRUE)
+  x <- gsub("_", "-", x, fixed = FALSE)
+  x[x == "" | is.na(x)] <- "NA_FEATURE"
+  x
+}
+sanitize_cell_names <- function(x) {
+  x <- as.character(x)
+  x <- str_trim(x)
+  x <- gsub("\uFEFF", "", x, fixed = TRUE)
+  x <- gsub("\r", "", x, fixed = TRUE)
+  x[x == "" | is.na(x)] <- "NA_CELL"
+  x
+}
+collapse_duplicate_features <- function(mat) {
+  rn <- rownames(mat)
+  if (is.null(rn) || !any(duplicated(rn))) return(mat)
+  f <- factor(rn, levels = unique(rn))
+  G <- Matrix::sparse.model.matrix(~ 0 + f)
+  agg <- Matrix::t(G) %*% mat
+  rownames(agg) <- levels(f)
+  agg
+}
+prefix_cell_barcodes <- function(mat, sample_id) {
+  colnames(mat) <- paste0(sample_id, "__", colnames(mat))
+  mat
+}
+merge_by_union_genes <- function(mats) {
+  all_genes <- sort(unique(unlist(lapply(mats, rownames))))
+  mats2 <- lapply(mats, function(m) {
+    missing <- setdiff(all_genes, rownames(m))
+    if (length(missing)) {
+      z <- Matrix::Matrix(0, nrow = length(missing), ncol = ncol(m), sparse = TRUE)
+      rownames(z) <- missing
+      colnames(z) <- colnames(m)
+      m <- rbind(m, z)
+    }
+    m[all_genes, , drop = FALSE]
+  })
+  pooled <- do.call(cbind, mats2)
+  as(pooled, "dgCMatrix")
+}
+
+# -----------------------------
+# Loaders
+# -----------------------------
+read_10x_folder <- function(folder) {
+  mat <- Seurat::Read10X(data.dir = folder)
+  if (is.list(mat)) {
+    if ("Gene Expression" %in% names(mat)) mat <- mat[["Gene Expression"]] else mat <- mat[[1]]
+  }
+  mat <- as(mat, "dgCMatrix")
+  rownames(mat) <- make.unique(sanitize_gene_names(rownames(mat)))
+  colnames(mat) <- make.unique(sanitize_cell_names(colnames(mat)))
+  collapse_duplicate_features(mat)
+}
+read_10x_triplet_files <- function(barcodes, features, matrix_mtx) {
+  bc <- readLines(gzfile(barcodes))
+  feat_dt <- data.table::fread(features, header = FALSE)
+  genes <- if (ncol(feat_dt) >= 2) feat_dt[[2]] else feat_dt[[1]]
+  genes <- make.unique(sanitize_gene_names(genes))
+
+  m <- Matrix::readMM(gzfile(matrix_mtx))
+  m <- as(m, "dgCMatrix")
+  rownames(m) <- genes
+  colnames(m) <- make.unique(sanitize_cell_names(bc))
+  collapse_duplicate_features(m)
+}
+read_dense_csv_gz_counts <- function(path) {
+  dt <- data.table::fread(cmd = paste("gzip -cd", shQuote(path)), data.table = FALSE)
+  if (!("V1" %in% colnames(dt))) colnames(dt)[1] <- "V1"
+  if (!("CLUSTER" %in% colnames(dt))) stop("Expected CLUSTER column not found: ", path)
+
+  cell_id <- make.unique(sanitize_cell_names(dt[["V1"]]))
+
+  gene_df <- dt[, setdiff(colnames(dt), c("V1", "CLUSTER")), drop = FALSE]
+  mat_cell_by_gene <- as.matrix(gene_df)
+  suppressWarnings(storage.mode(mat_cell_by_gene) <- "numeric")
+  mat_cell_by_gene[is.na(mat_cell_by_gene)] <- 0
+
+  genes <- sanitize_gene_names(colnames(mat_cell_by_gene))
+  colnames(mat_cell_by_gene) <- genes
+
+  counts <- t(mat_cell_by_gene) # gene x cell
+  rownames(counts) <- make.unique(sanitize_gene_names(rownames(counts)))
+  colnames(counts) <- cell_id
+  counts <- as(counts, "dgCMatrix")
+  collapse_duplicate_features(counts)
+}
+read_gene_cell_exprs_table <- function(path) {
+  dt <- data.table::fread(cmd = paste("gzip -cd", shQuote(path)), data.table = FALSE)
+  nms <- colnames(dt)
+  if (!all(c("Gene_ID", "Symbol") %in% nms)) {
+    stop("Unrecognized gene_cell_exprs_table format: ", path, "\nColumns: ", paste(nms, collapse = ", "))
+  }
+
+  genes <- toupper(sanitize_gene_names(dt[["Symbol"]]))
+  genes[is.na(genes) | genes == ""] <- "NA_GENE"
+  genes <- make.unique(genes)
+
+  expr_df <- dt[, setdiff(nms, c("Gene_ID", "Symbol")), drop = FALSE]
+  expr_mat <- as.matrix(expr_df)
+  suppressWarnings(storage.mode(expr_mat) <- "numeric")
+  expr_mat[is.na(expr_mat)] <- 0
+
+  rownames(expr_mat) <- genes
+  colnames(expr_mat) <- make.unique(sanitize_cell_names(colnames(expr_mat)))
+
+  mat <- as(expr_mat, "dgCMatrix")
+  collapse_duplicate_features(mat)
+}
+read_10x_tarball <- function(tar_gz_path, tmp_base = tempdir()) {
+  outdir <- file.path(tmp_base, paste0("untar_", tools::file_path_sans_ext(basename(tar_gz_path)), "_", as.integer(Sys.time())))
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  utils::untar(tar_gz_path, exdir = outdir)
+  mtx <- list.files(outdir, pattern = "matrix\\.mtx(\\.gz)?$", recursive = TRUE, full.names = TRUE)
+  if (!length(mtx)) stop("No matrix.mtx found after untar: ", tar_gz_path)
+  read_10x_folder(dirname(mtx[1]))
+}
+read_10x_zip <- function(zip_path, tmp_base = tempdir()) {
+  outdir <- file.path(tmp_base, paste0("unzip_", tools::file_path_sans_ext(basename(zip_path)), "_", as.integer(Sys.time())))
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  utils::unzip(zip_path, exdir = outdir)
+  mtx <- list.files(outdir, pattern = "matrix\\.mtx(\\.gz)?$", recursive = TRUE, full.names = TRUE)
+  if (!length(mtx)) stop("No matrix.mtx found after unzip: ", zip_path)
+  read_10x_folder(dirname(mtx[1]))
+}
+
+# -----------------------------
+# Seurat clustering (target ~8 clusters)
+# -----------------------------
+run_seurat_preprocess <- function(counts, project_name) {
+  so <- CreateSeuratObject(
+    counts = counts,
+    project = project_name,
+    min.cells = cfg$min_cells,
+    min.features = cfg$min_features
+  )
+  so <- NormalizeData(so)
+  so <- FindVariableFeatures(so, selection.method = "mvp", nfeatures = cfg$nfeatures)
+  so <- ScaleData(so)
+  so <- RunPCA(so)
+  so <- FindNeighbors(so, dims = cfg$dims)
+  so
+}
+find_resolution_for_k <- function(so, target_k, grid) {
+  best <- list(resolution = NA_real_, k = Inf, so = NULL, diff = Inf)
+  for (r in grid) {
+    so_r <- FindClusters(so, resolution = r, verbose = FALSE)
+    k <- length(unique(so_r$seurat_clusters))
+    d <- abs(k - target_k)
+    if (d < best$diff) {
+      best <- list(resolution = r, k = k, so = so_r, diff = d)
+      if (d == 0) break
+    }
+  }
+  best
+}
+
+# -----------------------------
+# Markers
+# -----------------------------
+top_markers_per_cluster <- function(so, group_name) {
+  Idents(so) <- so$seurat_clusters
+  mk <- FindAllMarkers(
+    object = so,
+    only.pos = cfg$only_pos,
+    test.use = cfg$test_use,
+    min.pct = cfg$min_pct,
+    logfc.threshold = cfg$logfc_threshold
+  )
+  if ("avg_logFC" %in% colnames(mk) && !("avg_log2FC" %in% colnames(mk))) {
+    mk <- mk %>% rename(avg_log2FC = avg_logFC)
+  }
+  mk %>%
+    mutate(group = group_name) %>%
+    group_by(cluster) %>%
+    arrange(desc(avg_log2FC), .by_group = TRUE) %>%
+    slice_head(n = cfg$top_n_markers) %>%
+    ungroup()
+}
+
+# -----------------------------
+# ASPC specificity ratio on pooled clusters
+# -----------------------------
+calc_tau <- function(pb_mat) {
+  apply(pb_mat, 1, function(x) {
+    if (all(is.na(x))) return(NA_real_)
+    mx <- max(x, na.rm = TRUE)
+    if (!is.finite(mx) || mx <= 0) return(0)
+    sum(1 - (x / mx), na.rm = TRUE) / (length(x) - 1)
+  })
+}
+
+calc_aspc_specific_ratio <- function(pb_mat, target_cluster) {
+  # pb_mat: gene x cluster matrix
+  lev <- colnames(pb_mat)
+  idx <- which(as.character(lev) == as.character(target_cluster))
+  if (length(idx) != 1) return(rep(NA_real_, nrow(pb_mat)))
+
+  target_expr <- pb_mat[, idx]
+  other_idx <- setdiff(seq_along(lev), idx)
+  other_expr <- if (length(other_idx) == 0) rep(0, length(target_expr)) else apply(pb_mat[, other_idx, drop = FALSE], 1, max, na.rm = TRUE)
+
+  ifelse(other_expr > 0, target_expr / other_expr, Inf)
+}
+
+pseudobulk_by_cluster <- function(so) {
+  # Use log-normalized data for marker-like ratios
+  mat <- GetAssayData(so, layer = "data")
+  cl <- as.character(so$seurat_clusters)
+  names(cl) <- colnames(mat)
+
+  lev <- sort(unique(cl))
+  pb <- sapply(lev, function(k) {
+    cells <- names(cl)[cl == k]
+    if (length(cells) == 1) return(as.numeric(mat[, cells, drop = FALSE]))
+    Matrix::rowMeans(mat[, cells, drop = FALSE])
+  })
+  rownames(pb) <- rownames(mat)
+  colnames(pb) <- lev
+  pb
+}
+
+# -----------------------------
+# GROUPS with specified target cluster (ASPC/stroma)
+# -----------------------------
+groups <- list(
+  # Mouse NEPC
+  list(
+    name = "Mouse_NEPC_GSE235036_TKO_rep1_4_pooled",
+    target_cluster = "3",  # ASPC
+    target_label = "ASPC",
+    samples = list(
+      list(sample_id = "TKO_rep1", type = "10x_folder", path = "/Volumes/Jingjing Chen/GSE235036/GSE235036_RAW/TKO_rep1"),
+      list(sample_id = "TKO_rep2", type = "10x_folder", path = "/Volumes/Jingjing Chen/GSE235036/GSE235036_RAW/TKO_rep2"),
+      list(sample_id = "TKO_rep3", type = "10x_folder", path = "/Volumes/Jingjing Chen/GSE235036/GSE235036_RAW/TKO_rep3"),
+      list(sample_id = "TKO_rep4", type = "10x_folder", path = "/Volumes/Jingjing Chen/GSE235036/GSE235036_RAW/TKO_rep4")
+    )
+  ),
+  list(
+    name = "Mouse_NEPC_GSE210358_TKO_dense_7_pooled",
+    target_cluster = "6",  # ASPC
+    target_label = "ASPC",
+    samples = list(
+      list(sample_id = "GSM6428973", type = "dense_csv_gz", path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428973_1640_TKO_12WK_Cas1_IGO_10682_8_dense.csv.gz"),
+      list(sample_id = "GSM6428974", type = "dense_csv_gz", path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428974_1641_TKO_12WK_Cas2_IGO_10682_3_dense.csv.gz"),
+      list(sample_id = "GSM6428975", type = "dense_csv_gz", path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428975_1642_TKO_12WK_Cas3_IGO_10682_4_dense.csv.gz"),
+      list(sample_id = "GSM6428979", type = "dense_csv_gz", path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428979_TKO12_week_1_dense.csv.gz"),
+      list(sample_id = "GSM6428980", type = "dense_csv_gz", path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428980_TKO12_week_2_dense.csv.gz"),
+      list(sample_id = "GSM6428981", type = "dense_csv_gz", path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428981_1213_TKO_12weeks_3_P138_IGO_09869_4_dense.csv.gz"),
+      list(sample_id = "GSM6428982", type = "dense_csv_gz", path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428982_1214_TKO_12weeks_4_P138_IGO_09869_5_dense.csv.gz")
+    )
+  ),
+  list(
+    name = "Mouse_NEPC_GSE296986_TKO_T1918_T2579_pooled",
+    target_cluster = "2",  # ASPC
+    target_label = "ASPC",
+    samples = list(
+      list(sample_id = "GSM8981213_TKO-T1918", type = "10x_folder", path = "/Volumes/Jingjing Chen/GSE296986/GSM8981213_TKO-T1918_filtered_feature_bc_matrix"),
+      list(sample_id = "GSM8981212_TKO-T2579", type = "10x_folder", path = "/Volumes/Jingjing Chen/GSE296986/GSM8981212_TKO-T2579_filtered_feature_bc_matrix")
+    )
+  ),
+  list(
+    name = "Mouse_NEPC_GSE221755_TKO_rep1_2_triplet_pooled",
+    target_cluster = "3",  # ASPC
+    target_label = "ASPC",
+    samples = list(
+      list(sample_id = "GSM6895313_rep1", type = "10x_triplet",
+           barcodes = "/Volumes/Jingjing Chen/GSE221755/GSM6895313_TKO-Replicate1_barcodes.tsv.gz",
+           features = "/Volumes/Jingjing Chen/GSE221755/GSM6895313_TKO-Replicate1_features.tsv.gz",
+           matrix   = "/Volumes/Jingjing Chen/GSE221755/GSM6895313_TKO-Replicate1_matrix.mtx.gz"),
+      list(sample_id = "GSM6895314_rep2", type = "10x_triplet",
+           barcodes = "/Volumes/Jingjing Chen/GSE221755/GSM6895314_TKO-Replicate2_barcodes.tsv.gz",
+           features = "/Volumes/Jingjing Chen/GSE221755/GSM6895314_TKO-Replicate2_features.tsv.gz",
+           matrix   = "/Volumes/Jingjing Chen/GSE221755/GSM6895314_TKO-Replicate2_matrix.mtx.gz")
+    )
+  ),
+
+  # Human NEPC
+  list(
+    name = "Human_NEPC_GSE210358_dense_3_pooled",
+    target_cluster = "3",  # ASPC
+    target_label = "ASPC",
+    samples = list(
+      list(sample_id = "GSM6428952", type = "dense_csv_gz", path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428952_1778_JZ_HMP_04_IGO_10726_2_dense.csv.gz"),
+      list(sample_id = "GSM6428960", type = "dense_csv_gz", path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428960_2016_JZHP_04_IGO_11245_7_dense.csv.gz"),
+      list(sample_id = "GSM6428961", type = "dense_csv_gz", path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428961_2513_HMP_17_IGO_11874_35_dense.csv.gz")
+    )
+  ),
+  list(
+    name = "Human_NEPC_GSE137829_P1_P6_pooled",
+    target_cluster = "1",  # ASPC
+    target_label = "ASPC",
+    samples = list(
+      list(sample_id = "P1", type = "gene_cell_exprs_table", path = "/Volumes/Jingjing Chen/GSE137829_RAW/GSM4089151_P1_gene_cell_exprs_table.txt.gz"),
+      list(sample_id = "P2", type = "gene_cell_exprs_table", path = "/Volumes/Jingjing Chen/GSE137829_RAW/GSM4089152_P2_gene_cell_exprs_table.txt.gz"),
+      list(sample_id = "P3", type = "gene_cell_exprs_table", path = "/Volumes/Jingjing Chen/GSE137829_RAW/GSM4089153_P3_gene_cell_exprs_table.txt.gz"),
+      list(sample_id = "P4", type = "gene_cell_exprs_table", path = "/Volumes/Jingjing Chen/GSE137829_RAW/GSM4089154_P4_gene_cell_exprs_table.txt.gz"),
+      list(sample_id = "P5", type = "gene_cell_exprs_table", path = "/Volumes/Jingjing Chen/GSE137829_RAW/GSM4711414_P5_gene_cell_exprs_table.txt.gz"),
+      list(sample_id = "P6", type = "gene_cell_exprs_table", path = "/Volumes/Jingjing Chen/GSE137829_RAW/GSM4711415_P6_gene_cell_exprs_table.txt.gz")
+    )
+  ),
+  list(
+    name = "Human_NEPC_GSE292074_tar_3_pooled",
+    target_cluster = "6",  # ASPC
+    target_label = "ASPC",
+    samples = list(
+      list(sample_id = "MH_07-042-M2", type = "10x_tar", path = "/Volumes/Jingjing Chen/GSE292074/GSM8848584_MH_07-042-M2_filtered_feature_bc_matrix.tar.gz"),
+      list(sample_id = "MH_13-084-D12", type = "10x_tar", path = "/Volumes/Jingjing Chen/GSE292074/GSM8848585_MH_13-084-D12_filtered_feature_bc_matrix.tar.gz"),
+      list(sample_id = "MH_13-084-D13", type = "10x_tar", path = "/Volumes/Jingjing Chen/GSE292074/GSM8848586_MH_13-084-D13_filtered_feature_bc_matrix.tar.gz")
+    )
+  ),
+
+  # Adenocarcinoma
+  list(
+    name = "Adeno_GSE296986_SKO_zip_3_pooled",
+    target_cluster = "2",  # stroma/fibroblast
+    target_label = "stroma",
+    samples = list(
+      list(sample_id = "SKO-134", type = "10x_zip", path = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE296986/GSM8981209_SKO-134_filtered_feature_bc_matrix.zip"),
+      list(sample_id = "SKO-143", type = "10x_zip", path = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE296986/GSM8981210_SKO-143_filtered_feature_bc_matrix.zip"),
+      list(sample_id = "SKO-159", type = "10x_zip", path = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE296986/GSM8981211_SKO-159_filtered_feature_bc_matrix.zip")
+    )
+  ),
+  list(
+    name = "Adeno_GSE268307_S03_S04_triplet_2_pooled",
+    target_cluster = "0",  # stroma/fibroblast
+    target_label = "stroma",
+    samples = list(
+      list(sample_id = "S_03", type = "10x_triplet",
+           barcodes = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE268307/GSM8289374_S_03_barcodes.tsv.gz",
+           features = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE268307/GSM8289374_S_03_features.tsv.gz",
+           matrix   = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE268307/GSM8289374_S_03_matrix.mtx.gz"),
+      list(sample_id = "S_04", type = "10x_triplet",
+           barcodes = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE268307/GSM8289375_S_04_barcodes.tsv.gz",
+           features = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE268307/GSM8289375_S_04_features.tsv.gz",
+           matrix   = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE268307/GSM8289375_S_04_matrix.mtx.gz")
+    )
+  ),
+  list(
+    name = "Adeno_GSE278936_CRPC_1_5_triplet_5_pooled",
+    target_cluster = "1",  # stroma/fibroblast
+    target_label = "stroma",
+    samples = list(
+      list(sample_id = "CRPC_1", type = "10x_triplet",
+           barcodes = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558019_CRPC_1_barcodes.tsv.gz",
+           features = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558019_CRPC_1_features.tsv.gz",
+           matrix   = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558019_CRPC_1_matrix.mtx.gz"),
+      list(sample_id = "CRPC_2", type = "10x_triplet",
+           barcodes = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558020_CRPC_2_barcodes.tsv.gz",
+           features = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558020_CRPC_2_features.tsv.gz",
+           matrix   = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558020_CRPC_2_matrix.mtx.gz"),
+      list(sample_id = "CRPC_3", type = "10x_triplet",
+           barcodes = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558021_CRPC_3_barcodes.tsv.gz",
+           features = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558021_CRPC_3_features.tsv.gz",
+           matrix   = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558021_CRPC_3_matrix.mtx.gz"),
+      list(sample_id = "CRPC_4", type = "10x_triplet",
+           barcodes = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558022_CRPC_4_barcodes.tsv.gz",
+           features = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558022_CRPC_4_features.tsv.gz",
+           matrix   = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558022_CRPC_4_matrix.mtx.gz"),
+      list(sample_id = "CRPC_5", type = "10x_triplet",
+           barcodes = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558023_CRPC_5_barcodes.tsv.gz",
+           features = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558023_CRPC_5_features.tsv.gz",
+           matrix   = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/GSM8558023_CRPC_5_matrix.mtx.gz")
+    )
+  )
+)
+
+# -----------------------------
+# MAIN
+# -----------------------------
+for (grp in groups) {
+  group_name <- grp$name
+  target_cluster <- as.character(grp$target_cluster)
+  target_label <- grp$target_label
+
+  msg("=== GROUP: %s (target %s cluster=%s) ===", group_name, target_label, target_cluster)
+
+  mats <- list()
+
+  for (s in grp$samples) {
+    msg("Loading sample: %s (type=%s)", s$sample_id, s$type)
+
+    mat <- tryCatch({
+      if (s$type == "10x_folder") {
+        if (!dir.exists(s$path)) stop("Missing folder: ", s$path)
+        read_10x_folder(s$path)
+      } else if (s$type == "10x_triplet") {
+        if (!file.exists(s$barcodes) || !file.exists(s$features) || !file.exists(s$matrix)) {
+          stop("Missing triplet files for sample: ", s$sample_id)
+        }
+        read_10x_triplet_files(s$barcodes, s$features, s$matrix)
+      } else if (s$type == "dense_csv_gz") {
+        if (!file.exists(s$path)) stop("Missing file: ", s$path)
+        read_dense_csv_gz_counts(s$path)
+      } else if (s$type == "gene_cell_exprs_table") {
+        if (!file.exists(s$path)) stop("Missing file: ", s$path)
+        read_gene_cell_exprs_table(s$path)
+      } else if (s$type == "10x_tar") {
+        if (!file.exists(s$path)) stop("Missing tar.gz: ", s$path)
+        read_10x_tarball(s$path)
+      } else if (s$type == "10x_zip") {
+        if (!file.exists(s$path)) stop("Missing zip: ", s$path)
+        read_10x_zip(s$path)
+      } else {
+        stop("Unknown sample type: ", s$type)
+      }
+    }, error = function(e) {
+      warn_msg("%s", e$message)
+      NULL
+    })
+
+    if (is.null(mat)) next
+    mat <- prefix_cell_barcodes(mat, s$sample_id)
+    mats[[s$sample_id]] <- mat
+    msg("Loaded %s: genes=%d cells=%d", s$sample_id, nrow(mat), ncol(mat))
+  }
+
+  if (length(mats) == 0) {
+    warn_msg("No samples loaded for group: %s; skipping.", group_name)
+    next
+  }
+
+  pooled_counts <- merge_by_union_genes(mats)
+  msg("Pooled matrix: genes=%d cells=%d", nrow(pooled_counts), ncol(pooled_counts))
+
+  # Seurat preprocess + choose resolution to get ~8 clusters
+  so0 <- run_seurat_preprocess(pooled_counts, project_name = group_name)
+  best <- find_resolution_for_k(so0, cfg$target_k, cfg$resolution_grid)
+  so <- best$so
+  msg("Chosen resolution=%.2f -> clusters=%d (target=%d)", best$resolution, best$k, cfg$target_k)
+
+  so$sample_id <- sub("__.*$", "", Cells(so))
+
+  # Cluster counts
+  cc <- sort(table(so$seurat_clusters), decreasing = TRUE)
+  cc_path <- file.path(cfg$out_dir, paste0(group_name, "_cluster_counts.csv"))
+  write_csv(tibble(cluster = names(cc), n_cells = as.integer(cc)), cc_path)
+  msg("Wrote: %s", cc_path)
+
+  # Markers top 100 per cluster
+  mk_top <- top_markers_per_cluster(so, group_name)
+  out_mk <- file.path(cfg$out_dir, paste0(group_name, "_cluster_markers_top", cfg$top_n_markers, ".csv"))
+  write_csv(mk_top, out_mk)
+  msg("Wrote: %s", out_mk)
+
+  # Compute gene-level aspc_specific_ratio using specified target cluster
+  if (!(target_cluster %in% levels(so$seurat_clusters) || target_cluster %in% unique(as.character(so$seurat_clusters)))) {
+    warn_msg("Target cluster %s not present in clustering results for %s. Ratio will be NA.", target_cluster, group_name)
+  }
+
+  pb <- pseudobulk_by_cluster(so)  # gene x cluster
+  ratio <- calc_aspc_specific_ratio(pb, target_cluster)
+  tau <- calc_tau(pb)
+
+  ratio_tbl <- tibble(
+    gene = toupper(rownames(pb)),
+    aspc_specific_ratio = as.numeric(ratio),
+    tau = as.numeric(tau),
+    group = group_name,
+    target_label = target_label,
+    target_cluster = target_cluster,
+    chosen_resolution = best$resolution,
+    n_clusters = best$k
+  )
+
+  out_ratio <- file.path(cfg$out_dir, paste0(group_name, "_aspc_specific_ratio.csv"))
+  write_csv(ratio_tbl, out_ratio)
+  msg("Wrote: %s", out_ratio)
+
+  # Optional save Seurat object
+  if (isTRUE(cfg$write_seurat_rds)) {
+    out_rds <- file.path(cfg$out_dir, paste0(group_name, "_seurat.rds"))
+    saveRDS(so, out_rds)
+    msg("Wrote: %s", out_rds)
+  }
+}
+
+msg("DONE.")
