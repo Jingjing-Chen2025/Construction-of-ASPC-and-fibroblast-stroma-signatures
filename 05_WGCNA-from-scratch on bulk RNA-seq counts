@@ -1,0 +1,319 @@
+# WGCNA-from-scratch on bulk RNA-seq counts (UPDATED: residualization uses lm.fit, rank-deficiency safe)
+# - Input: raw counts (genes x samples in a CSV where first column is gene)
+# - Normalization: edgeR logCPM (safe for correlation-based networks)
+# - Covariates (recommended): purity, ASPC fraction, immune/stromal (QC + optional residualization)
+# - Output:
+#   1) wgcna_result.rds (datExpr, MEs, moduleColors, params)
+#   2) wgcna_module_membership.csv (gene, module, kME, kME_abs, in_wgcna_module)
+#   3) wgcna.PROVENANCE.txt
+
+# ---- user paths ----
+counts_csv <- "/Volumes/Jingjing Chen/Jingjing and Martin/Updated data 2023/RR1384_all_counts.csv"
+
+aspc_frac_csv <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs/ASPC_fractions.csv"
+imm_str_csv   <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs/immune_stromal_fractions.csv"
+purity_csv    <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs/purity_estimates.csv"
+
+clinical_xlsx <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ClinicalGenomicsData_WCM OS_MONTHS BMI.xlsx" # optional
+
+out_dir <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/wgcna_runs/2026-01-17"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ---- install/load packages (safer) ----
+pkgs <- c("WGCNA", "edgeR", "readxl", "ggplot2", "janitor", "dplyr", "tidyr", "readr")
+to_install <- pkgs[!vapply(pkgs, requireNamespace, quietly = TRUE, FUN.VALUE = logical(1))]
+if (length(to_install)) install.packages(to_install)
+
+suppressPackageStartupMessages({
+  library(WGCNA)
+  library(edgeR)
+  library(readxl)
+  library(ggplot2)
+  library(janitor)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+})
+
+WGCNA::allowWGCNAThreads()
+
+msg <- function(...) cat("[INFO]", sprintf(...), "\n")
+warn_msg <- function(...) cat("[WARN]", sprintf(...), "\n")
+
+# ---- helpers ----
+toupper_trim <- function(x) toupper(trimws(as.character(x)))
+safe_numeric <- function(x) suppressWarnings(as.numeric(gsub("^NO-PM\\s*[0-9]+$", NA_character_, as.character(x))))
+
+read_cov <- function(path, needed_cols) {
+  if (!file.exists(path)) {
+    warn_msg("Missing covariate file: %s", path)
+    return(tibble::tibble())
+  }
+  df <- readr::read_csv(path, show_col_types = FALSE) %>% tibble::as_tibble()
+  miss <- setdiff(needed_cols, names(df))
+  if (length(miss)) warn_msg("File %s missing columns: %s", path, paste(miss, collapse = ", "))
+  df
+}
+
+# ---- 1) load counts (genes x samples) ----
+stopifnot(file.exists(counts_csv))
+counts_df <- readr::read_csv(counts_csv, show_col_types = FALSE)
+
+gene_col <- names(counts_df)[1]
+genes <- toupper_trim(counts_df[[gene_col]])
+
+count_mat <- counts_df %>%
+  dplyr::select(-dplyr::all_of(gene_col)) %>%
+  as.data.frame()
+
+count_mat[] <- lapply(count_mat, safe_numeric)
+count_mat <- as.matrix(count_mat)
+rownames(count_mat) <- genes
+
+# remove duplicated genes safely by summing counts
+if (any(duplicated(rownames(count_mat)))) {
+  msg("Found duplicated gene symbols; summing duplicated rows.")
+  count_mat <- rowsum(count_mat, group = rownames(count_mat), reorder = FALSE)
+}
+
+# ---- 2) edgeR normalization + logCPM ----
+y <- edgeR::DGEList(counts = count_mat)
+y <- edgeR::calcNormFactors(y)
+
+keep <- edgeR::filterByExpr(y)
+y <- y[keep, , keep.lib.sizes = FALSE]
+msg("Genes kept after filterByExpr: %d", nrow(y))
+
+logCPM <- edgeR::cpm(y, log = TRUE, prior.count = 1)
+
+# WGCNA input: samples x genes
+datExpr <- t(logCPM)
+datExpr <- as.data.frame(datExpr)
+datExpr <- datExpr[, apply(datExpr, 2, sd, na.rm = TRUE) > 0, drop = FALSE]
+msg("WGCNA datExpr dimensions (samples x genes): %d x %d", nrow(datExpr), ncol(datExpr))
+
+# optional: keep top variable genes (recommended for speed/stability)
+top_var_genes <- 10000
+if (ncol(datExpr) > top_var_genes) {
+  v <- apply(datExpr, 2, var, na.rm = TRUE)
+  keep_genes <- names(sort(v, decreasing = TRUE))[seq_len(top_var_genes)]
+  datExpr <- datExpr[, keep_genes, drop = FALSE]
+  msg("Kept top %d variable genes for WGCNA", top_var_genes)
+}
+
+# ---- 3) load covariates and align samples ----
+aspc_frac <- read_cov(aspc_frac_csv, c("sample", "ASPC_fraction")) %>%
+  dplyr::transmute(sample = as.character(sample), ASPC_fraction = as.numeric(ASPC_fraction))
+
+imm_str <- read_cov(imm_str_csv, c("sample", "immune_fraction", "stromal_fraction")) %>%
+  dplyr::transmute(sample = as.character(sample),
+                   immune_fraction = as.numeric(immune_fraction),
+                   stromal_fraction = as.numeric(stromal_fraction))
+
+purity <- read_cov(purity_csv, c("sample", "purity")) %>%
+  dplyr::transmute(sample = as.character(sample), purity = as.numeric(purity))
+
+if (!file.exists(clinical_xlsx)) warn_msg("Clinical xlsx not found (optional): %s", clinical_xlsx)
+
+# join covariates without purrr
+cov_tbl <- Reduce(function(x, y) dplyr::full_join(x, y, by = "sample"),
+                  list(aspc_frac, imm_str, purity))
+
+# align to datExpr samples
+cov_tbl <- cov_tbl %>% dplyr::filter(sample %in% rownames(datExpr))
+datExpr <- datExpr[intersect(rownames(datExpr), cov_tbl$sample), , drop = FALSE]
+cov_tbl <- cov_tbl %>% dplyr::slice(match(rownames(datExpr), sample))
+
+msg("Samples in WGCNA after covariate alignment: %d", nrow(datExpr))
+
+# ---- 4) QC: check for good samples/genes + sample outliers ----
+gsg <- WGCNA::goodSamplesGenes(datExpr, verbose = 3)
+if (!gsg$allOK) {
+  warn_msg("Removing bad samples/genes detected by goodSamplesGenes.")
+  if (sum(!gsg$goodSamples) > 0) datExpr <- datExpr[gsg$goodSamples, , drop = FALSE]
+  if (sum(!gsg$goodGenes) > 0) datExpr <- datExpr[, gsg$goodGenes, drop = FALSE]
+  cov_tbl <- cov_tbl %>% dplyr::slice(match(rownames(datExpr), sample))
+}
+
+sampleTree <- hclust(dist(datExpr), method = "average")
+pdf(file.path(out_dir, "WGCNA_sample_clustering.pdf"), width = 10, height = 6)
+plot(sampleTree, main = "Sample clustering (WGCNA QC)", xlab = "", sub = "")
+dev.off()
+
+# Optional: remove outliers by cut height (leave NA to skip)
+cut_height <- NA_real_
+if (!is.na(cut_height)) {
+  clust <- WGCNA::cutreeStatic(sampleTree, cutHeight = cut_height, minSize = 10)
+  keep_samples <- (clust == 1)
+  msg("Outlier removal: removing %d samples using cutHeight=%.2f", sum(!keep_samples), cut_height)
+  datExpr <- datExpr[keep_samples, , drop = FALSE]
+  cov_tbl <- cov_tbl %>% dplyr::slice(match(rownames(datExpr), sample))
+}
+
+# ---- 5) OPTIONAL: residualize expression on covariates (RANK-DEFICIENCY SAFE) ----
+do_residualize <- TRUE
+if (do_residualize && nrow(cov_tbl) == nrow(datExpr)) {
+
+  cov_use <- cov_tbl %>%
+    dplyr::select(dplyr::any_of(c("purity", "ASPC_fraction", "immune_fraction", "stromal_fraction")))
+
+  # median-impute NAs
+  for (nm in names(cov_use)) {
+    cov_use[[nm]][is.na(cov_use[[nm]])] <- median(cov_use[[nm]], na.rm = TRUE)
+  }
+
+  # drop near-constant covariates
+  is_constant <- vapply(cov_use, function(v) sd(v, na.rm = TRUE) < 1e-8, logical(1))
+  if (any(is_constant)) {
+    warn_msg("Dropping near-constant covariates: %s", paste(names(cov_use)[is_constant], collapse = ", "))
+    cov_use <- cov_use[, !is_constant, drop = FALSE]
+  }
+
+  if (ncol(cov_use) > 0) {
+    msg("Residualizing datExpr on covariates: %s", paste(names(cov_use), collapse = ", "))
+
+    X <- model.matrix(~ ., data = cov_use)  # includes intercept
+    Y <- as.matrix(datExpr)                 # samples x genes
+
+    resid_mat <- matrix(NA_real_, nrow = nrow(Y), ncol = ncol(Y),
+                        dimnames = dimnames(Y))
+
+    for (j in seq_len(ncol(Y))) {
+      fit <- lm.fit(x = X, y = Y[, j])      # handles rank deficiency
+      resid_mat[, j] <- fit$residuals
+    }
+
+    datExpr <- as.data.frame(resid_mat)
+  } else {
+    warn_msg("No usable covariates found to residualize; skipping.")
+  }
+}
+
+# ---- 6) pick soft threshold power ----
+powers <- 1:20
+sft <- WGCNA::pickSoftThreshold(datExpr, powerVector = powers, networkType = "signed", verbose = 5)
+
+pdf(file.path(out_dir, "WGCNA_pickSoftThreshold.pdf"), width = 10, height = 5)
+par(mfrow = c(1, 2))
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit, signed R^2",
+     type = "n", main = "Scale independence")
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+     labels = powers, cex = 0.9, col = "red")
+abline(h = 0.8, col = "blue", lty = 2)
+
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab = "Soft Threshold (power)", ylab = "Mean connectivity",
+     type = "n", main = "Mean connectivity")
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels = powers, cex = 0.9, col = "red")
+dev.off()
+
+pick_power <- function(sft, target = 0.8, fallback = 6) {
+  fi <- sft$fitIndices
+  if (is.null(fi) || nrow(fi) == 0) return(fallback)
+  r2 <- -sign(fi[,3]) * fi[,2]
+  ok <- which(r2 >= target)
+  if (length(ok)) return(fi[min(ok), 1])
+  fallback
+}
+softPower <- pick_power(sft, target = 0.8, fallback = 6)
+msg("Chosen softPower = %d", softPower)
+
+# ---- 7) run blockwiseModules ----
+net <- WGCNA::blockwiseModules(
+  datExpr,
+  power = softPower,
+  networkType = "signed",
+  TOMType = "signed",
+  minModuleSize = 30,
+  reassignThreshold = 0,
+  mergeCutHeight = 0.25,
+  numericLabels = FALSE,
+  pamRespectsDendro = TRUE,
+  saveTOMs = FALSE,
+  verbose = 3
+)
+
+moduleColors <- net$colors
+MEs <- WGCNA::orderMEs(net$MEs)
+
+pdf(file.path(out_dir, "WGCNA_dendrogram_modules.pdf"), width = 12, height = 6)
+WGCNA::plotDendroAndColors(net$dendrograms[[1]],
+                           moduleColors[net$blockGenes[[1]]],
+                           "Module colors", dendroLabels = FALSE, hang = 0.03,
+                           addGuide = TRUE, guideHang = 0.05)
+dev.off()
+
+# ---- 8) compute kME ----
+kME_mat <- WGCNA::signedKME(datExpr, MEs, outputColumnName = "kME")
+kME_df <- as.data.frame(kME_mat)
+kME_df$gene <- rownames(kME_df)
+
+module_of_gene <- moduleColors
+names(module_of_gene) <- names(moduleColors)  # should be colnames(datExpr)
+
+get_kme_for_gene <- function(g, mod) {
+  if (is.na(mod) || mod == "grey") return(NA_real_)
+  col <- paste0("kME", mod)
+  if (!col %in% names(kME_df)) return(NA_real_)
+  kME_df[kME_df$gene == g, col, drop = TRUE]
+}
+
+kME_own <- vapply(names(module_of_gene), function(g) get_kme_for_gene(g, module_of_gene[g]), numeric(1))
+
+membership_tbl <- tibble::tibble(
+  gene = toupper_trim(names(module_of_gene)),
+  module = as.character(module_of_gene),
+  kME = as.numeric(kME_own),
+  kME_abs = abs(as.numeric(kME_own))
+) %>%
+  dplyr::mutate(in_wgcna_module = !is.na(kME) & module != "grey" & kME_abs >= 0.30) %>%
+  dplyr::arrange(dplyr::desc(in_wgcna_module), dplyr::desc(kME_abs))
+
+# ---- 9) save outputs ----
+saveRDS(
+  list(
+    datExpr = datExpr,
+    MEs = MEs,
+    moduleColors = moduleColors,
+    kME_matrix = kME_mat,
+    params = list(
+      softPower = softPower,
+      networkType = "signed",
+      TOMType = "signed",
+      minModuleSize = 30,
+      mergeCutHeight = 0.25,
+      residualized_on_covariates = do_residualize,
+      top_variable_genes = min(top_var_genes, ncol(datExpr))
+    )
+  ),
+  file.path(out_dir, "wgcna_result.rds")
+)
+
+readr::write_csv(membership_tbl, file.path(out_dir, "wgcna_module_membership.csv"))
+
+prov <- c(
+  paste0("date: ", Sys.time()),
+  paste0("counts_csv: ", counts_csv),
+  paste0("aspc_frac_csv: ", aspc_frac_csv),
+  paste0("imm_str_csv: ", imm_str_csv),
+  paste0("purity_csv: ", purity_csv),
+  paste0("clinical_xlsx: ", if (file.exists(clinical_xlsx)) clinical_xlsx else "NOT_FOUND"),
+  paste0("n_samples: ", nrow(datExpr)),
+  paste0("n_genes: ", ncol(datExpr)),
+  "normalization: edgeR logCPM(prior.count=1)",
+  "filter: edgeR filterByExpr + top variable genes",
+  paste0("residualized_on_covariates: ", do_residualize),
+  paste0("softPower: ", softPower),
+  "WGCNA blockwiseModules params:",
+  "  networkType=signed",
+  "  TOMType=signed",
+  "  minModuleSize=30",
+  "  mergeCutHeight=0.25",
+  "membership threshold: kME_abs >= 0.30 and module != grey"
+)
+writeLines(prov, file.path(out_dir, "wgcna.PROVENANCE.txt"))
+
+msg("Done. Outputs written to: %s", out_dir)
+msg("Membership file: %s", file.path(out_dir, "wgcna_module_membership.csv"))
+msg("Result RDS: %s", file.path(out_dir, "wgcna_result.rds"))
