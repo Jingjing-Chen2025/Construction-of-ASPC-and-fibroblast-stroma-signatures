@@ -1,0 +1,480 @@
+# ======================================================================
+# Single-cell RNA-seq processing (wide-format gene-by-cell tables)
+# Memory-safe pipeline with:
+#   - Loading wide gene-by-cell count tables
+#   - QC & optional downsampling
+#   - SCTransform per sample (glmGamPoi)
+#   - RPCA integration (SCT normalization)
+#   - Clustering / UMAP
+#   - Marker discovery (PrepSCTFindMarkers + FindAllMarkers fallback to RNA)
+#   - Pseudobulk edgeR DE (cluster vs rest) with robust dimension handling
+#   - High-specificity marker filtering + final enriched marker table
+#   - Tau specificity scoring
+#   - GO / KEGG enrichment via clusterProfiler
+#   - Export of stabilized residual matrix (SCT assay "data" layer)
+#
+# NOTE: DietSeurat slimming block removed per user request.
+# ======================================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(Seurat)
+  library(Matrix)
+  library(dplyr)
+  library(ggplot2)
+  library(SingleR)
+  library(celldex)
+  library(edgeR)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(enrichplot)
+  library(future)
+})
+
+# -----------------------
+# CONFIG
+# -----------------------
+base_dir  <- "/Volumes/Jingjing Chen/GSE137829_RAW"
+files <- c(
+  "GSM4089152_P2_gene_cell_exprs_table.txt.gz",
+  "GSM4089154_P4_gene_cell_exprs_table.txt.gz",
+  "GSM4711414_P5_gene_cell_exprs_table.txt.gz",
+  "GSM4711415_P6_gene_cell_exprs_table.txt.gz"
+)
+
+min_features               <- 300
+max_features               <- 8000
+max_mito_percent           <- 15
+downsample_cells_per_sample<- 2000
+
+use_symbol_as_rownames     <- TRUE
+variable_features_sct      <- 2500
+integration_features       <- 1500
+n_pcs                      <- 30
+cluster_resolution         <- 0.3
+
+perform_integration        <- TRUE
+perform_pseudobulk         <- TRUE
+export_residual_matrix     <- TRUE
+diet_seurat_after_pb       <- TRUE  # retained but unused after removal of slimming block
+
+seed_val <- 123
+set.seed(seed_val)
+
+future::plan(sequential)
+options(future.globals.maxSize = 8 * 1024^3)
+
+# -----------------------
+# LOAD FUNCTION
+# -----------------------
+load_wide_matrix <- function(path, use_symbol = TRUE, project = NULL) {
+  if (!file.exists(path)) stop("File not found: ", path)
+  dt <- fread(path)
+  if (!all(c("Gene_ID","Symbol") %in% names(dt))) {
+    stop("Missing Gene_ID or Symbol in: ", basename(path))
+  }
+  counts_dt <- dt[, -(1:2), with = FALSE]
+  non_num <- names(counts_dt)[!sapply(counts_dt, function(x) is.integer(x) || is.numeric(x))]
+  if (length(non_num) > 0) {
+    message("[WARN] Coercing non-numeric columns to numeric (NAs→0): ",
+            paste(head(non_num, 5), collapse = ", "))
+    counts_dt <- data.frame(lapply(counts_dt, function(col) {
+      v <- suppressWarnings(as.numeric(col)); v[is.na(v)] <- 0; v
+    }), check.names = FALSE)
+  }
+  mat <- as.matrix(counts_dt)
+  rn <- if (use_symbol) dt$Symbol else dt$Gene_ID
+  rn <- make.unique(gsub("_","-", rn, fixed = TRUE))
+  rownames(mat) <- rn
+  sparse_mat <- as(mat, "dgCMatrix")
+  sample_name <- if (is.null(project)) sub("_gene_cell_exprs_table.*","", basename(path)) else project
+  seu <- CreateSeuratObject(counts = sparse_mat, project = sample_name)
+  seu$sample <- sample_name
+  seu@misc$feature_map <- data.frame(feature = rn,
+                                     Gene_ID = dt$Gene_ID,
+                                     Symbol  = dt$Symbol,
+                                     stringsAsFactors = FALSE)
+  seu
+}
+
+# -----------------------
+# LOAD SAMPLES
+# -----------------------
+message("[INFO] Loading samples...")
+seurat_list <- lapply(files, function(f) {
+  full <- file.path(base_dir, f)
+  message(" - ", f)
+  load_wide_matrix(full, use_symbol = use_symbol_as_rownames)
+})
+names(seurat_list) <- files
+if (!length(seurat_list)) stop("No samples loaded.")
+
+# -----------------------
+# QC & DOWNSAMPLING
+# -----------------------
+message("[INFO] QC filtering & downsampling...")
+for (nm in names(seurat_list)) {
+  seu <- seurat_list[[nm]]
+  seu[["percent.mito"]] <- PercentageFeatureSet(seu, pattern = "^MT-")
+  before <- ncol(seu)
+  seu <- subset(seu,
+                subset = nFeature_RNA >= min_features &
+                         nFeature_RNA <= max_features &
+                         percent.mito <= max_mito_percent)
+  after <- ncol(seu)
+  message(sprintf("[QC] %s: %d -> %d cells retained.", nm, before, after))
+  if (after == 0) {
+    warning("[WARN] Sample ", nm, " removed (0 cells after QC).")
+    next
+  }
+  if (after > downsample_cells_per_sample) {
+    message("[INFO] Downsampling ", nm, " from ", after, " to ", downsample_cells_per_sample)
+    keep <- sample(colnames(seu), downsample_cells_per_sample)
+    seu <- subset(seu, cells = keep)
+  }
+  colnames(seu) <- paste0(seu$sample, "_", colnames(seu))
+  seurat_list[[nm]] <- seu
+}
+seurat_list <- Filter(function(x) ncol(x) > 0, seurat_list)
+if (!length(seurat_list)) stop("All samples lost after QC.")
+
+# -----------------------
+# SCTransform
+# -----------------------
+message("[INFO] SCTransform per sample...")
+for (nm in names(seurat_list)) {
+  seurat_list[[nm]] <- SCTransform(
+    seurat_list[[nm]],
+    assay = "RNA",
+    new.assay.name = "SCT",
+    variable.features.n = variable_features_sct,
+    conserve.memory = FALSE,
+    method = "glmGamPoi",
+    verbose = FALSE
+  )
+  DefaultAssay(seurat_list[[nm]]) <- "SCT"
+}
+
+# -----------------------
+# INTEGRATION (RPCA)
+# -----------------------
+if (perform_integration && length(seurat_list) > 1) {
+  message("[INFO] Selecting integration features...")
+  features <- SelectIntegrationFeatures(object.list = seurat_list,
+                                        nfeatures = integration_features)
+  message("[INFO] PrepSCTIntegration...")
+  seurat_list <- PrepSCTIntegration(object.list = seurat_list,
+                                    anchor.features = features,
+                                    verbose = FALSE)
+  message("[INFO] PCA for RPCA integration...")
+  for (i in seq_along(seurat_list)) {
+    seurat_list[[i]] <- RunPCA(seurat_list[[i]], assay = "SCT", npcs = n_pcs, verbose = FALSE)
+  }
+  message("[INFO] Finding RPCA anchors...")
+  anchors <- FindIntegrationAnchors(object.list = seurat_list,
+                                    normalization.method = "SCT",
+                                    anchor.features = features,
+                                    dims = 1:n_pcs,
+                                    reduction = "rpca")
+  message("[INFO] Integrating data...")
+  seurat_integrated <- IntegrateData(anchorset = anchors,
+                                     normalization.method = "SCT",
+                                     dims = 1:n_pcs)
+  DefaultAssay(seurat_integrated) <- "integrated"
+} else {
+  message("[INFO] Skipping integration; using first sample only.")
+  seurat_integrated <- seurat_list[[1]]
+  DefaultAssay(seurat_integrated) <- "SCT"
+}
+
+# -----------------------
+# DIM REDUCTION & CLUSTERING
+# -----------------------
+message("[INFO] Dimensional reduction & clustering...")
+seurat_integrated <- RunPCA(seurat_integrated, npcs = n_pcs, verbose = FALSE)
+seurat_integrated <- RunUMAP(seurat_integrated, dims = 1:n_pcs)
+seurat_integrated <- FindNeighbors(seurat_integrated, dims = 1:n_pcs)
+seurat_integrated <- FindClusters(seurat_integrated, resolution = cluster_resolution)
+
+# -----------------------
+# EXPORT RESIDUAL MATRIX (SCT@data)
+# -----------------------
+if (export_residual_matrix) {
+  message("[INFO] Exporting stabilized residual matrix (SCT@data)...")
+  sample_residuals <- lapply(seurat_list, function(obj) {
+    DefaultAssay(obj) <- "SCT"
+    GetAssayData(obj, slot = "data")
+  })
+  common_genes <- Reduce(intersect, lapply(sample_residuals, rownames))
+  combined_residuals <- do.call(cbind, lapply(sample_residuals, function(m) m[common_genes, ]))
+  Matrix::writeMM(combined_residuals, "stabilized_residuals.mtx")
+  write.table(common_genes, "stabilized_residuals_genes.tsv",
+              sep = "\t", quote = FALSE, col.names = FALSE, row.names = FALSE)
+  write.table(colnames(combined_residuals), "stabilized_residuals_cells.tsv",
+              sep = "\t", quote = FALSE, col.names = FALSE, row.names = FALSE)
+}
+
+# -----------------------
+# MARKER DISCOVERY
+# -----------------------
+message("[MARKERS] Preparing SCT assay for differential expression...")
+DefaultAssay(seurat_integrated) <- "SCT"
+if ("PrepSCTFindMarkers" %in% ls(getNamespace("Seurat"))) {
+  seurat_integrated <- PrepSCTFindMarkers(seurat_integrated)
+} else {
+  warning("[MARKERS] PrepSCTFindMarkers not available. Consider Seurat upgrade or RNA fallback.")
+}
+
+min_pct_marker  <- 0.10
+logfc_threshold <- 0.15
+test_method     <- "wilcox"
+
+message(sprintf("[MARKERS] Running FindAllMarkers (min.pct=%.2f, logfc=%.2f, test=%s)...",
+                min_pct_marker, logfc_threshold, test_method))
+
+markers <- FindAllMarkers(
+  object          = seurat_integrated,
+  assay           = "SCT",
+  only.pos        = TRUE,
+  min.pct         = min_pct_marker,
+  logfc.threshold = logfc_threshold,
+  test.use        = test_method
+)
+
+if (nrow(markers) == 0) {
+  warning("[MARKERS] No markers found. Retrying relaxed thresholds...")
+  markers <- FindAllMarkers(
+    object          = seurat_integrated,
+    assay           = "SCT",
+    only.pos        = TRUE,
+    min.pct         = 0.05,
+    logfc.threshold = 0.10,
+    test.use        = test_method
+  )
+}
+if (nrow(markers) == 0) {
+  warning("[MARKERS] Still empty. Using RNA fallback.")
+  DefaultAssay(seurat_integrated) <- "RNA"
+  seurat_integrated <- NormalizeData(seurat_integrated)
+  seurat_integrated <- FindVariableFeatures(seurat_integrated)
+  markers <- FindAllMarkers(
+    object          = seurat_integrated,
+    assay           = "RNA",
+    only.pos        = TRUE,
+    min.pct         = 0.05,
+    logfc.threshold = 0.10,
+    test.use        = test_method
+  )
+  DefaultAssay(seurat_integrated) <- "SCT"
+}
+
+if (nrow(markers) > 0) {
+  if (all(c("pct.1","pct.2") %in% colnames(markers))) {
+    markers <- markers %>% mutate(pct.diff = pct.1 - pct.2)
+  } else {
+    markers$pct.diff <- NA_real_
+  }
+  write.csv(markers, "markers_all_SCT.csv", row.names = FALSE)
+
+  markers_high_spec <- markers %>%
+    filter(p_val_adj < 0.05,
+           !is.na(avg_log2FC),
+           avg_log2FC >= 0.4,
+           if (!all(is.na(pct.diff))) pct.diff >= 0.20 else TRUE) %>%
+    mutate(spec_score = if (!all(is.na(pct.diff))) avg_log2FC * pct.diff else avg_log2FC) %>%
+    group_by(cluster) %>%
+    arrange(desc(spec_score)) %>%
+    slice_head(n = 50) %>%
+    ungroup()
+  write.csv(markers_high_spec, "markers_high_specificity_SCT.csv", row.names = FALSE)
+} else {
+  markers_high_spec <- data.frame()
+  warning("[MARKERS] Marker discovery failed entirely.")
+}
+
+# -----------------------
+# PSEUDOBULK (edgeR) – corrected & type-harmonized
+# -----------------------
+if (perform_pseudobulk) {
+  if (!"RNA" %in% names(seurat_integrated@assays)) {
+    warning("[PSEUDOBULK] RNA assay missing; skipping pseudobulk.")
+    perform_pseudobulk <- FALSE
+  }
+}
+
+if (perform_pseudobulk) {
+  message("[PSEUDOBULK] Running pseudobulk DE (edgeR)...")
+  DefaultAssay(seurat_integrated) <- "RNA"
+  counts <- GetAssayData(seurat_integrated, slot = "counts")
+  meta   <- seurat_integrated@meta.data
+  meta$cell <- rownames(meta)
+
+  min_cells_pb <- 5
+
+  group_tbl <- meta |>
+    dplyr::select(cell, sample, seurat_clusters) |>
+    dplyr::group_by(sample, seurat_clusters) |>
+    dplyr::summarise(cells = list(cell),
+                     n_cells = dplyr::n(),
+                     .groups = "drop") |>
+    dplyr::filter(n_cells >= min_cells_pb)
+
+  if (nrow(group_tbl) == 0) {
+    warning("[PSEUDOBULK] No (sample, cluster) groups with >= ", min_cells_pb, " cells. Skipping pseudobulk.")
+    perform_pseudobulk <- FALSE
+  }
+}
+
+if (perform_pseudobulk) {
+  pb_list <- lapply(seq_len(nrow(group_tbl)), function(i) {
+    cell_ids <- group_tbl$cells[[i]]
+    submat <- counts[, cell_ids, drop = FALSE]
+    Matrix::rowSums(submat)
+  })
+
+  pb_mat <- do.call(cbind, pb_list)
+  rownames(pb_mat) <- rownames(counts)
+  colnames(pb_mat) <- paste0(group_tbl$sample, "_C", group_tbl$seurat_clusters)
+
+  dge_global <- DGEList(pb_mat)
+  keep_global <- rowSums(cpm(dge_global) > 1) >= 2
+  if (sum(keep_global) == 0) {
+    warning("[PSEUDOBULK] All genes filtered out. Skipping pseudobulk DE.")
+    perform_pseudobulk <- FALSE
+  } else {
+    pb_mat <- pb_mat[keep_global, , drop = FALSE]
+  }
+
+  if (perform_pseudobulk) {
+    cluster_label <- sub(".*_C", "", colnames(pb_mat))
+    cluster_label <- as.integer(cluster_label)
+    cluster_ids <- sort(unique(cluster_label))
+    all_markers_pb <- list()
+
+    for (cl in cluster_ids) {
+      group_factor <- factor(ifelse(cluster_label == cl, paste0("Cluster", cl), "Other"))
+      if (sum(group_factor == paste0("Cluster", cl)) < 1 || sum(group_factor == "Other") < 1) next
+
+      dge <- DGEList(pb_mat)
+      dge <- calcNormFactors(dge, method = "TMM")
+      design <- model.matrix(~0 + group_factor)
+      colnames(design) <- levels(group_factor)
+      if (!all(c(paste0("Cluster", cl), "Other") %in% colnames(design))) next
+
+      dge <- estimateDisp(dge, design)
+      fit <- glmQLFit(dge, design)
+
+      contrast_vec <- setNames(rep(0, ncol(design)), colnames(design))
+      contrast_vec[paste0("Cluster", cl)] <- 1
+      contrast_vec["Other"] <- -1
+
+      qlf <- glmQLFTest(fit, contrast = contrast_vec)
+      tt <- topTags(qlf, n = Inf)$table
+      tt$cluster <- cl
+      tt$gene <- rownames(tt)
+      all_markers_pb[[as.character(cl)]] <- tt
+    }
+
+    if (length(all_markers_pb) == 0) {
+      warning("[PSEUDOBULK] No pseudobulk contrasts produced results.")
+      markers_pb <- data.frame()
+    } else {
+      markers_pb <- dplyr::bind_rows(all_markers_pb) |>
+        dplyr::filter(FDR < 0.05, logFC > 0.5)
+    }
+
+    write.csv(markers_pb, "pseudobulk_markers.csv", row.names = FALSE)
+
+    if (exists("markers_high_spec") && nrow(markers_high_spec) > 0) {
+      markers_high_spec <- markers_high_spec |>
+        dplyr::mutate(cluster = as.character(cluster),
+                      gene = as.character(gene))
+    }
+    if (nrow(markers_pb) > 0) {
+      markers_pb <- markers_pb |>
+        dplyr::mutate(cluster = as.character(cluster),
+                      gene = as.character(gene))
+    }
+
+    if (nrow(markers_high_spec) > 0 && nrow(markers_pb) > 0) {
+      final_markers <- markers_high_spec |>
+        dplyr::inner_join(markers_pb, by = c("cluster","gene")) |>
+        dplyr::filter(!grepl("^MT-", gene),
+                      !grepl("^RPS|^RPL", gene),
+                      !gene %in% c("ACTB","GAPDH","EEF1A1","B2M")) |>
+        dplyr::arrange(cluster, dplyr::desc(avg_log2FC))
+    } else {
+      final_markers <- markers_high_spec
+    }
+  } else {
+    final_markers <- markers_high_spec
+  }
+} else {
+  final_markers <- markers_high_spec
+}
+
+write.csv(final_markers, "final_enriched_markers.csv", row.names = FALSE)
+
+# -----------------------
+# TAU SPECIFICITY
+# -----------------------
+message("[INFO] Computing tau specificity...")
+DefaultAssay(seurat_integrated) <- if (perform_integration) "SCT" else DefaultAssay(seurat_integrated)
+expr_mat <- GetAssayData(seurat_integrated, slot = "data")
+cluster_ids <- Idents(seurat_integrated)
+cluster_means <- sapply(levels(cluster_ids), function(cl)
+  Matrix::rowMeans(expr_mat[, cluster_ids == cl, drop = FALSE]))
+tau <- function(x) if (all(x == 0)) NA_real_ else 1 - sum(x / max(x)) / (length(x)-1)
+tau_scores <- apply(cluster_means, 1, tau)
+spec_df <- data.frame(gene = names(tau_scores), tau = tau_scores)
+final_markers_tau <- final_markers %>%
+  left_join(spec_df, by = "gene") %>%
+  arrange(cluster, desc(tau), desc(avg_log2FC))
+write.csv(final_markers_tau, "final_enriched_markers_with_tau.csv", row.names = FALSE)
+
+# -----------------------
+# ENRICHMENT
+# -----------------------
+message("[INFO] Functional enrichment (GO/KEGG)...")
+convert_symbols <- function(symbols) {
+  mapped <- bitr(symbols, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)
+  unique(mapped$ENTREZID)
+}
+clusters <- unique(final_markers_tau$cluster)
+for (cl in clusters) {
+  genes_cl <- final_markers_tau %>%
+    filter(cluster == cl) %>%
+    head(100) %>% pull(gene)
+  entrez <- convert_symbols(genes_cl)
+  if (length(entrez) < 5) next
+  ego <- tryCatch(enrichGO(gene = entrez, OrgDb = org.Hs.eg.db, ont = "BP",
+                           pAdjustMethod = "BH", qvalueCutoff = 0.05, readable = TRUE),
+                  error = function(e) NULL)
+  ekegg <- tryCatch(enrichKEGG(gene = entrez, organism = "hsa",
+                               pAdjustMethod = "BH", qvalueCutoff = 0.05),
+                    error = function(e) NULL)
+  if (inherits(ego, "enrichResult") && nrow(as.data.frame(ego)) > 0)
+    write.csv(as.data.frame(ego), paste0("cluster_", cl, "_GO.csv"), row.names = FALSE)
+  if (inherits(ekegg, "enrichResult") && nrow(as.data.frame(ekegg)) > 0)
+    write.csv(as.data.frame(ekegg), paste0("cluster_", cl, "_KEGG.csv"), row.names = FALSE)
+}
+
+# -----------------------
+# UMAP
+# -----------------------
+message("[INFO] Plotting UMAP clusters...")
+pdf("umap_clusters.pdf", width = 10, height = 6)
+print(
+  DimPlot(seurat_integrated, group.by = "seurat_clusters",
+          label = TRUE, repel = TRUE) + ggtitle("UMAP: Clusters")
+)
+dev.off()
+
+# -----------------------
+# SAVE OBJECT
+# -----------------------
+message("[INFO] Saving integrated object & metadata...")
+saveRDS(seurat_integrated, "seurat_integrated.rds")
+write.csv(seurat_integrated@meta.data, "metadata_integrated.csv", row.names = TRUE)
+
+message("[DONE] Pipeline completed successfully.")
