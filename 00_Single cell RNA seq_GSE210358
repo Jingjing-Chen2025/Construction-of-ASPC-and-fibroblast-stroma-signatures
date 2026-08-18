@@ -1,0 +1,284 @@
+# ========================
+# Single-cell RNA-seq processing from dense CSV count matrices
+# ========================
+# Pipeline overview:
+#   1. Load libraries
+#   2. Read dense CSV expression matrices (robust orientation + duplicate column handling)
+#   3. Merge samples & preprocessing (Normalize, HVGs, Scale, PCA, neighbors, clustering, UMAP)
+#   4. Identify cluster markers (stratified by placeholder genotype = Unknown)
+#   5. Cell type annotation via SingleR (Mouse reference)
+#   6. Human‑readable cluster naming and visualization
+#   7. Export results (including PDF plots of cluster & cell type UMAPs)
+#
+# Notes:
+#   - Pseudotime analysis and genotype mapping removed per user request.
+#   - Loader auto-detects orientation (genes-in-rows vs genes-in-columns) and handles duplicated columns.
+#   - Cluster naming uses a safe mapping that avoids metadata assignment errors.
+#   - PDF outputs added: umap_clusters_named.pdf, umap_celltypes.pdf, umap_clusters_named_and_celltypes.pdf
+# ========================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(SingleR)
+  library(celldex)
+  library(Matrix)
+  library(SingleCellExperiment)
+  library(data.table)
+  # patchwork is used for combining plots with '+'
+  library(patchwork)
+})
+
+# ========================
+# STEP 2: Load Dense CSV Data (Robust)
+# ========================
+base_dir <- "/Volumes/Jingjing Chen/GSE210358/data/raw"
+dense_files <- c(
+  "GSM6428961_2513_HMP_17_IGO_11874_35_dense.csv.gz",
+  "GSM6428960_2016_JZHP_04_IGO_11245_7_dense.csv.gz",
+  "GSM6428952_1778_JZ_HMP_04_IGO_10726_2_dense.csv.gz"
+)
+
+# Heuristic helper to spot gene-like strings
+is_gene_vector <- function(v) {
+  any(grepl("^(ENS(MUSG|G)|ENSG)", v)) ||
+    mean(nchar(v) <= 12) > 0.5 ||
+    any(grepl("^[A-Z0-9]+$", v))
+}
+
+# Identify likely metadata (non-count) columns to drop (case-insensitive)
+is_metadata_col <- function(nm) {
+  grepl("^(cluster|sum|mean|var|variance|total|barcode)$", tolower(nm))
+}
+
+read_dense_to_seurat <- function(filepath,
+                                 assume_genes_in_rows = TRUE,
+                                 force_first_col_character = TRUE,
+                                 drop_metadata = TRUE) {
+  message("[INFO] Reading ", basename(filepath))
+  if (force_first_col_character) {
+    dt <- data.table::fread(filepath, colClasses = list(character = 1))
+  } else {
+    dt <- data.table::fread(filepath)
+  }
+  if (ncol(dt) < 2) stop("File ", basename(filepath), " has <2 columns; cannot build expression matrix.")
+
+  # Deduplicate column names early
+  orig_names <- names(dt)
+  if (any(duplicated(orig_names))) {
+    message("[WARN] Duplicate column names detected in ", basename(filepath), "; making them unique.")
+    names(dt) <- make.unique(orig_names)
+  }
+
+  first_col <- dt[[1]]
+  col_names <- colnames(dt)
+
+  first_col_numeric_all <- all(!is.na(suppressWarnings(as.numeric(first_col))))
+  genes_row_style <- assume_genes_in_rows &&
+    !first_col_numeric_all &&
+    (is_gene_vector(first_col) || grepl("gene", tolower(col_names[1])))
+
+  genes_col_style <- is_gene_vector(col_names[-1]) ||
+    grepl("gene", tolower(paste(col_names, collapse = ",")))
+
+  # Optional metadata column removal
+  if (drop_metadata) {
+    meta_candidates <- which(sapply(col_names, is_metadata_col))
+    if (genes_row_style) {
+      meta_candidates <- setdiff(meta_candidates, 1L) # keep gene name column
+    }
+    if (length(meta_candidates)) {
+      message("[INFO] Dropping metadata columns: ", paste(col_names[meta_candidates], collapse = ", "))
+      dt <- dt[, -meta_candidates, with = FALSE]
+      col_names <- colnames(dt)
+      first_col <- dt[[1]]
+      first_col_numeric_all <- all(!is.na(suppressWarnings(as.numeric(first_col))))
+      genes_row_style <- assume_genes_in_rows &&
+        !first_col_numeric_all &&
+        (is_gene_vector(first_col) || grepl("gene", tolower(col_names[1])))
+      genes_col_style <- is_gene_vector(col_names[-1]) ||
+        grepl("gene", tolower(paste(col_names, collapse = ",")))
+    }
+  }
+
+  if (genes_row_style) {
+    genes <- make.unique(as.character(first_col))
+    count_df <- dt[, -1, with = FALSE]
+    for (j in seq_len(ncol(count_df))) {
+      v <- suppressWarnings(as.numeric(count_df[[j]])); v[is.na(v)] <- 0
+      set(count_df, j = j, value = v)
+    }
+    mat <- as.matrix(count_df)
+    rownames(mat) <- genes
+    if (is.null(colnames(mat)) || any(colnames(mat) == "")) {
+      colnames(mat) <- paste0("Cell_", seq_len(ncol(mat)))
+    }
+    orientation <- "genes_in_rows"
+
+  } else if (genes_col_style) {
+    cell_ids_raw <- dt[[1]]
+    cell_ids_numeric <- !is.na(suppressWarnings(as.numeric(cell_ids_raw)))
+    if (all(cell_ids_numeric)) {
+      cell_ids <- paste0("Cell_", seq_len(length(cell_ids_raw)))
+    } else {
+      cell_ids <- make.unique(as.character(cell_ids_raw))
+    }
+    count_df <- dt[, -1, with = FALSE]
+    for (j in seq_len(ncol(count_df))) {
+      v <- suppressWarnings(as.numeric(count_df[[j]])); v[is.na(v)] <- 0
+      set(count_df, j = j, value = v)
+    }
+    mat_raw <- as.matrix(count_df)
+    colnames(mat_raw) <- make.unique(colnames(count_df))
+    rownames(mat_raw) <- cell_ids
+    mat <- t(mat_raw)  # genes x cells
+    orientation <- "genes_in_columns_transposed"
+
+  } else {
+    if (first_col_numeric_all) {
+      message("[WARN] First column numeric; synthesizing gene names for ", basename(filepath))
+      genes <- paste0("Gene_", seq_len(nrow(dt)))
+    } else {
+      genes <- make.unique(as.character(first_col))
+    }
+    count_df <- dt[, -1, with = FALSE]
+    for (j in seq_len(ncol(count_df))) {
+      v <- suppressWarnings(as.numeric(count_df[[j]])); v[is.na(v)] <- 0
+      set(count_df, j = j, value = v)
+    }
+    mat <- as.matrix(count_df)
+    rownames(mat) <- genes
+    if (is.null(colnames(mat)) || any(colnames(mat) == "")) {
+      colnames(mat) <- paste0("Cell_", seq_len(ncol(mat)))
+    }
+    orientation <- "fallback_genes_in_rows"
+  }
+
+  sparse_mat <- as(mat, "dgCMatrix")
+  sample_name <- sub("_dense\\.csv\\.gz$", "", basename(filepath))
+  seu <- CreateSeuratObject(counts = sparse_mat, project = sample_name)
+  seu$sample <- sample_name
+  seu$genotype <- "Unknown"
+  seu@misc$import_info <- list(
+    file = basename(filepath),
+    orientation = orientation,
+    n_genes = nrow(sparse_mat),
+    n_cells = ncol(sparse_mat),
+    dropped_metadata = drop_metadata
+  )
+  message("[INFO] Imported ", sample_name, ": ",
+          nrow(sparse_mat), " genes x ", ncol(sparse_mat), " cells (", orientation, ")")
+  seu
+}
+
+seurat_list <- lapply(file.path(base_dir, dense_files), read_dense_to_seurat)
+names(seurat_list) <- sub("_dense\\.csv\\.gz$", "", dense_files)
+
+# ========================
+# STEP 3: Merge & Preprocess
+# ========================
+seurat_obj <- merge(seurat_list[[1]], y = seurat_list[-1])
+seurat_obj <- NormalizeData(seurat_obj)
+seurat_obj <- FindVariableFeatures(seurat_obj, nfeatures = 1000)
+seurat_obj <- ScaleData(seurat_obj)
+seurat_obj <- RunPCA(seurat_obj, npcs = 20)
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:20)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.05)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:20)
+
+# ========================
+# STEP 4: Identify Cluster Markers by Genotype (placeholder)
+# ========================
+tmp_obj <- JoinLayers(seurat_obj)
+genotypes <- unique(tmp_obj$genotype)
+for (g in genotypes) {
+  seu_g <- subset(tmp_obj, genotype == g)
+  seu_g <- JoinLayers(seu_g)
+  markers_g <- FindAllMarkers(
+    seu_g,
+    only.pos = TRUE,
+    min.pct = 0.25,
+    logfc.threshold = 0.25
+  )
+  p_col <- if ("p_val_adj" %in% colnames(markers_g)) {
+    "p_val_adj"
+  } else if ("p_val" %in% colnames(markers_g)) {
+    "p_val"
+  } else {
+    stop("No p-value column found in markers_g")
+  }
+  sig_markers_g <- dplyr::filter(markers_g, .data[[p_col]] < 0.05)
+  write.csv(sig_markers_g, paste0("cluster.markers.sig_", g, ".csv"), row.names = FALSE)
+}
+
+# ========================
+# STEP 5: Cell Type Annotation via SingleR
+# ========================
+seurat_obj <- JoinLayers(seurat_obj)
+suppressWarnings({
+  sce <- as.SingleCellExperiment(seurat_obj)
+})
+ref <- celldex::MouseRNAseqData()
+sr <- SingleR(
+  test = sce,
+  ref = ref,
+  labels = ref$label.main,
+  assay.type.test = "counts"
+)
+seurat_obj$celltype <- sr$labels
+Idents(seurat_obj) <- seurat_obj$seurat_clusters
+
+# ========================
+# STEP 6: Safe Cluster Naming & Visualization
+# ========================
+cl_ids <- Idents(seurat_obj)  # factor of cluster IDs per cell
+cluster_name_map <- setNames(paste0("Cluster_", levels(cl_ids)), levels(cl_ids))
+cluster_name_vec <- cluster_name_map[as.character(cl_ids)]
+names(cluster_name_vec) <- colnames(seurat_obj)  # align names with cells
+seurat_obj$cluster_name <- cluster_name_vec
+
+p_clusters <- DimPlot(
+  seurat_obj,
+  group.by = "cluster_name",
+  label = TRUE,
+  repel = TRUE,
+  label.size = 4
+) +
+  ggtitle("UMAP: Named Clusters") +
+  labs(color = "Cluster")
+
+p_celltype <- DimPlot(
+  seurat_obj,
+  group.by = "celltype",
+  label = TRUE,
+  repel = TRUE,
+  label.size = 4
+) +
+  ggtitle("UMAP: Cell Type Annotation") +
+  labs(color = "Cell Type")
+
+# ========================
+# STEP 6b: Save UMAPs to PDF
+# ========================
+pdf("umap_clusters_named.pdf", width = 8, height = 6)
+print(p_clusters)
+dev.off()
+
+pdf("umap_celltypes.pdf", width = 8, height = 6)
+print(p_celltype)
+dev.off()
+
+pdf("umap_clusters_named_and_celltypes.pdf", width = 12, height = 6)
+print(p_clusters + p_celltype)
+dev.off()
+
+# Also optionally save a PNG (uncomment if needed):
+# ggsave("umap_clusters_named.png", p_clusters, width = 8, height = 6, dpi = 300)
+# ggsave("umap_celltypes.png", p_celltype, width = 8, height = 6, dpi = 300)
+
+# ========================
+# STEP 7: Export Outputs
+# ========================
+saveRDS(seurat_obj, "seurat_merged.rds")
+write.csv(seurat_obj@meta.data, "metadata_merged.csv", row.names = TRUE)
