@@ -1,0 +1,499 @@
+# Calculate tau (Yanai tissue/celltype specificity index) per gene across multiple scRNA-seq datasets
+#
+# This version REPLACES BOTH:
+# 1) clustering functions: NO Seurat clustering (avoids Seurat internal issues)
+# 2) MAIN LOOP: NO calls to cluster_with_seurat() / tau_from_seurat()
+#
+# Key bugfix (your traceback):
+# - Matrix::cBind is DEFUNCT in Matrix >= 1.7.x
+# - Replace do.call(Matrix::cBind, ...) with do.call(cbind, ...)  (base cbind works for dgCMatrix)
+#
+# Seurat is used ONLY for Read10X() IO convenience.
+
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(data.table)
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(tools)
+})
+
+# Seurat used only for Read10X()
+if (!requireNamespace("Seurat", quietly = TRUE)) {
+  stop("Please install Seurat (used only for Read10X): install.packages('Seurat')")
+}
+suppressPackageStartupMessages(library(Seurat))
+
+if (!requireNamespace("irlba", quietly = TRUE)) {
+  stop("Please install irlba: install.packages('irlba')")
+}
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+cfg <- list(
+  out_dir = "tau_results",
+
+  # QC thresholds
+  min_cells = 3,
+  min_features = 200,
+
+  # non-Seurat clustering params
+  hvgs = 2000,
+  n_pcs = 30,
+  n_clusters = 8,     # kmeans K; adjust as desired
+  kmeans_nstart = 10,
+
+  # outputs requested
+  marker_top_n = 100
+)
+
+dir.create(cfg$out_dir, showWarnings = FALSE, recursive = TRUE)
+msg <- function(...) cat("[INFO]", sprintf(...), "\n")
+warn_msg <- function(...) cat("[WARN]", sprintf(...), "\n")
+
+# -----------------------------
+# Tau (Yanai)
+# -----------------------------
+calc_tau_from_pseudobulk <- function(pb_mat) {
+  apply(pb_mat, 1, function(x) {
+    mx <- max(x, na.rm = TRUE)
+    if (!is.finite(mx) || mx <= 0) return(0)
+    sum(1 - (x / mx), na.rm = TRUE) / (length(x) - 1)
+  })
+}
+
+# -----------------------------
+# Helpers: sanitize + collapse duplicates (genes)
+# -----------------------------
+sanitize_gene_names <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_trim(x)
+  x <- gsub("\uFEFF", "", x, fixed = TRUE)
+  x <- gsub("\r", "", x, fixed = TRUE)
+  x <- gsub("_", "-", x, fixed = FALSE)
+  x[x == "" | is.na(x)] <- "NA_FEATURE"
+  x
+}
+
+sanitize_cell_names <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_trim(x)
+  x <- gsub("\uFEFF", "", x, fixed = TRUE)
+  x <- gsub("\r", "", x, fixed = TRUE)
+  x[x == "" | is.na(x)] <- "NA_CELL"
+  x
+}
+
+collapse_duplicate_features <- function(mat, dataset_name = NA_character_) {
+  rn <- rownames(mat)
+  stopifnot(!is.null(rn))
+
+  dup <- duplicated(rn)
+  if (!any(dup)) return(mat)
+
+  dups <- unique(rn[dup])
+  warn_msg("Dataset %s: collapsing %d duplicated genes (sum rows). Example: %s",
+           dataset_name, length(dups), paste(head(dups, 10), collapse = ", "))
+
+  f <- factor(rn, levels = unique(rn))
+  G <- Matrix::sparse.model.matrix(~ 0 + f)
+  agg <- Matrix::t(G) %*% mat
+  rownames(agg) <- levels(f)
+  agg
+}
+
+# -----------------------------
+# Dense reader returning counts + clusters (for GSE210358 dense format)
+# -----------------------------
+read_dense_csv_gz_with_cluster <- function(path, dataset_name) {
+  stopifnot(file.exists(path))
+
+  dt <- data.table::fread(cmd = paste("gzip -cd", shQuote(path)), data.table = FALSE)
+  if (ncol(dt) < 3) stop("Dense file has too few columns: ", path)
+
+  if (!("V1" %in% colnames(dt))) colnames(dt)[1] <- "V1"
+  if (!("CLUSTER" %in% colnames(dt))) stop("Expected CLUSTER column not found in dense file: ", path)
+
+  cell_id <- sanitize_cell_names(dt[["V1"]])
+  cluster <- as.character(dt[["CLUSTER"]]) |> stringr::str_trim()
+
+  gene_df <- dt[, setdiff(colnames(dt), c("V1", "CLUSTER")), drop = FALSE]
+  mat_cell_by_gene <- as.matrix(gene_df)
+  storage.mode(mat_cell_by_gene) <- "numeric"
+  genes <- sanitize_gene_names(colnames(mat_cell_by_gene))
+
+  if (any(duplicated(genes))) {
+    warn_msg("Dataset %s: collapsing duplicated gene columns in dense file by summing.", dataset_name)
+    idx <- split(seq_along(genes), genes)
+    mat_cell_by_gene <- sapply(names(idx), function(g) {
+      cols <- idx[[g]]
+      if (length(cols) == 1) mat_cell_by_gene[, cols] else rowSums(mat_cell_by_gene[, cols, drop = FALSE])
+    })
+    mat_cell_by_gene <- as.matrix(mat_cell_by_gene)
+    colnames(mat_cell_by_gene) <- names(idx)
+  } else {
+    colnames(mat_cell_by_gene) <- genes
+  }
+
+  mat_gene_by_cell <- t(mat_cell_by_gene)
+  rownames(mat_gene_by_cell) <- sanitize_gene_names(rownames(mat_gene_by_cell))
+  colnames(mat_gene_by_cell) <- make.unique(cell_id)
+
+  mat_gene_by_cell <- as(mat_gene_by_cell, "dgCMatrix")
+  mat_gene_by_cell <- collapse_duplicate_features(mat_gene_by_cell, dataset_name = dataset_name)
+
+  clusters_named <- cluster
+  names(clusters_named) <- colnames(mat_gene_by_cell)
+
+  list(counts = mat_gene_by_cell, clusters = clusters_named)
+}
+
+# -----------------------------
+# Loaders (non-dense)
+# -----------------------------
+read_10x_folder <- function(folder) {
+  stopifnot(dir.exists(folder))
+  mat <- Seurat::Read10X(data.dir = folder)
+  if (is.list(mat)) {
+    if ("Gene Expression" %in% names(mat)) mat <- mat[["Gene Expression"]] else mat <- mat[[1]]
+  }
+  as(mat, "dgCMatrix")
+}
+
+read_10x_triplet_files <- function(barcodes, features, matrix_mtx) {
+  stopifnot(file.exists(barcodes), file.exists(features), file.exists(matrix_mtx))
+
+  bc <- readLines(gzfile(barcodes))
+  feat_dt <- data.table::fread(features, header = FALSE)
+
+  gene_names <- if (ncol(feat_dt) >= 2) feat_dt[[2]] else feat_dt[[1]]
+  gene_names <- sanitize_gene_names(gene_names)
+
+  m <- Matrix::readMM(gzfile(matrix_mtx))
+  m <- as(m, "dgCMatrix")
+
+  rownames(m) <- make.unique(gene_names)
+  colnames(m) <- make.unique(bc)
+  m
+}
+
+read_gene_cell_exprs_table <- function(path) {
+  stopifnot(file.exists(path))
+  dt <- data.table::fread(cmd = paste("gzip -cd", shQuote(path)), data.table = TRUE)
+
+  cn <- tolower(names(dt))
+  if (all(c("gene", "cell", "expr") %in% cn)) {
+    data.table::setnames(dt, names(dt), cn)
+    genes <- sanitize_gene_names(dt$gene)
+    cells <- sanitize_cell_names(dt$cell)
+    vals  <- as.numeric(dt$expr)
+
+    g_levels <- unique(genes)
+    c_levels <- unique(cells)
+    i <- match(genes, g_levels)
+    j <- match(cells, c_levels)
+
+    mat <- sparseMatrix(i = i, j = j, x = vals, dims = c(length(g_levels), length(c_levels)))
+    rownames(mat) <- g_levels
+    colnames(mat) <- c_levels
+    return(as(mat, "dgCMatrix"))
+  }
+
+  # wide fallback
+  df <- as.data.frame(dt)
+  if (!is.numeric(df[[1]])) {
+    rn <- sanitize_gene_names(df[[1]])
+    df <- df[, -1, drop = FALSE]
+    rownames(df) <- rn
+  }
+  mat <- as.matrix(df); storage.mode(mat) <- "numeric"
+  as(mat, "dgCMatrix")
+}
+
+read_10x_tarball <- function(tar_gz_path, tmp_base = tempdir()) {
+  stopifnot(file.exists(tar_gz_path))
+  outdir <- file.path(tmp_base, paste0("untar_", tools::file_path_sans_ext(basename(tar_gz_path)), "_", as.integer(Sys.time())))
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  utils::untar(tar_gz_path, exdir = outdir)
+
+  mtx <- list.files(outdir, pattern = "matrix\\.mtx(\\.gz)?$", recursive = TRUE, full.names = TRUE)
+  if (!length(mtx)) stop("No matrix.mtx found after untar: ", tar_gz_path)
+  folder <- dirname(mtx[1])
+  read_10x_folder(folder)
+}
+
+read_10x_zip <- function(zip_path, tmp_base = tempdir()) {
+  stopifnot(file.exists(zip_path))
+  outdir <- file.path(tmp_base, paste0("unzip_", tools::file_path_sans_ext(basename(zip_path)), "_", as.integer(Sys.time())))
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  utils::unzip(zip_path, exdir = outdir)
+
+  mtx <- list.files(outdir, pattern = "matrix\\.mtx(\\.gz)?$", recursive = TRUE, full.names = TRUE)
+  if (!length(mtx)) stop("No matrix.mtx found after unzip: ", zip_path)
+  folder <- dirname(mtx[1])
+  read_10x_folder(folder)
+}
+
+# -----------------------------
+# Pooling helpers (PATCHED: Matrix::cBind -> base cbind)
+# -----------------------------
+read_and_pool_10x_folders <- function(folders, dataset_name) {
+  stopifnot(length(folders) >= 2)
+  stopifnot(all(dir.exists(folders)))
+
+  mats <- lapply(folders, function(f) {
+    m <- read_10x_folder(f)
+    prefix <- basename(f)
+    colnames(m) <- paste0(prefix, "__", colnames(m))
+    m
+  })
+
+  all_genes <- unique(unlist(lapply(mats, rownames)))
+  mats2 <- lapply(mats, function(m) {
+    miss <- setdiff(all_genes, rownames(m))
+    if (length(miss)) {
+      z <- Matrix::Matrix(0, nrow = length(miss), ncol = ncol(m), sparse = TRUE)
+      rownames(z) <- miss
+      colnames(z) <- colnames(m)
+      m <- rbind(m, z)
+    }
+    m[all_genes, , drop = FALSE]
+  })
+
+  # FIX: Matrix::cBind is defunct in Matrix>=1.7
+  counts <- do.call(cbind, mats2)
+  counts <- as(counts, "dgCMatrix")
+
+  rownames(counts) <- make.unique(sanitize_gene_names(rownames(counts)))
+  colnames(counts) <- make.unique(sanitize_cell_names(colnames(counts)))
+
+  counts <- collapse_duplicate_features(counts, dataset_name = dataset_name)
+  counts
+}
+
+read_and_pool_10x_triplets <- function(triplets, dataset_name) {
+  stopifnot(length(triplets) >= 2)
+
+  mats <- lapply(triplets, function(tr) {
+    stopifnot(file.exists(tr$barcodes), file.exists(tr$features), file.exists(tr$matrix))
+    m <- read_10x_triplet_files(tr$barcodes, tr$features, tr$matrix)
+    colnames(m) <- paste0(tr$sample_prefix, "__", colnames(m))
+    m
+  })
+
+  all_genes <- unique(unlist(lapply(mats, rownames)))
+  mats2 <- lapply(mats, function(m) {
+    miss <- setdiff(all_genes, rownames(m))
+    if (length(miss)) {
+      z <- Matrix::Matrix(0, nrow = length(miss), ncol = ncol(m), sparse = TRUE)
+      rownames(z) <- miss
+      colnames(z) <- colnames(m)
+      m <- rbind(m, z)
+    }
+    m[all_genes, , drop = FALSE]
+  })
+
+  # FIX: Matrix::cBind is defunct in Matrix>=1.7
+  counts <- do.call(cbind, mats2)
+  counts <- as(counts, "dgCMatrix")
+
+  rownames(counts) <- make.unique(sanitize_gene_names(rownames(counts)))
+  colnames(counts) <- make.unique(sanitize_cell_names(colnames(counts)))
+
+  counts <- collapse_duplicate_features(counts, dataset_name = dataset_name)
+  counts
+}
+
+# -----------------------------
+# NON-SEURAT clustering functions
+# -----------------------------
+filter_cells_and_genes <- function(counts, dataset_name) {
+  gene_ncells <- Matrix::rowSums(counts > 0)
+  cell_nfeatures <- Matrix::colSums(counts > 0)
+
+  keep_genes <- gene_ncells >= cfg$min_cells
+  keep_cells <- cell_nfeatures >= cfg$min_features
+
+  msg("QC %s: keep_genes=%d/%d keep_cells=%d/%d",
+      dataset_name, sum(keep_genes), length(keep_genes), sum(keep_cells), length(keep_cells))
+
+  counts[keep_genes, keep_cells, drop = FALSE]
+}
+
+log_normalize_counts <- function(counts) {
+  lib <- Matrix::colSums(counts)
+  lib[lib == 0] <- 1
+  cpm <- t(t(counts) / lib) * 1e6
+  log1p(cpm)
+}
+
+choose_hvgs <- function(log_expr, n = cfg$hvgs) {
+  v <- apply(log_expr, 1, var)
+  names(sort(v, decreasing = TRUE))[seq_len(min(n, length(v)))]
+}
+
+cluster_counts_pca_kmeans <- function(counts, dataset_name) {
+  counts <- as(counts, "dgCMatrix")
+  rownames(counts) <- make.unique(sanitize_gene_names(rownames(counts)))
+  colnames(counts) <- make.unique(sanitize_cell_names(colnames(counts)))
+
+  counts <- collapse_duplicate_features(counts, dataset_name = dataset_name)
+  counts <- filter_cells_and_genes(counts, dataset_name)
+
+  log_expr <- log_normalize_counts(counts)
+  hvgs <- choose_hvgs(log_expr, n = cfg$hvgs)
+
+  X <- t(as.matrix(log_expr[hvgs, , drop = FALSE])) # cells x hvgs (dense)
+  npcs <- min(cfg$n_pcs, ncol(X) - 1, nrow(X) - 1)
+  if (npcs < 2) stop("Not enough cells/genes for PCA in dataset: ", dataset_name)
+
+  pca <- irlba::prcomp_irlba(X, n = npcs, center = TRUE, scale. = FALSE)
+  pcs <- pca$x
+
+  k <- min(cfg$n_clusters, nrow(pcs) - 1)
+  set.seed(123)
+  km <- stats::kmeans(pcs, centers = k, nstart = cfg$kmeans_nstart)
+
+  clusters <- as.character(km$cluster - 1) # "0.."
+  names(clusters) <- colnames(counts)
+
+  list(counts = counts, clusters = clusters)
+}
+
+calc_tau_from_counts_and_clusters_mat <- function(counts, clusters, dataset_name = NA_character_) {
+  stopifnot(inherits(counts, "dgCMatrix") || is.matrix(counts))
+  if (!inherits(counts, "dgCMatrix")) counts <- as(counts, "dgCMatrix")
+
+  clusters <- clusters[colnames(counts)]
+  keep <- !is.na(clusters)
+  counts <- counts[, keep, drop = FALSE]
+  clusters <- clusters[keep]
+
+  cl_levels <- sort(unique(as.character(clusters)))
+  pb <- sapply(cl_levels, function(cl) {
+    cells <- names(clusters)[clusters == cl]
+    Matrix::rowMeans(counts[, cells, drop = FALSE])
+  })
+  rownames(pb) <- rownames(counts)
+
+  tau <- calc_tau_from_pseudobulk(pb)
+
+  list(
+    tau_tbl = tibble(gene = rownames(pb), tau = as.numeric(tau), dataset = dataset_name),
+    pseudobulk = pb
+  )
+}
+
+top_markers_from_pseudobulk <- function(pb, top_n = cfg$marker_top_n, dataset_name = NA_character_) {
+  clusters <- colnames(pb)
+  out <- vector("list", length(clusters))
+  names(out) <- clusters
+
+  for (cl in clusters) {
+    x <- pb[, cl]
+    others <- pb[, setdiff(clusters, cl), drop = FALSE]
+    other_mean <- if (ncol(others) == 0) rep(0, length(x)) else rowMeans(others)
+    logfc <- log2(x + 1) - log2(other_mean + 1)
+
+    out[[cl]] <- tibble(
+      dataset = dataset_name,
+      cluster = cl,
+      gene = rownames(pb),
+      avg_log2FC = as.numeric(logfc)
+    ) %>%
+      arrange(desc(avg_log2FC)) %>%
+      slice_head(n = top_n)
+  }
+
+  bind_rows(out)
+}
+
+# -----------------------------
+# DATASET DEFINITIONS
+# -----------------------------
+datasets <- list(
+  # Mouse NEPC pooled
+  list(name = "mouse_GSE235036_TKO_pooled_rep1to4", cohort = "NEPC", type = "pooled_10x_folders",
+       folders = file.path("/Volumes/Jingjing Chen/GSE235036/GSE235036_RAW", c("TKO_rep1","TKO_rep2","TKO_rep3","TKO_rep4"))),
+
+  # Mouse NEPC dense
+  list(name = "mouse_GSE210358_GSM6428973_dense", cohort = "NEPC", type = "dense_csv_gz",
+       path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428973_1640_TKO_12WK_Cas1_IGO_10682_8_dense.csv.gz"),
+  list(name = "mouse_GSE210358_GSM6428974_dense", cohort = "NEPC", type = "dense_csv_gz",
+       path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428974_1641_TKO_12WK_Cas2_IGO_10682_3_dense.csv.gz"),
+  list(name = "mouse_GSE210358_GSM6428975_dense", cohort = "NEPC", type = "dense_csv_gz",
+       path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428975_1642_TKO_12WK_Cas3_IGO_10682_4_dense.csv.gz"),
+  list(name = "mouse_GSE210358_GSM6428979_dense", cohort = "NEPC", type = "dense_csv_gz",
+       path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428979_TKO12_week_1_dense.csv.gz"),
+  list(name = "mouse_GSE210358_GSM6428980_dense", cohort = "NEPC", type = "dense_csv_gz",
+       path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428980_TKO12_week_2_dense.csv.gz"),
+  list(name = "mouse_GSE210358_GSM6428981_dense", cohort = "NEPC", type = "dense_csv_gz",
+       path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428981_1213_TKO_12weeks_3_P138_IGO_09869_4_dense.csv.gz"),
+  list(name = "mouse_GSE210358_GSM6428982_dense", cohort = "NEPC", type = "dense_csv_gz",
+       path = "/Volumes/Jingjing Chen/GSE210358/data/raw/GSM6428982_1214_TKO_12weeks_4_P138_IGO_09869_5_dense.csv.gz")
+)
+
+# -----------------------------
+# MAIN LOOP (NO SEURAT CLUSTERING)
+# -----------------------------
+all_tau <- list()
+
+for (ds in datasets) {
+  dataset_name <- ds$name
+  cohort <- ds$cohort
+  msg("Processing: %s (cohort=%s)", dataset_name, cohort)
+
+  if (ds$type == "dense_csv_gz") {
+    dense <- read_dense_csv_gz_with_cluster(ds$path, dataset_name = dataset_name)
+    msg("Loaded dense (gene x cell): genes=%d cells=%d; clusters=%d",
+        nrow(dense$counts), ncol(dense$counts), length(unique(dense$clusters)))
+
+    res <- calc_tau_from_counts_and_clusters_mat(dense$counts, dense$clusters, dataset_name = dataset_name)
+    tau_tbl <- res$tau_tbl %>% mutate(cohort = cohort)
+    all_tau[[dataset_name]] <- tau_tbl
+
+    out_tau <- file.path(cfg$out_dir, paste0(dataset_name, "_tau.csv"))
+    readr::write_csv(tau_tbl, out_tau)
+    saveRDS(res$pseudobulk, file.path(cfg$out_dir, paste0(dataset_name, "_pseudobulk.rds")))
+    msg("Wrote: %s", out_tau)
+    next
+  }
+
+  # load counts
+  counts <- NULL
+  if (ds$type == "pooled_10x_folders") {
+    counts <- read_and_pool_10x_folders(ds$folders, dataset_name = dataset_name)
+  } else if (ds$type == "pooled_10x_triplet") {
+    counts <- read_and_pool_10x_triplets(ds$triplets, dataset_name = dataset_name)
+  } else if (ds$type == "10x_folder") {
+    counts <- read_10x_folder(ds$path)
+  } else if (ds$type == "10x_triplet") {
+    counts <- read_10x_triplet_files(ds$barcodes, ds$features, ds$matrix)
+  } else if (ds$type == "gene_cell_exprs_table") {
+    counts <- read_gene_cell_exprs_table(ds$path)
+  } else if (ds$type == "10x_tar") {
+    counts <- read_10x_tarball(ds$path)
+  } else if (ds$type == "10x_zip") {
+    counts <- read_10x_zip(ds$path)
+  } else {
+    warn_msg("Unknown ds$type: %s", ds$type)
+    next
+  }
+
+  msg("Loaded counts: genes=%d cells=%d", nrow(counts), ncol(counts))
+
+  clust <- cluster_counts_pca_kmeans(counts, dataset_name = dataset_name)
+  msg("Clustered %s: n_clusters=%d", dataset_name, length(unique(clust$clusters)))
+
+  res <- calc_tau_from_counts_and_clusters_mat(clust$counts, clust$clusters, dataset_name = dataset_name)
+  tau_tbl <- res$tau_tbl %>% mutate(cohort = cohort)
+  all_tau[[dataset_name]] <- tau_tbl
+
+  out_tau <- file.path(cfg$out_dir, paste0(dataset_name, "_tau.csv"))
+  readr::write_csv(tau_tbl, out_tau)
+  saveRDS(res$pseudobulk, file.path(cfg$out_dir, paste0(dataset_name, "_pseudobulk.rds")))
+  msg("Wrote: %s", out_tau)
+}
