@@ -1,26 +1,70 @@
-# WGCNA-from-scratch on bulk RNA-seq counts (UPDATED: residualization uses lm.fit, rank-deficiency safe)
-# - Input: raw counts (genes x samples in a CSV where first column is gene)
-# - Normalization: edgeR logCPM (safe for correlation-based networks)
-# - Covariates (recommended): purity, ASPC fraction, immune/stromal (QC + optional residualization)
-# - Output:
-#   1) wgcna_result.rds (datExpr, MEs, moduleColors, params)
-#   2) wgcna_module_membership.csv (gene, module, kME, kME_abs, in_wgcna_module)
-#   3) wgcna.PROVENANCE.txt
+# ============================================================================
+# 05_ WGCNA module detection + ASPC/NEPC module-trait association — v2
+# ============================================================================
+# Consumes the bulk cohort plus the single-cell feature evidence from 02_/03_,
+# and writes the module-membership table that 06_ integrates.
+#
+# ---------------------------------------------------------------------------
+# THE MAIN DEFECT IN v1
+# ---------------------------------------------------------------------------
+# v1 residualised expression on ASPC_fraction:
+#
+#     cov_use <- cov_tbl %>% select(any_of(c("purity", "ASPC_fraction",
+#                                            "immune_fraction", "stromal_fraction")))
+#
+# That regresses the ASPC signal OUT of the matrix before module detection.
+# Any co-expression module driven by adipose stem/progenitor content is
+# removed by construction, and the modules that survive cannot be ASPC
+# modules. Since 06_ uses `in_wgcna_module` as evidence that a gene belongs
+# to an ASPC-associated programme, v1's flag could not carry that meaning.
+#
+# v2 excludes ASPC_fraction from residualisation, matching the decision
+# already taken in 04_ ("do NOT residualize on ASPC_fraction because it is a
+# target"). Technical covariates — purity, immune, stromal — are still
+# removed. cfg$resid_covariates makes this explicit and auditable.
+#
+# ---------------------------------------------------------------------------
+# THE SECOND DEFECT: no module-trait step
+# ---------------------------------------------------------------------------
+# v1 flagged `in_wgcna_module` for ANY gene in ANY non-grey module with
+# |kME| >= 0.30 — roughly half the genes in a typical run. That is not
+# evidence of ASPC association; it is evidence of being co-expressed with
+# something.
+#
+# v2 adds the missing step: correlate every module eigengene with
+# ASPC_fraction and with NEPC_score, identify the ASPC-associated module(s)
+# by FDR-corrected correlation, and set `in_wgcna_module` TRUE only for genes
+# in those modules. The permissive v1 definition is retained alongside as
+# `in_any_module` so nothing is silently lost.
+#
+# ---------------------------------------------------------------------------
+# OTHER CHANGES IN v2
+# ---------------------------------------------------------------------------
+#   * Paths corrected to /Volumes/Jingjing_Chen (v1 used "Jingjing Chen").
+#   * NEPC_score computed identically to 04_ (same signature, same z-scaling)
+#     so the two scripts agree on the trait.
+#   * Residualisation vectorised: one qr.resid() solve replaces a 10,000-
+#     iteration lm.fit loop.
+#   * kME lookup vectorised via matrix indexing; v1 did a linear scan of
+#     kME_df per gene (O(n^2) — minutes on 10k genes).
+#   * Membership table annotated with tau (02_) and ratio (03_) so 06_ can
+#     see all three lines of evidence in one place.
+#   * Module-trait heatmap, eigengene table, and module summary written out.
+#   * out_dir is date-stamped automatically rather than hard-coded.
+#
+# ---------------------------------------------------------------------------
+# OUTPUTS (out_dir)
+#   wgcna_module_membership.csv   gene, module, kME, in_wgcna_module   <- 06_
+#   wgcna_module_trait.csv        module x trait correlation + FDR
+#   wgcna_module_summary.csv      per-module size, ASPC r, NEPC r, verdict
+#   wgcna_eigengenes.csv          sample x module eigengene values
+#   wgcna_result.rds              datExpr, MEs, colours, params
+#   wgcna.PROVENANCE.txt
+#   *.pdf                         QC, soft threshold, dendrogram, trait heatmap
+# ============================================================================
 
-# ---- user paths ----
-counts_csv <- "/Volumes/Jingjing Chen/Jingjing and Martin/Updated data 2023/RR1384_all_counts.csv"
-
-aspc_frac_csv <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs/ASPC_fractions.csv"
-imm_str_csv   <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs/immune_stromal_fractions.csv"
-purity_csv    <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs/purity_estimates.csv"
-
-clinical_xlsx <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ClinicalGenomicsData_WCM OS_MONTHS BMI.xlsx" # optional
-
-out_dir <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/wgcna_runs/2026-01-17"
-dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-
-# ---- install/load packages (safer) ----
-pkgs <- c("WGCNA", "edgeR", "readxl", "ggplot2", "janitor", "dplyr", "tidyr", "readr")
+pkgs <- c("WGCNA", "edgeR", "readxl", "ggplot2", "janitor", "dplyr",
+          "tidyr", "readr", "tibble", "pheatmap")
 to_install <- pkgs[!vapply(pkgs, requireNamespace, quietly = TRUE, FUN.VALUE = logical(1))]
 if (length(to_install)) install.packages(to_install)
 
@@ -33,14 +77,85 @@ suppressPackageStartupMessages({
   library(dplyr)
   library(tidyr)
   library(readr)
+  library(tibble)
 })
 
 WGCNA::allowWGCNAThreads()
+options(stringsAsFactors = FALSE)
+set.seed(123)
 
-msg <- function(...) cat("[INFO]", sprintf(...), "\n")
+msg      <- function(...) cat("[INFO]", sprintf(...), "\n")
 warn_msg <- function(...) cat("[WARN]", sprintf(...), "\n")
+hdr      <- function(...) cat("\n========================================\n",
+                              sprintf(...), "\n========================================\n", sep = "")
 
-# ---- helpers ----
+# ============================================================================
+# PATHS
+# ============================================================================
+NEPC_ROOT  <- "/Volumes/Jingjing_Chen/NEPC scRNA dataset"
+ADENO_ROOT <- "/Volumes/Jingjing_Chen/Adenocarcinoma scRNA dataset"
+
+counts_csv    <- "/Volumes/Jingjing_Chen/Jingjing and Martin/Updated data 2023/RR1384_all_counts.csv"
+
+DECON_DIR     <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs"
+aspc_frac_csv <- file.path(DECON_DIR, "ASPC_fractions.csv")
+imm_str_csv   <- file.path(DECON_DIR, "immune_stromal_fractions.csv")
+purity_csv    <- file.path(DECON_DIR, "purity_estimates.csv")
+
+clinical_xlsx <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ClinicalGenomicsData_WCM OS_MONTHS BMI.xlsx"
+
+BASE_OUT <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/wgcna_runs"
+out_dir  <- file.path(BASE_OUT, format(Sys.Date(), "%Y-%m-%d"))
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+cfg <- list(
+  # ---- gene filtering ----
+  top_var_genes   = 10000,
+
+  # ---- residualisation ----
+  residualize     = TRUE,
+  # ASPC_fraction deliberately EXCLUDED — it is the trait we want modules to
+  # correlate with. Removing it would erase the ASPC module by construction.
+  resid_covariates = c("purity", "immune_fraction", "stromal_fraction"),
+
+  # ---- network ----
+  powers          = 1:20,
+  r2_target       = 0.80,
+  fallback_power  = 6,
+  network_type    = "signed",
+  tom_type        = "signed",
+  min_module_size = 30,
+  merge_cut       = 0.25,
+
+  # ---- sample QC ----
+  outlier_cut_height = NA_real_,   # set numeric to prune the sample tree
+
+  # ---- module-trait selection ----
+  trait_fdr       = 0.05,
+  trait_min_r     = 0.30,          # |Pearson r| for a module to count as associated
+  kme_cutoff      = 0.30,          # membership threshold within a module
+
+  # ---- single-cell cross-reference ----
+  annotate_group  = "NEPC",        # which 02_/03_ tables to attach
+  annotate_root   = NEPC_ROOT,
+
+  # ---- NEPC signature — identical to 04_ ----
+  nepc_up = toupper(c(
+    "ASXL3","CAND2","ETV5","GPX2","JAKMIP2","KIAA0408","SOGA3","TRIM9","BRINP1","C7ORF76",
+    "GNAO1","KCNB2","KCND2","LRRC16B","MAP10","NRSN1","PCSK1","PROX1","RGS7","SCG3","SEC11C",
+    "SEZ6","ST8SIA3","SVOP","SYT11","AURKA","DNMT1","EZH2","MYCN"
+  )),
+  nepc_down = toupper(c(
+    "AR","CCND1","CIITA","CREBBP","CSDE1","CYLD","DICER1","FHIT","FOXP1","HERPUD1","MMP2",
+    "MYH9","NUP93","PAX8","RBBP6","TRIM33","GATA2","MAPKAPK3","SPDEF","ARHGAP8","CATSPERB",
+    "EFNA4","EPN3","EVPL","HOXB13","KLK3","KLK4","LMAN1L","NKX3-1","OPHN1","PIEZO1",
+    "PRR5-ARHGAP8","PSCA","RAB27B","RGS10","RIPK2","SLC25A37","SLC44A4","TC2N","UPK2","RB1"
+  ))
+)
+
 toupper_trim <- function(x) toupper(trimws(as.character(x)))
 safe_numeric <- function(x) suppressWarnings(as.numeric(gsub("^NO-PM\\s*[0-9]+$", NA_character_, as.character(x))))
 
@@ -51,11 +166,15 @@ read_cov <- function(path, needed_cols) {
   }
   df <- readr::read_csv(path, show_col_types = FALSE) %>% tibble::as_tibble()
   miss <- setdiff(needed_cols, names(df))
-  if (length(miss)) warn_msg("File %s missing columns: %s", path, paste(miss, collapse = ", "))
+  if (length(miss)) warn_msg("%s missing columns: %s", basename(path), paste(miss, collapse = ", "))
   df
 }
 
-# ---- 1) load counts (genes x samples) ----
+# ============================================================================
+# STEP 1 — COUNTS + NORMALISATION
+# ============================================================================
+hdr("STEP 1 — counts and normalisation")
+
 stopifnot(file.exists(counts_csv))
 counts_df <- readr::read_csv(counts_csv, show_col_types = FALSE)
 
@@ -65,49 +184,73 @@ genes <- toupper_trim(counts_df[[gene_col]])
 count_mat <- counts_df %>%
   dplyr::select(-dplyr::all_of(gene_col)) %>%
   as.data.frame()
-
 count_mat[] <- lapply(count_mat, safe_numeric)
 count_mat <- as.matrix(count_mat)
 rownames(count_mat) <- genes
 
-# remove duplicated genes safely by summing counts
 if (any(duplicated(rownames(count_mat)))) {
-  msg("Found duplicated gene symbols; summing duplicated rows.")
+  msg("Summing %d duplicated gene symbols.", sum(duplicated(rownames(count_mat))))
   count_mat <- rowsum(count_mat, group = rownames(count_mat), reorder = FALSE)
 }
+msg("Counts: %d genes x %d samples", nrow(count_mat), ncol(count_mat))
 
-# ---- 2) edgeR normalization + logCPM ----
 y <- edgeR::DGEList(counts = count_mat)
 y <- edgeR::calcNormFactors(y)
-
 keep <- edgeR::filterByExpr(y)
 y <- y[keep, , keep.lib.sizes = FALSE]
 msg("Genes kept after filterByExpr: %d", nrow(y))
 
 logCPM <- edgeR::cpm(y, log = TRUE, prior.count = 1)
 
-# WGCNA input: samples x genes
-datExpr <- t(logCPM)
-datExpr <- as.data.frame(datExpr)
-datExpr <- datExpr[, apply(datExpr, 2, sd, na.rm = TRUE) > 0, drop = FALSE]
-msg("WGCNA datExpr dimensions (samples x genes): %d x %d", nrow(datExpr), ncol(datExpr))
+# ============================================================================
+# STEP 2 — TRAITS (NEPC_score computed exactly as in 04_)
+# ============================================================================
+hdr("STEP 2 — traits")
 
-# optional: keep top variable genes (recommended for speed/stability)
-top_var_genes <- 10000
-if (ncol(datExpr) > top_var_genes) {
-  v <- apply(datExpr, 2, var, na.rm = TRUE)
-  keep_genes <- names(sort(v, decreasing = TRUE))[seq_len(top_var_genes)]
-  datExpr <- datExpr[, keep_genes, drop = FALSE]
-  msg("Kept top %d variable genes for WGCNA", top_var_genes)
+zscale_rows <- function(mat) t(scale(t(mat)))
+
+score_from_genes <- function(gset, mat) {
+  gset <- intersect(toupper(gset), rownames(mat))
+  if (!length(gset)) return(setNames(rep(NA_real_, ncol(mat)), colnames(mat)))
+  z <- zscale_rows(mat[gset, , drop = FALSE])
+  setNames(colMeans(z, na.rm = TRUE), colnames(mat))
 }
 
-# ---- 3) load covariates and align samples ----
+n_up   <- length(intersect(cfg$nepc_up,   rownames(logCPM)))
+n_down <- length(intersect(cfg$nepc_down, rownames(logCPM)))
+msg("NEPC signature present: %d/%d up, %d/%d down",
+    n_up, length(cfg$nepc_up), n_down, length(cfg$nepc_down))
+
+NEPC_score_all <- score_from_genes(cfg$nepc_up, logCPM) -
+                  score_from_genes(cfg$nepc_down, logCPM)
+
+# ============================================================================
+# STEP 3 — EXPRESSION MATRIX FOR WGCNA
+# ============================================================================
+hdr("STEP 3 — WGCNA input matrix")
+
+datExpr <- as.data.frame(t(logCPM))
+datExpr <- datExpr[, apply(datExpr, 2, sd, na.rm = TRUE) > 0, drop = FALSE]
+msg("datExpr (samples x genes): %d x %d", nrow(datExpr), ncol(datExpr))
+
+if (ncol(datExpr) > cfg$top_var_genes) {
+  v <- apply(datExpr, 2, var, na.rm = TRUE)
+  keep_genes <- names(sort(v, decreasing = TRUE))[seq_len(cfg$top_var_genes)]
+  datExpr <- datExpr[, keep_genes, drop = FALSE]
+  msg("Kept top %d variable genes.", cfg$top_var_genes)
+}
+
+# ============================================================================
+# STEP 4 — COVARIATES + ALIGNMENT
+# ============================================================================
+hdr("STEP 4 — covariates")
+
 aspc_frac <- read_cov(aspc_frac_csv, c("sample", "ASPC_fraction")) %>%
   dplyr::transmute(sample = as.character(sample), ASPC_fraction = as.numeric(ASPC_fraction))
 
 imm_str <- read_cov(imm_str_csv, c("sample", "immune_fraction", "stromal_fraction")) %>%
   dplyr::transmute(sample = as.character(sample),
-                   immune_fraction = as.numeric(immune_fraction),
+                   immune_fraction  = as.numeric(immune_fraction),
                    stromal_fraction = as.numeric(stromal_fraction))
 
 purity <- read_cov(purity_csv, c("sample", "purity")) %>%
@@ -115,127 +258,154 @@ purity <- read_cov(purity_csv, c("sample", "purity")) %>%
 
 if (!file.exists(clinical_xlsx)) warn_msg("Clinical xlsx not found (optional): %s", clinical_xlsx)
 
-# join covariates without purrr
 cov_tbl <- Reduce(function(x, y) dplyr::full_join(x, y, by = "sample"),
-                  list(aspc_frac, imm_str, purity))
+                  list(aspc_frac, imm_str, purity)) %>%
+  dplyr::filter(sample %in% rownames(datExpr))
 
-# align to datExpr samples
-cov_tbl <- cov_tbl %>% dplyr::filter(sample %in% rownames(datExpr))
+if (!nrow(cov_tbl)) stop("No overlap between covariate sample IDs and expression columns.")
+
 datExpr <- datExpr[intersect(rownames(datExpr), cov_tbl$sample), , drop = FALSE]
 cov_tbl <- cov_tbl %>% dplyr::slice(match(rownames(datExpr), sample))
+stopifnot(identical(rownames(datExpr), cov_tbl$sample))
 
-msg("Samples in WGCNA after covariate alignment: %d", nrow(datExpr))
+for (nm in c("ASPC_fraction", "immune_fraction", "stromal_fraction", "purity")) {
+  if (nm %in% names(cov_tbl)) {
+    n_na <- sum(is.na(cov_tbl[[nm]]))
+    if (n_na) {
+      warn_msg("  %s: imputing %d NA with median", nm, n_na)
+      cov_tbl[[nm]][is.na(cov_tbl[[nm]])] <- median(cov_tbl[[nm]], na.rm = TRUE)
+    }
+  }
+}
 
-# ---- 4) QC: check for good samples/genes + sample outliers ----
-gsg <- WGCNA::goodSamplesGenes(datExpr, verbose = 3)
+cov_tbl$NEPC_score <- as.numeric(NEPC_score_all[cov_tbl$sample])
+msg("Samples after alignment: %d", nrow(datExpr))
+
+# ============================================================================
+# STEP 5 — SAMPLE / GENE QC
+# ============================================================================
+hdr("STEP 5 — QC")
+
+gsg <- WGCNA::goodSamplesGenes(datExpr, verbose = 0)
 if (!gsg$allOK) {
-  warn_msg("Removing bad samples/genes detected by goodSamplesGenes.")
+  warn_msg("goodSamplesGenes: removing %d samples, %d genes",
+           sum(!gsg$goodSamples), sum(!gsg$goodGenes))
   if (sum(!gsg$goodSamples) > 0) datExpr <- datExpr[gsg$goodSamples, , drop = FALSE]
-  if (sum(!gsg$goodGenes) > 0) datExpr <- datExpr[, gsg$goodGenes, drop = FALSE]
+  if (sum(!gsg$goodGenes)   > 0) datExpr <- datExpr[, gsg$goodGenes, drop = FALSE]
   cov_tbl <- cov_tbl %>% dplyr::slice(match(rownames(datExpr), sample))
 }
 
 sampleTree <- hclust(dist(datExpr), method = "average")
 pdf(file.path(out_dir, "WGCNA_sample_clustering.pdf"), width = 10, height = 6)
 plot(sampleTree, main = "Sample clustering (WGCNA QC)", xlab = "", sub = "")
+if (!is.na(cfg$outlier_cut_height)) abline(h = cfg$outlier_cut_height, col = "red", lty = 2)
 dev.off()
 
-# Optional: remove outliers by cut height (leave NA to skip)
-cut_height <- NA_real_
-if (!is.na(cut_height)) {
-  clust <- WGCNA::cutreeStatic(sampleTree, cutHeight = cut_height, minSize = 10)
+if (!is.na(cfg$outlier_cut_height)) {
+  clust <- WGCNA::cutreeStatic(sampleTree, cutHeight = cfg$outlier_cut_height, minSize = 10)
   keep_samples <- (clust == 1)
-  msg("Outlier removal: removing %d samples using cutHeight=%.2f", sum(!keep_samples), cut_height)
+  msg("Outlier removal: dropping %d samples at cutHeight=%.2f",
+      sum(!keep_samples), cfg$outlier_cut_height)
   datExpr <- datExpr[keep_samples, , drop = FALSE]
   cov_tbl <- cov_tbl %>% dplyr::slice(match(rownames(datExpr), sample))
 }
 
-# ---- 5) OPTIONAL: residualize expression on covariates (RANK-DEFICIENCY SAFE) ----
-do_residualize <- TRUE
-if (do_residualize && nrow(cov_tbl) == nrow(datExpr)) {
+# ============================================================================
+# STEP 6 — RESIDUALISATION  (ASPC_fraction EXCLUDED — see header)
+# ============================================================================
+hdr("STEP 6 — residualisation")
 
-  cov_use <- cov_tbl %>%
-    dplyr::select(dplyr::any_of(c("purity", "ASPC_fraction", "immune_fraction", "stromal_fraction")))
+if (isTRUE(cfg$residualize) && nrow(cov_tbl) == nrow(datExpr)) {
+  msg("Residualising on: %s", paste(cfg$resid_covariates, collapse = ", "))
+  msg("  ASPC_fraction EXCLUDED — it is the module-trait target. Removing it")
+  msg("  would eliminate the ASPC module by construction (v1 defect).")
 
-  # median-impute NAs
-  for (nm in names(cov_use)) {
-    cov_use[[nm]][is.na(cov_use[[nm]])] <- median(cov_use[[nm]], na.rm = TRUE)
-  }
+  cov_use <- cov_tbl %>% dplyr::select(dplyr::any_of(cfg$resid_covariates))
 
-  # drop near-constant covariates
-  is_constant <- vapply(cov_use, function(v) sd(v, na.rm = TRUE) < 1e-8, logical(1))
-  if (any(is_constant)) {
-    warn_msg("Dropping near-constant covariates: %s", paste(names(cov_use)[is_constant], collapse = ", "))
-    cov_use <- cov_use[, !is_constant, drop = FALSE]
+  is_const <- vapply(cov_use, function(v) sd(v, na.rm = TRUE) < 1e-8, logical(1))
+  if (any(is_const)) {
+    warn_msg("  Dropping near-constant covariates: %s",
+             paste(names(cov_use)[is_const], collapse = ", "))
+    cov_use <- cov_use[, !is_const, drop = FALSE]
   }
 
   if (ncol(cov_use) > 0) {
-    msg("Residualizing datExpr on covariates: %s", paste(names(cov_use), collapse = ", "))
+    Xcov <- model.matrix(~ ., data = cov_use)
+    Y <- as.matrix(datExpr)
 
-    X <- model.matrix(~ ., data = cov_use)  # includes intercept
-    Y <- as.matrix(datExpr)                 # samples x genes
-
-    resid_mat <- matrix(NA_real_, nrow = nrow(Y), ncol = ncol(Y),
-                        dimnames = dimnames(Y))
-
-    for (j in seq_len(ncol(Y))) {
-      fit <- lm.fit(x = X, y = Y[, j])      # handles rank deficiency
-      resid_mat[, j] <- fit$residuals
+    qrX <- qr(Xcov)
+    if (qrX$rank < ncol(Xcov)) {
+      warn_msg("  Covariate matrix rank-deficient (%d of %d); QR pivoting handles it.",
+               qrX$rank, ncol(Xcov))
     }
-
+    resid_mat <- qr.resid(qrX, Y)          # all genes in one solve
+    dimnames(resid_mat) <- dimnames(Y)
     datExpr <- as.data.frame(resid_mat)
+    msg("  Residualised %d genes in a single QR solve.", ncol(Y))
   } else {
-    warn_msg("No usable covariates found to residualize; skipping.")
+    warn_msg("  No usable covariates; skipping.")
   }
+} else {
+  msg("Residualisation disabled.")
 }
 
-# ---- 6) pick soft threshold power ----
-powers <- 1:20
-sft <- WGCNA::pickSoftThreshold(datExpr, powerVector = powers, networkType = "signed", verbose = 5)
+# ============================================================================
+# STEP 7 — SOFT THRESHOLD
+# ============================================================================
+hdr("STEP 7 — soft threshold")
+
+sft <- WGCNA::pickSoftThreshold(datExpr, powerVector = cfg$powers,
+                                networkType = cfg$network_type, verbose = 0)
 
 pdf(file.path(out_dir, "WGCNA_pickSoftThreshold.pdf"), width = 10, height = 5)
 par(mfrow = c(1, 2))
-plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
-     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit, signed R^2",
-     type = "n", main = "Scale independence")
-text(sft$fitIndices[,1], -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
-     labels = powers, cex = 0.9, col = "red")
-abline(h = 0.8, col = "blue", lty = 2)
-
-plot(sft$fitIndices[,1], sft$fitIndices[,5],
-     xlab = "Soft Threshold (power)", ylab = "Mean connectivity",
-     type = "n", main = "Mean connectivity")
-text(sft$fitIndices[,1], sft$fitIndices[,5], labels = powers, cex = 0.9, col = "red")
+r2 <- -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2]
+plot(sft$fitIndices[, 1], r2, xlab = "Soft threshold (power)",
+     ylab = "Scale-free topology R^2", type = "n", main = "Scale independence")
+text(sft$fitIndices[, 1], r2, labels = cfg$powers, cex = 0.9, col = "red")
+abline(h = cfg$r2_target, col = "blue", lty = 2)
+plot(sft$fitIndices[, 1], sft$fitIndices[, 5], xlab = "Soft threshold (power)",
+     ylab = "Mean connectivity", type = "n", main = "Mean connectivity")
+text(sft$fitIndices[, 1], sft$fitIndices[, 5], labels = cfg$powers, cex = 0.9, col = "red")
 dev.off()
 
-pick_power <- function(sft, target = 0.8, fallback = 6) {
+pick_power <- function(sft, target, fallback) {
   fi <- sft$fitIndices
   if (is.null(fi) || nrow(fi) == 0) return(fallback)
-  r2 <- -sign(fi[,3]) * fi[,2]
+  r2 <- -sign(fi[, 3]) * fi[, 2]
   ok <- which(r2 >= target)
   if (length(ok)) return(fi[min(ok), 1])
+  warn_msg("No power reaches R^2 >= %.2f; using fallback %d.", target, fallback)
   fallback
 }
-softPower <- pick_power(sft, target = 0.8, fallback = 6)
+softPower <- pick_power(sft, cfg$r2_target, cfg$fallback_power)
 msg("Chosen softPower = %d", softPower)
 
-# ---- 7) run blockwiseModules ----
+# ============================================================================
+# STEP 8 — MODULE DETECTION
+# ============================================================================
+hdr("STEP 8 — blockwiseModules")
+
 net <- WGCNA::blockwiseModules(
   datExpr,
-  power = softPower,
-  networkType = "signed",
-  TOMType = "signed",
-  minModuleSize = 30,
+  power             = softPower,
+  networkType       = cfg$network_type,
+  TOMType           = cfg$tom_type,
+  minModuleSize     = cfg$min_module_size,
   reassignThreshold = 0,
-  mergeCutHeight = 0.25,
-  numericLabels = FALSE,
+  mergeCutHeight    = cfg$merge_cut,
+  numericLabels     = FALSE,
   pamRespectsDendro = TRUE,
-  saveTOMs = FALSE,
-  verbose = 3
+  saveTOMs          = FALSE,
+  verbose           = 0
 )
 
 moduleColors <- net$colors
 MEs <- WGCNA::orderMEs(net$MEs)
+
+mod_sizes <- sort(table(moduleColors), decreasing = TRUE)
+msg("Modules detected: %d (excluding grey)", sum(names(mod_sizes) != "grey"))
+print(mod_sizes)
 
 pdf(file.path(out_dir, "WGCNA_dendrogram_modules.pdf"), width = 12, height = 6)
 WGCNA::plotDendroAndColors(net$dendrograms[[1]],
@@ -244,76 +414,249 @@ WGCNA::plotDendroAndColors(net$dendrograms[[1]],
                            addGuide = TRUE, guideHang = 0.05)
 dev.off()
 
-# ---- 8) compute kME ----
-kME_mat <- WGCNA::signedKME(datExpr, MEs, outputColumnName = "kME")
-kME_df <- as.data.frame(kME_mat)
-kME_df$gene <- rownames(kME_df)
+# ============================================================================
+# STEP 9 — MODULE-TRAIT CORRELATION   [the step v1 was missing]
+# ============================================================================
+hdr("STEP 9 — module-trait association")
 
-module_of_gene <- moduleColors
-names(module_of_gene) <- names(moduleColors)  # should be colnames(datExpr)
+traits <- cov_tbl %>%
+  dplyr::select(dplyr::any_of(c("ASPC_fraction", "NEPC_score",
+                                "purity", "immune_fraction", "stromal_fraction"))) %>%
+  as.data.frame()
+rownames(traits) <- cov_tbl$sample
+traits <- traits[rownames(datExpr), , drop = FALSE]
 
-get_kme_for_gene <- function(g, mod) {
-  if (is.na(mod) || mod == "grey") return(NA_real_)
-  col <- paste0("kME", mod)
-  if (!col %in% names(kME_df)) return(NA_real_)
-  kME_df[kME_df$gene == g, col, drop = TRUE]
+keep_tr <- vapply(traits, function(v) sd(v, na.rm = TRUE) > 1e-8, logical(1))
+traits <- traits[, keep_tr, drop = FALSE]
+msg("Traits tested: %s", paste(colnames(traits), collapse = ", "))
+
+nSamples <- nrow(datExpr)
+moduleTraitCor <- WGCNA::cor(MEs, traits, use = "pairwise.complete.obs")
+moduleTraitP   <- WGCNA::corPvalueStudent(moduleTraitCor, nSamples)
+
+mt_tbl <- as.data.frame(moduleTraitCor) %>%
+  tibble::rownames_to_column("ME") %>%
+  tidyr::pivot_longer(-ME, names_to = "trait", values_to = "r") %>%
+  left_join(
+    as.data.frame(moduleTraitP) %>%
+      tibble::rownames_to_column("ME") %>%
+      tidyr::pivot_longer(-ME, names_to = "trait", values_to = "p"),
+    by = c("ME", "trait")
+  ) %>%
+  mutate(module = sub("^ME", "", ME),
+         fdr = p.adjust(p, method = "BH")) %>%
+  select(module, ME, trait, r, p, fdr) %>%
+  arrange(trait, desc(abs(r)))
+
+readr::write_csv(mt_tbl, file.path(out_dir, "wgcna_module_trait.csv"))
+msg("Wrote wgcna_module_trait.csv")
+
+# ---- identify ASPC-associated modules ----
+aspc_mt <- mt_tbl %>%
+  filter(trait == "ASPC_fraction", module != "grey")
+
+aspc_modules <- aspc_mt %>%
+  filter(fdr < cfg$trait_fdr, abs(r) >= cfg$trait_min_r) %>%
+  pull(module)
+
+if (!length(aspc_modules)) {
+  warn_msg("No module reaches FDR < %.2f AND |r| >= %.2f for ASPC_fraction.",
+           cfg$trait_fdr, cfg$trait_min_r)
+  warn_msg("Falling back to the single strongest-correlated module.")
+  aspc_modules <- aspc_mt %>% slice_max(abs(r), n = 1) %>% pull(module)
 }
 
-kME_own <- vapply(names(module_of_gene), function(g) get_kme_for_gene(g, module_of_gene[g]), numeric(1))
+msg("ASPC-associated module(s): %s", paste(aspc_modules, collapse = ", "))
+for (m in aspc_modules) {
+  row <- aspc_mt %>% filter(module == m)
+  msg("  %-14s r = %+.3f  p = %.2e  FDR = %.2e  (%d genes)",
+      m, row$r[1], row$p[1], row$fdr[1], sum(moduleColors == m))
+}
+
+nepc_mt <- mt_tbl %>% filter(trait == "NEPC_score", module != "grey")
+cat("\n--- Top modules by |r| with NEPC_score ---\n")
+print(head(as.data.frame(nepc_mt), 5))
+
+# ---- heatmap ----
+if (requireNamespace("pheatmap", quietly = TRUE) && nrow(moduleTraitCor) > 1) {
+  lab <- matrix(sprintf("%.2f\n(%.0e)", moduleTraitCor, moduleTraitP),
+                nrow = nrow(moduleTraitCor), dimnames = dimnames(moduleTraitCor))
+  pdf(file.path(out_dir, "WGCNA_module_trait_heatmap.pdf"),
+      width = 8, height = max(5, 0.32 * nrow(moduleTraitCor)))
+  pheatmap::pheatmap(moduleTraitCor, display_numbers = lab, cluster_cols = FALSE,
+                     color = colorRampPalette(c("blue", "white", "red"))(51),
+                     breaks = seq(-1, 1, length.out = 52),
+                     main = "Module eigengene vs trait (r, p)", fontsize_number = 7)
+  dev.off()
+}
+
+readr::write_csv(
+  MEs %>% as.data.frame() %>% tibble::rownames_to_column("sample"),
+  file.path(out_dir, "wgcna_eigengenes.csv"))
+
+# ============================================================================
+# STEP 10 — kME AND MEMBERSHIP
+# ============================================================================
+hdr("STEP 10 — module membership")
+
+kME_mat <- WGCNA::signedKME(datExpr, MEs, outputColumnName = "kME")
+kME_mat <- as.matrix(kME_mat)
+
+gene_ids <- colnames(datExpr)
+mod_of_gene <- as.character(moduleColors)
+names(mod_of_gene) <- gene_ids
+
+# Vectorised own-module kME. v1 scanned the whole kME data frame per gene.
+own_col <- paste0("kME", mod_of_gene)
+valid <- own_col %in% colnames(kME_mat) & mod_of_gene != "grey"
+
+kME_own <- rep(NA_real_, length(gene_ids))
+if (any(valid)) {
+  idx <- cbind(match(gene_ids[valid], rownames(kME_mat)),
+               match(own_col[valid],  colnames(kME_mat)))
+  kME_own[valid] <- kME_mat[idx]
+}
 
 membership_tbl <- tibble::tibble(
-  gene = toupper_trim(names(module_of_gene)),
-  module = as.character(module_of_gene),
-  kME = as.numeric(kME_own),
+  gene    = toupper_trim(gene_ids),
+  module  = mod_of_gene,
+  kME     = as.numeric(kME_own),
   kME_abs = abs(as.numeric(kME_own))
 ) %>%
-  dplyr::mutate(in_wgcna_module = !is.na(kME) & module != "grey" & kME_abs >= 0.30) %>%
-  dplyr::arrange(dplyr::desc(in_wgcna_module), dplyr::desc(kME_abs))
+  mutate(
+    # v1 definition, retained for transparency: any non-grey module
+    in_any_module   = !is.na(kME) & module != "grey" & kME_abs >= cfg$kme_cutoff,
+    # v2 definition: restricted to ASPC-ASSOCIATED modules — what 06_ should use
+    aspc_module     = module %in% aspc_modules,
+    in_wgcna_module = aspc_module & !is.na(kME) & kME_abs >= cfg$kme_cutoff
+  )
 
-# ---- 9) save outputs ----
+# ---- attach single-cell evidence from 02_ and 03_ ----
+attach_sc <- function(tbl, group_name, root) {
+  tau_path   <- file.path(root, sprintf("tau_%s_all_datasets.csv", group_name))
+  ratio_path <- file.path(root, sprintf("ratio_%s_all_datasets.csv", group_name))
+
+  if (file.exists(tau_path)) {
+    tt <- readr::read_csv(tau_path, show_col_types = FALSE) %>%
+      transmute(gene = toupper(gene), tau_sc = tau)
+    tbl <- left_join(tbl, tt, by = "gene")
+    msg("Attached tau from 02_: %d genes matched", sum(!is.na(tbl$tau_sc)))
+  } else warn_msg("02_ tau table not found: %s", tau_path)
+
+  if (file.exists(ratio_path)) {
+    rt <- readr::read_csv(ratio_path, show_col_types = FALSE)
+    rcol <- intersect(c("aspc_specific_ratio", "ratio_max", "ratio_mean"), names(rt))[1]
+    if (!is.na(rcol)) {
+      rt <- rt %>% transmute(gene = toupper(gene), ratio_sc = .data[[rcol]])
+      tbl <- left_join(tbl, rt, by = "gene")
+      msg("Attached ratio from 03_: %d genes matched", sum(!is.na(tbl$ratio_sc)))
+    }
+  } else warn_msg("03_ ratio table not found: %s", ratio_path)
+
+  tbl
+}
+
+membership_tbl <- attach_sc(membership_tbl, cfg$annotate_group, cfg$annotate_root) %>%
+  arrange(desc(in_wgcna_module), desc(kME_abs))
+
+readr::write_csv(membership_tbl, file.path(out_dir, "wgcna_module_membership.csv"))
+
+msg("Genes in ASPC module(s) with |kME| >= %.2f : %d",
+    cfg$kme_cutoff, sum(membership_tbl$in_wgcna_module))
+msg("Genes in ANY module (v1 definition)        : %d",
+    sum(membership_tbl$in_any_module))
+
+if ("tau_sc" %in% names(membership_tbl)) {
+  ov <- membership_tbl %>% filter(in_wgcna_module, !is.na(tau_sc))
+  if (nrow(ov)) {
+    msg("Of ASPC-module genes with single-cell tau, median tau = %.3f", median(ov$tau_sc))
+    msg("  ... and %d have tau >= 0.80", sum(ov$tau_sc >= 0.80))
+  }
+}
+
+# ============================================================================
+# STEP 11 — MODULE SUMMARY
+# ============================================================================
+mod_summary <- membership_tbl %>%
+  group_by(module) %>%
+  summarise(n_genes = n(),
+            median_kME = median(kME_abs, na.rm = TRUE),
+            n_tau_high = sum(tau_sc >= 0.80, na.rm = TRUE),
+            n_ratio_high = sum(ratio_sc >= 2, na.rm = TRUE),
+            .groups = "drop") %>%
+  left_join(mt_tbl %>% filter(trait == "ASPC_fraction") %>%
+              select(module, r_ASPC = r, fdr_ASPC = fdr), by = "module") %>%
+  left_join(mt_tbl %>% filter(trait == "NEPC_score") %>%
+              select(module, r_NEPC = r, fdr_NEPC = fdr), by = "module") %>%
+  mutate(is_aspc_module = module %in% aspc_modules) %>%
+  arrange(desc(is_aspc_module), desc(abs(r_ASPC)))
+
+readr::write_csv(mod_summary, file.path(out_dir, "wgcna_module_summary.csv"))
+
+cat("\n--- Module summary ---\n")
+print(as.data.frame(mod_summary))
+
+# ============================================================================
+# STEP 12 — SAVE
+# ============================================================================
+hdr("STEP 12 — outputs")
+
 saveRDS(
   list(
-    datExpr = datExpr,
-    MEs = MEs,
-    moduleColors = moduleColors,
-    kME_matrix = kME_mat,
+    datExpr        = datExpr,
+    MEs            = MEs,
+    moduleColors   = moduleColors,
+    kME_matrix     = kME_mat,
+    moduleTraitCor = moduleTraitCor,
+    moduleTraitP   = moduleTraitP,
+    aspc_modules   = aspc_modules,
+    traits         = traits,
     params = list(
-      softPower = softPower,
-      networkType = "signed",
-      TOMType = "signed",
-      minModuleSize = 30,
-      mergeCutHeight = 0.25,
-      residualized_on_covariates = do_residualize,
-      top_variable_genes = min(top_var_genes, ncol(datExpr))
+      softPower                  = softPower,
+      networkType                = cfg$network_type,
+      TOMType                    = cfg$tom_type,
+      minModuleSize              = cfg$min_module_size,
+      mergeCutHeight             = cfg$merge_cut,
+      residualized               = cfg$residualize,
+      resid_covariates           = cfg$resid_covariates,
+      aspc_excluded_from_resid   = TRUE,
+      top_variable_genes         = ncol(datExpr),
+      trait_fdr                  = cfg$trait_fdr,
+      trait_min_r                = cfg$trait_min_r,
+      kme_cutoff                 = cfg$kme_cutoff
     )
   ),
   file.path(out_dir, "wgcna_result.rds")
 )
 
-readr::write_csv(membership_tbl, file.path(out_dir, "wgcna_module_membership.csv"))
-
 prov <- c(
   paste0("date: ", Sys.time()),
+  paste0("script: 05_wgcna.R v2"),
   paste0("counts_csv: ", counts_csv),
   paste0("aspc_frac_csv: ", aspc_frac_csv),
   paste0("imm_str_csv: ", imm_str_csv),
   paste0("purity_csv: ", purity_csv),
   paste0("clinical_xlsx: ", if (file.exists(clinical_xlsx)) clinical_xlsx else "NOT_FOUND"),
+  paste0("single_cell_annotation: ", cfg$annotate_group, " @ ", cfg$annotate_root),
   paste0("n_samples: ", nrow(datExpr)),
   paste0("n_genes: ", ncol(datExpr)),
   "normalization: edgeR logCPM(prior.count=1)",
   "filter: edgeR filterByExpr + top variable genes",
-  paste0("residualized_on_covariates: ", do_residualize),
+  paste0("residualized_on: ", paste(cfg$resid_covariates, collapse = ", ")),
+  "ASPC_fraction EXCLUDED from residualization (it is the module-trait target)",
   paste0("softPower: ", softPower),
-  "WGCNA blockwiseModules params:",
-  "  networkType=signed",
-  "  TOMType=signed",
-  "  minModuleSize=30",
-  "  mergeCutHeight=0.25",
-  "membership threshold: kME_abs >= 0.30 and module != grey"
+  paste0("networkType: ", cfg$network_type),
+  paste0("minModuleSize: ", cfg$min_module_size),
+  paste0("mergeCutHeight: ", cfg$merge_cut),
+  paste0("modules_detected: ", sum(names(mod_sizes) != "grey")),
+  paste0("ASPC-associated modules: ", paste(aspc_modules, collapse = ", ")),
+  paste0("module-trait criteria: FDR < ", cfg$trait_fdr, " AND |r| >= ", cfg$trait_min_r),
+  paste0("membership: in_wgcna_module = ASPC module AND |kME| >= ", cfg$kme_cutoff),
+  paste0("n_in_wgcna_module: ", sum(membership_tbl$in_wgcna_module)),
+  paste0("n_in_any_module (v1 definition): ", sum(membership_tbl$in_any_module))
 )
 writeLines(prov, file.path(out_dir, "wgcna.PROVENANCE.txt"))
 
-msg("Done. Outputs written to: %s", out_dir)
-msg("Membership file: %s", file.path(out_dir, "wgcna_module_membership.csv"))
-msg("Result RDS: %s", file.path(out_dir, "wgcna_result.rds"))
+msg("Outputs written to: %s", out_dir)
+hdr("05_ COMPLETE — ASPC module(s): %s | %d member genes",
+    paste(aspc_modules, collapse = ", "), sum(membership_tbl$in_wgcna_module))
