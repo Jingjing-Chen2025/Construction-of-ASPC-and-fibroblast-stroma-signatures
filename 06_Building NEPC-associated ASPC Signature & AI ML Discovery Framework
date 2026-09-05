@@ -1,62 +1,143 @@
-# End-to-end Pipeline: ASPC-driven NEPC discovery in bulk RNA-seq using AI/ML with scRNA priors
+# ============================================================================
+# 06_ Integrate evidence -> ASPC_SIGNATURE + FIBROBLAST_STROMA_SIGNATURE — v6
+# ============================================================================
+# Final integration step. Consumes the outputs of every upstream script:
 #
-# Single-file runnable script that generates:
-#   - ASPC_SIGNATURE
-#   - FIBROBLAST_STROMA_SIGNATURE
+#   01_ scRNA_batch_pipeline.R (v8)  seurat_merged.rds, cluster.markers.sig_Unknown.csv
+#   02_ calculate_tau.R        (v3)  tau_<group>_all_datasets.csv
+#   03_ target_cluster_markers (v2)  ratio_<group>_all_datasets.csv,
+#                                    target_markers_<group>_recurrence.csv
+#   04_ multitask_elasticnet   (v2)  multi_task_coefficients.csv,
+#                                    stability_selection.csv
+#   05_ wgcna                  (v2)  wgcna_module_membership.csv
 #
-# REVISION (2026-01-15):
-# - Define "high tau" as tau >= 0.95 (fixed cutoff)
-# - Enforce high_tau as a HARD FILTER for both ASPC_SIGNATURE and FIBROBLAST_STROMA_SIGNATURE
-# - NEW: Load TF/cofactor/chromatin UNION list from FILE and add evidence weight
-# - NEW: Hard check for HTML/WAF contamination in TF list (fail fast)
-# - Rest of code kept intact.
+# ---------------------------------------------------------------------------
+# CHANGE IN v6 — TARGET-SIZE SIGNATURE SELECTION
+# ---------------------------------------------------------------------------
+# The v5 run produced ASPC_SIGNATURE = 23 genes and
+# FIBROBLAST_STROMA_SIGNATURE = 0 genes. Both are unusable: 23 is too small
+# for a stable bulk score, and 0 means the ASPC-down branch is undefined.
 #
-# PATCH (2026-01-17):
-# - Load precomputed WGCNA outputs from:
-#     /Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/wgcna_runs/2026-01-17/wgcna_module_membership.csv
-#     /Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/wgcna_runs/2026-01-17/wgcna_result.rds
-# - Populate wgcna_membership with (gene, kME, in_wgcna_module)
-# - Everything else unchanged.
+# The cause is a stack of independent hard gates applied simultaneously:
+#     high_tau (tau >= 0.95)      HARD FILTER, applied first
+#   + evidence_score >= 1.0
+#   + non-NA cor_NEPC and cor_AR
+#   + directional correlation gates
+#   + ratio_mean >= 1.5
+# Each is individually defensible; their intersection is not. tau >= 0.95 in
+# particular is near-unreachable for cohorts that 01_ clustered into only 2-3
+# groups, because tau's denominator is (n_clusters - 1) — a 2-cluster cohort
+# can only produce tau = 1 - min/max, a different quantity entirely.
 #
-# PATCH (2026-01-19):
-# - Output:
-#     results_pipeline/bulk_signature_scores_NEPC_AR_ASPC_up_down.csv
-#   containing per-sample scores:
-#     NEPC_score, AR_score, ASPC_signature_score, FIBROBLAST_STROMA_signature_score
-# - Keep everything else intact.
+# v6 replaces "filter until whatever survives" with "rank, then take the top
+# N", which is how a signature of a specified size should be built:
 #
-# PATCH (2026-02-03):
-# - Replace Nelson_AR_targets with HALLMARK_ANDROGEN_RESPONSE (UP-only) for AR_score.
-# - Update AR-correlation gate for ASPC_SIGNATURE:
-#     cfg$cor_AR_max <- 0.3222
-# - Rename legacy Nelson AR fields to generic AR fields (no logic change):
-#     cor_Nelson_AR -> cor_AR
-#     cfg$cor_Nelson_AR_max -> cfg$cor_AR_max
-#     cfg$cor_Nelson_AR_down_min -> cfg$cor_AR_down_min
-# - Keep the rest of the code intact.
+#   * cfg$target_size (default 200) sets the intended signature length.
+#   * cfg$selection_mode:
+#       "adaptive"  (DEFAULT) walk a relaxation ladder from the strict v5
+#                   thresholds downward, stopping at the FIRST tier that
+#                   yields >= target_size genes, then rank within that tier
+#                   and take the top N. Never relaxes further than needed.
+#       "rank_only" apply only the minimum sanity gates, rank, take top N.
+#       "strict"    exact v5 behaviour, for reproducing the 23/0 result.
+#   * cfg$tau_floor / cfg$ratio_floor bound how far relaxation may go, so the
+#     ladder cannot silently descend into meaninglessness.
+#   * The tier actually used, and the effective thresholds, are printed and
+#     written to signature_selection_diagnostics.csv. Nothing is relaxed
+#     invisibly.
+#   * cfg$min_marker_cohorts lowered 2 -> 1. With 18 cohorts split across two
+#     groups and several clustered coarsely, requiring recurrence in >= 2
+#     cohorts caps the candidate pool below the target before any gate runs.
+#     The pool size is now reported first, since no amount of threshold
+#     relaxation can exceed it.
+#
+# Ranking within a tier is by: evidence_score, then branch ratio, then tau,
+# then |partial_corr|. The gates decide ELIGIBILITY; the ranking decides
+# MEMBERSHIP.
+#
+# ---------------------------------------------------------------------------
+# READ THE DIAGNOSTICS, NOT JUST THE GENE LISTS
+# ---------------------------------------------------------------------------
+# Relaxing a threshold to reach a target size is target-fitting. It is
+# legitimate here ONLY because the ranking is evidence-based and the achieved
+# thresholds are recorded. If the run reports that it reached 200 genes only
+# at tau >= 0.50, the honest description is "top 200 by evidence among genes
+# with tau >= 0.50", not "genes with high cell-type specificity".
+#
+# ---------------------------------------------------------------------------
+# FIXES CARRIED FORWARD
+# ---------------------------------------------------------------------------
+# v5 — top-level `if (...) expr` NEWLINE `else` is a syntax error; braced.
+#      Also added a WGCNA module-size QC gate.
+# v4 — namespace masking: select() resolved to MASS::select() because MASS is
+#      attached via WGCNA. All dplyr verbs namespace-qualified; stats::cor and
+#      stats::sd qualified because WGCNA overrides both.
+# v3 — tau column located by candidate-name search, not positional renaming.
+# v2 BUG 1 — multi_task_positive / stability_selected were hard-coded FALSE,
+#      so 4.5 of ~15 evidence points (the whole ML arm) were inert.
+# v2 BUG 2 — v1 residualised on a covariate set INCLUDING ASPC_fraction, then
+#      correlated the residual WITH ASPC_fraction: ~0 by construction.
+# v2 BUG 3 — `tau` collided on join; ASPC-down branch tested NEPC tau.
+# v2 BUG 4 — stale paths. v2 BUG 5 — %||% undefined.
+# v2 BUG 6 — in_wgcna_module meant "any non-grey module".
+# ============================================================================
 
 suppressPackageStartupMessages({
-  library(dplyr); library(readr); library(readxl); library(tidyr); library(Matrix)
-  library(ggplot2); library(stringr); library(janitor); library(purrr); library(scales)
-  library(glmnet); library(pROC)
+  library(dplyr); library(readr); library(readxl); library(tidyr); library(tibble)
+  library(Matrix); library(ggplot2); library(stringr); library(janitor)
+  library(purrr); library(scales)
 })
 
 pkg_available <- function(p) requireNamespace(p, quietly = TRUE)
-has_seurat <- pkg_available("Seurat")
-
 if (!pkg_available("ppcor")) {
-  message("[INFO] Installing 'ppcor' package because it is not currently available ...")
-  install.packages("ppcor")
+  message("[INFO] Installing 'ppcor' ...")
+  try(install.packages("ppcor"), silent = TRUE)
 }
 has_ppcor <- pkg_available("ppcor")
-if (has_ppcor) library(ppcor)
+if (has_ppcor) {
+  suppressPackageStartupMessages(library(ppcor))
+}
 
 set.seed(123)
 options(stringsAsFactors = FALSE)
 
-# -----------------------------
+msg      <- function(...) cat("[INFO]", sprintf(...), "\n")
+warn_msg <- function(...) cat("[WARN]", sprintf(...), "\n")
+hdr      <- function(...) cat("\n========================================\n",
+                              sprintf(...), "\n========================================\n", sep = "")
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# ============================================================================
+# STEP 0 — NAMESPACE CONFLICT REPORT
+# ============================================================================
+hdr("STEP 0 — namespace conflicts")
+
+report_masking <- function(fns = c("select", "filter", "mutate", "arrange",
+                                   "rename", "slice", "lag", "cor", "sd",
+                                   "dist", "combine", "count", "first")) {
+  found <- FALSE
+  for (f in fns) {
+    where <- utils::getAnywhere(f)
+    pkgs <- unique(where$where[grepl("^package:", where$where)])
+    pkgs <- sub("^package:", "", pkgs)
+    if (length(pkgs) > 1) {
+      found <- TRUE
+      cat(sprintf("  %-10s resolved from '%s'  (also in: %s)\n",
+                  f, pkgs[1], paste(pkgs[-1], collapse = ", ")))
+    }
+  }
+  if (!found) {
+    msg("  No masking detected among the verbs this script uses.")
+  } else {
+    msg("  All dplyr verbs below are namespace-qualified, so masking is harmless.")
+  }
+}
+report_masking()
+
+# ============================================================================
 # AR signature: HALLMARK_ANDROGEN_RESPONSE (UP-only)
-# -----------------------------
+# ============================================================================
 HALLMARK_ANDROGEN_RESPONSE <- unique(toupper(c(
   "ABCC4","ABHD2","ACSL3","ACTN1","ADAMTS1","ADRM1","AKAP12","AKT1","ALDH1A3","ANKH","APPBP2","ARID5B","AZGP1","B2M","B4GALT1","BMPR1B","CAMKK2","CCND1",
   "CCND3","CDC14B","CDK6","CENPN","DBI","DHCR24","DNAJB9","ELK4","ELL2","ELOVL5","FADS1","FKBP5","GNAI3","GPD1L","GSR","GUCY1A1","H1-0","HERC3","HMGCR",
@@ -66,52 +147,83 @@ HALLMARK_ANDROGEN_RESPONSE <- unique(toupper(c(
   "TSC22D1","UAP1","UBE2I","UBE2J1","VAPA","XRCC5","XRCC6","ZBTB10","ZMIZ1"
 )))
 
+# ============================================================================
+# CONFIG
+# ============================================================================
+NEPC_ROOT  <- "/Volumes/Jingjing_Chen/NEPC scRNA dataset"
+ADENO_ROOT <- "/Volumes/Jingjing_Chen/Adenocarcinoma scRNA dataset"
+
+ICLOUD     <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719"
+RES_04     <- file.path(ICLOUD, "results_pipeline")
+WGCNA_BASE <- file.path(ICLOUD, "wgcna_runs")
+
 cfg <- list(
-  human_marker_sources = list(
-    list(type="csv",   file="/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/GSE137829_RAW/final_enriched_markers_with_tau.csv", cluster=6),
-    list(type="csv",   file="/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/GSE210358/cluster.markers.sig_Unknown.csv", cluster=6),
-    list(type="excel", file="/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/GSE292074/MH_filtered_feature_exact8_clusters.xlsx", sheet="Markers_sig", cluster=4)
-  ),
+  # ---------- 02_ ----------
+  tau_nepc_csv    = file.path(NEPC_ROOT,  "tau_NEPC_all_datasets.csv"),
+  tau_adeno_csv   = file.path(ADENO_ROOT, "tau_Adeno_all_datasets.csv"),
 
-  mouse_marker_sources = list(
-    list(type="csv",   file="/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/Single cell sequencing data/cluster.markers.sig.csv", cluster=5),
-    list(type="csv",   file="/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/Single cell sequencing data/cluster.markers.sig_TKO.csv", cluster=3),
-    list(type="excel", file="/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/GSE296986/TKO_zip_clusters.xlsx", sheet="TKO_markers_sig", cluster=3),
-    list(type="excel", file="/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/GSE221755/TKO_mtx_clusters_exact8.xlsx", sheet="TKO_markers_sig", cluster=3)
-  ),
+  # ---------- 03_ ----------
+  ratio_nepc_csv   = file.path(NEPC_ROOT,  "ratio_NEPC_all_datasets.csv"),
+  ratio_adeno_csv  = file.path(ADENO_ROOT, "ratio_Adeno_all_datasets.csv"),
+  ratio_nepc_long  = file.path(NEPC_ROOT,  "ratio_NEPC_per_dataset_long.csv"),
+  ratio_adeno_long = file.path(ADENO_ROOT, "ratio_Adeno_per_dataset_long.csv"),
+  recur_nepc_csv   = file.path(NEPC_ROOT,  "target_markers_NEPC_recurrence.csv"),
+  recur_adeno_csv  = file.path(ADENO_ROOT, "target_markers_Adeno_recurrence.csv"),
 
-  aspc_down_marker_sources = list(
-    list(type="csv",   file="/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE268307/final_enriched_markers_C2.csv", cluster=2),
-    list(type="excel", file="/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE278936/cluster_markers_sig_CRPC_C2.xlsx", sheet=1, cluster=2),
-    list(type="excel", file="/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Adenocarcinoma scRNA dataset/GSE296986/cluster_markers_sig_C3.xlsx", sheet=1, cluster=3)
-  ),
+  # ---------- 04_ ----------
+  multi_task_csv  = file.path(RES_04, "multi_task_coefficients.csv"),
+  stability_csv   = file.path(RES_04, "stability_selection.csv"),
+  features_csv    = file.path(RES_04, "aspc_features_bulk.csv"),
 
-  bulk_clinical_xlsx = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ClinicalGenomicsData_WCM OS_MONTHS BMI.xlsx",
-  bulk_counts_csv    = "/Volumes/Jingjing Chen/Jingjing and Martin/Updated data 2023/RR1384_all_counts.csv",
+  # ---------- 05_ ----------
+  wgcna_dir       = NULL,
+  wgcna_max_frac  = 0.35,
 
-  scrna_reference_rds = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/scRNA_reference_ASPC_UP_human_clustered.rds",
-  aspc_cluster_labels = c("6"),
+  # ---------- bulk ----------
+  bulk_counts_csv    = "/Volumes/Jingjing_Chen/Jingjing and Martin/Updated data 2023/RR1384_all_counts.csv",
+  bulk_clinical_xlsx = file.path(ICLOUD, "ClinicalGenomicsData_WCM OS_MONTHS BMI.xlsx"),
 
-  deconv_aspc_fraction_file = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs/ASPC_fractions.csv",
-  purity_file               = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs/purity_estimates.csv",
-  immune_stromal_file       = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs/immune_stromal_fractions.csv",
+  deconv_aspc_fraction_file = file.path(ICLOUD, "deconvolution_inputs/ASPC_fractions.csv"),
+  purity_file               = file.path(ICLOUD, "deconvolution_inputs/purity_estimates.csv"),
+  immune_stromal_file       = file.path(ICLOUD, "deconvolution_inputs/immune_stromal_fractions.csv"),
 
-  ligand_file    = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/reference/ligands_of_interest.txt",
-  secreted_file  = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/reference/secreted_gene_list.txt",
-  matrisome_file = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/reference/matrisome_core.txt",
-  metabolic_file = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/reference/metabolic_genes.txt",
+  # ---------- annotation lists ----------
+  ligand_file    = file.path(ICLOUD, "reference/ligands_of_interest.txt"),
+  secreted_file  = file.path(ICLOUD, "reference/secreted_gene_list.txt"),
+  matrisome_file = file.path(ICLOUD, "reference/matrisome_core.txt"),
+  metabolic_file = file.path(ICLOUD, "reference/metabolic_genes.txt"),
+  tf_cof_chromatin_union_txt = file.path(ICLOUD, "tf_resources/TF_or_Cofactor_or_Chromatin_symbols_union.txt"),
 
-  tf_resources_hs_cof = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/tf_resources/Homo_sapiens_Cof.txt",
-  tf_resources_hs_tf  = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/tf_resources/Homo_sapiens_TF.txt",
-  tf_resources_mm_cof = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/tf_resources/Mus_musculus_Cof.txt",
-  tf_resources_mm_tf  = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/tf_resources/Mus_musculus_TF.txt",
+  # ---------- candidates ----------
+  # v6: 2 -> 1. With 18 cohorts split over two groups and several clustered
+  # coarsely, requiring recurrence in >=2 cohorts caps the pool below target.
+  min_marker_cohorts = 1,
 
-  tf_cof_chromatin_union_txt = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/tf_resources/TF_or_Cofactor_or_Chromatin_symbols_union.txt",
+  # ---------- v6 TARGET-SIZE SELECTION ----------
+  target_size        = 200,
+  selection_mode     = "adaptive",   # "adaptive" | "rank_only" | "strict"
+  tau_floor          = 0.50,         # relaxation may not go below this
+  ratio_floor        = 1.00,
+  score_floor        = 0.0,
+
+  # ---------- strict (tier 0) thresholds — the v5 values ----------
+  tau_threshold              = 0.95,
+  partial_corr_threshold     = 0.05,
+  ratio_nepc_mean_threshold  = 1.5,
+  ratio_adeno_mean_threshold = 1.5,
+  ratio_present_threshold    = 1.5,
+
+  cor_NEPC_min       = 0.0,
+  cor_AR_max         = 0.3222,
+  cor_NEPC_down_max  = 0.0,
+  cor_AR_down_min    = 0.0,
+
+  resid_covariates = c("purity", "immune_fraction", "stromal_fraction"),
 
   nepc_up = toupper(c(
     "ASXL3","CAND2","ETV5","GPX2","JAKMIP2","KIAA0408","SOGA3","TRIM9","BRINP1","C7ORF76",
     "GNAO1","KCNB2","KCND2","LRRC16B","MAP10","NRSN1","PCSK1","PROX1","RGS7","SCG3","SEC11C",
-    "SEZ6","ST8SIA3","SVOP","SVOP","SYT11","AURKA","DNMT1","EZH2","MYCN"
+    "SEZ6","ST8SIA3","SVOP","SYT11","AURKA","DNMT1","EZH2","MYCN"
   )),
   nepc_down = toupper(c(
     "AR","CCND1","CIITA","CREBBP","CSDE1","CYLD","DICER1","FHIT","FOXP1","HERPUD1","MMP2",
@@ -120,649 +232,107 @@ cfg <- list(
     "PRR5-ARHGAP8","PSCA","RAB27B","RGS10","RIPK2","SLC25A37","SLC44A4","TC2N","UPK2","RB1"
   )),
 
-  results_dir = "results_pipeline",
-
-  de_log2fc_threshold       = 0.2,
-  fdr_threshold             = 0.2,
-  min_aspc_prevalence       = 0.2,
-  min_aspc_down_prevalence  = 0.2,
-
-  stability_boot            = 100,
-  stability_thresh          = 0.2,
-
-  tau_threshold             = 0.2,
-  partial_corr_threshold    = 0.05,
-
-  cor_NEPC_min              = 0.0,
-  cor_AR_max                = 0.3222,
-
-  ratio_present_threshold = 1.5,
-
-  ratio_nepc_mean_threshold  = 1.5,
-  ratio_adeno_mean_threshold = 1.5,
-
-  tau_adeno_all_csv = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/tau_results/tau_Adeno_all_datasets.csv",
-  tau_nepc_all_csv  = "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/tau_results/tau_NEPC_all_datasets.csv",
-
-  ratio_nepc_dataset_csvs = c(
-    "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ratio_results/Human_NEPC_GSE137829_P1_P6_pooled_aspc_specific_ratio.csv",
-    "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ratio_results/Human_NEPC_GSE210358_dense_3_pooled_aspc_specific_ratio.csv",
-    "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ratio_results/Human_NEPC_GSE292074_tar_3_pooled_aspc_specific_ratio.csv",
-    "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ratio_results/Mouse_NEPC_GSE210358_TKO_dense_7_pooled_aspc_specific_ratio.csv",
-    "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ratio_results/Mouse_NEPC_GSE221755_TKO_rep1_2_triplet_pooled_aspc_specific_ratio.csv",
-    "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ratio_results/Mouse_NEPC_GSE235036_TKO_rep1_4_pooled_aspc_specific_ratio.csv",
-    "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ratio_results/Mouse_NEPC_GSE296986_TKO_T1918_T2579_pooled_aspc_specific_ratio.csv"
-  ),
-
-  ratio_adeno_dataset_csvs = c(
-    "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ratio_results/Adeno_GSE235036_SKO_tar_3_pooled_aspc_specific_ratio.csv",
-    "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ratio_results/Adeno_GSE268307_S03_S04_triplet_2_pooled_aspc_specific_ratio.csv",
-    "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ratio_results/Adeno_GSE278936_CRPC_1_5_triplet_5_pooled_aspc_specific_ratio.csv",
-    "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/ratio_results/Adeno_GSE296986_SKO_zip_3_pooled_aspc_specific_ratio.csv"
-  )
+  results_dir = file.path(RES_04, "signatures")
 )
-
-cfg$cor_NEPC_down_max <- 0.0
-cfg$cor_AR_down_min   <- 0.0
 
 w <- list(
-  high_tau                 = 2,
-  high_partial_corr        = 3,
-  in_wgcna_module          = 0.5,
-  multi_task_positive      = 1.5,
-  stability_selected       = 3,
-  atlas_supported          = 4,
-  is_ligand                = 0.5,
-  is_secreted              = 0.5,
-  is_ecm                   = 0.5,
-  is_metabolic             = 0.5,
-  is_TF_Cof_Chromatin      = 0.5
+  high_tau            = 2,
+  high_partial_corr   = 3,
+  in_wgcna_module     = 0.5,
+  multi_task_positive = 1.5,
+  stability_selected  = 3,
+  atlas_supported     = 4,
+  is_ligand           = 0.5,
+  is_secreted         = 0.5,
+  is_ecm              = 0.5,
+  is_metabolic        = 0.5,
+  is_TF_Cof_Chromatin = 0.5
 )
-
 score_threshold <- 1.0
+
 dir.create(cfg$results_dir, showWarnings = FALSE, recursive = TRUE)
 
-msg      <- function(...) cat("[INFO]", sprintf(...), "\n")
-warn_msg <- function(...) cat("[WARN]", sprintf(...), "\n")
-
-safe_make_names <- function(nms){
-  nms2 <- nms
-  nms2[is.na(nms2) | nms2 == ""] <- paste0("X_UNNAMED_", seq_len(sum(is.na(nms2) | nms2 == "")))
-  make.unique(nms2)
+# ============================================================================
+# v6 — RELAXATION LADDER
+# ============================================================================
+# Walked top to bottom. The FIRST tier yielding >= target_size genes is used;
+# ranking then selects the top N within it. Tier 0 reproduces v5 exactly.
+build_tiers <- function() {
+  list(
+    list(id = 0, label = "strict (v5)",
+         tau = 0.95, ratio = 1.50, score = 1.0, cor_gates = TRUE,  require_cor = TRUE),
+    list(id = 1, label = "tau 0.90",
+         tau = 0.90, ratio = 1.50, score = 1.0, cor_gates = TRUE,  require_cor = TRUE),
+    list(id = 2, label = "tau 0.85 / ratio 1.3",
+         tau = 0.85, ratio = 1.30, score = 1.0, cor_gates = TRUE,  require_cor = TRUE),
+    list(id = 3, label = "tau 0.80 / ratio 1.2",
+         tau = 0.80, ratio = 1.20, score = 1.0, cor_gates = TRUE,  require_cor = TRUE),
+    list(id = 4, label = "tau 0.75 / ratio 1.1 / score 0.5",
+         tau = 0.75, ratio = 1.10, score = 0.5, cor_gates = TRUE,  require_cor = TRUE),
+    list(id = 5, label = "tau 0.70 / ratio 1.0 / score 0.5",
+         tau = 0.70, ratio = 1.00, score = 0.5, cor_gates = TRUE,  require_cor = TRUE),
+    list(id = 6, label = "tau 0.60 / correlation gates dropped",
+         tau = 0.60, ratio = 1.00, score = 0.5, cor_gates = FALSE, require_cor = TRUE),
+    list(id = 7, label = "tau 0.50 / cor gates dropped / NA cor allowed",
+         tau = 0.50, ratio = 1.00, score = 0.0, cor_gates = FALSE, require_cor = FALSE)
+  )
 }
+
+# ============================================================================
+# HELPERS
+# ============================================================================
 num_safely <- function(x){
   y <- gsub("^NO-PM\\s*[0-9]+$", NA_character_, as.character(x))
   suppressWarnings(as.numeric(y))
 }
+
 zscale_cols <- function(mat){
-  if (is.null(dim(mat))) return(scale(mat)[,1])
+  if (is.null(dim(mat))) return(scale(mat)[, 1])
   t(scale(t(mat)))
 }
 
-standardize_marker_df <- function(df){
-  if (is.null(df)) return(NULL)
-  names(df) <- safe_make_names(names(df))
-
-  ren <- function(pat, new){
-    hit <- grep(pat, names(df), ignore.case = TRUE, value = TRUE)
-    if (length(hit) == 1) names(df)[names(df) == hit] <<- new
+read_list_or_empty <- function(f) {
+  if (!file.exists(f)) {
+    warn_msg("List not found: %s", f)
+    return(character(0))
   }
-
-  ren("^gene$|^symbol$|^feature$", "gene")
-  ren("^cluster$|^seurat_clusters$|^ident$|^cluster_id$", "cluster")
-  ren("^avg_log2fc$|^avg_logfc$|^log2fc$|^logfc$", "avg_log2FC")
-  ren("^p_val_adj$|^padj$|^fdr$", "p_val_adj")
-  ren("^p_val$|^pvalue$", "p_val")
-  ren("^pct\\.1$|^pct_1$|^percent\\.1$", "pct.1")
-  ren("^pct\\.2$|^pct_2$|^percent\\.2$", "pct.2")
-
-  df$cluster <- gsub("^c", "", as.character(df$cluster))
-  suppressWarnings({
-    num <- as.numeric(df$cluster)
-    if (sum(!is.na(num)) == length(df$cluster)) df$cluster <- num
-  })
-  df
+  toupper(trimws(readLines(f, warn = FALSE)))
 }
 
-load_marker_source <- function(src){
-  if (src$type == "csv") {
-    if (!file.exists(src$file)) { warn_msg("Missing CSV: %s", src$file); return(NULL) }
-    df <- tryCatch(read.csv(src$file, check.names = FALSE), error = function(e) NULL)
-  } else {
-    if (!file.exists(src$file)) { warn_msg("Missing Excel: %s", src$file); return(NULL) }
-    df <- tryCatch(readxl::read_xlsx(src$file, sheet = src$sheet), error = function(e) NULL)
+read_req <- function(path, label, required = TRUE) {
+  if (!file.exists(path)) {
+    if (required) {
+      stop(label, " not found:\n  ", path,
+           "\n  -> run the upstream script that produces it.")
+    }
+    warn_msg("%s not found (optional): %s", label, path)
+    return(NULL)
   }
-  df <- standardize_marker_df(df)
-  if (is.null(df)) return(NULL)
-  df %>% dplyr::filter(as.character(cluster) == as.character(!!src$cluster))
+  msg("  %-28s %s", label, basename(path))
+  readr::read_csv(path, show_col_types = FALSE)
 }
 
-filter_by_criteria <- function(df, log2fc_thr, fdr_thr, prev_thr){
-  if (is.null(df) || !"gene" %in% names(df)) return(character(0))
-  df <- df %>% mutate(gene = toupper(gene))
-  if ("avg_log2FC" %in% names(df)) df <- df %>% filter(!is.na(avg_log2FC), avg_log2FC >= log2fc_thr)
-  if ("p_val_adj" %in% names(df)) df <- df %>% filter(!is.na(p_val_adj), p_val_adj < fdr_thr)
-  if (all(c("pct.1","pct.2") %in% names(df))) {
-    df <- df %>% filter(!is.na(pct.1), !is.na(pct.2), pct.1 >= prev_thr, pct.2 <= (1 - prev_thr))
-  }
-  unique(df$gene)
-}
-
-read_list_or_empty <- function(f) if (file.exists(f)) toupper(readLines(f)) else character(0)
-
-# -----------------------------
-# Load TF/cofactor/chromatin union list FROM FILE for is_TF_Cof_Chromatin
-# -----------------------------
-looks_like_html_waf <- function(lines) {
-  any(grepl("<html|</html|<script|aliyunwaf|acw_sc", lines, ignore.case = TRUE))
-}
-
-if (!file.exists(cfg$tf_cof_chromatin_union_txt)) {
-  stop("TF/cofactor/chromatin union list not found: ", cfg$tf_cof_chromatin_union_txt)
-}
-
-tf_cof_chromatin <- readLines(cfg$tf_cof_chromatin_union_txt, warn = FALSE)
-tf_cof_chromatin <- gsub("\r", "", tf_cof_chromatin)
-tf_cof_chromatin <- toupper(trimws(tf_cof_chromatin))
-tf_cof_chromatin <- tf_cof_chromatin[!is.na(tf_cof_chromatin) & tf_cof_chromatin != ""]
-
-if (length(tf_cof_chromatin) == 0) {
-  stop("TF/cofactor/chromatin union list is empty: ", cfg$tf_cof_chromatin_union_txt)
-}
-if (looks_like_html_waf(tf_cof_chromatin[1:min(50, length(tf_cof_chromatin))])) {
-  stop("TF/cofactor/chromatin union list looks like HTML/WAF content, not gene symbols: ",
-       cfg$tf_cof_chromatin_union_txt)
-}
-msg("Loaded TF/cofactor/chromatin union list: %d genes", length(tf_cof_chromatin))
-
-# -----------------------------
-# PATCH: prevent many-to-many joins + memory blow-ups
-# -----------------------------
 collapse_to_unique_gene <- function(df) {
   if (is.null(df) || nrow(df) == 0) return(df)
   df <- tibble::as_tibble(df)
   if (!"gene" %in% names(df)) return(df)
-
   df <- df %>%
     dplyr::mutate(gene = toupper(as.character(gene))) %>%
     dplyr::filter(!is.na(gene) & gene != "")
-
   if (!any(duplicated(df$gene))) return(df)
-
-  df %>%
-    dplyr::group_by(gene) %>%
-    dplyr::summarise(
-      dplyr::across(where(is.logical), ~ any(.x, na.rm = TRUE)),
-      dplyr::across(where(is.numeric), ~ suppressWarnings(max(.x, na.rm = TRUE))),
-      dplyr::across(where(is.character), ~ dplyr::first(na.omit(.x))),
-      .groups = "drop"
-    )
-}
-
-maybe_collapse <- function(x) {
-  if (exists(x, inherits = TRUE)) {
-    assign(x, collapse_to_unique_gene(get(x, inherits = TRUE)), inherits = TRUE)
-  }
-}
-
-# -----------------------------
-# A) scRNA reference & tau
-# -----------------------------
-scrna_ref_mat <- NULL
-scrna_clusters <- NULL
-
-if (!file.exists(cfg$scrna_reference_rds)) {
-  warn_msg("scRNA reference file not found: %s", cfg$scrna_reference_rds)
-} else {
-  if (!has_seurat) stop("Seurat package is required to load scRNA reference for tau.")
-  suppressPackageStartupMessages(library(Seurat))
-
-  ref_obj <- readRDS(cfg$scrna_reference_rds)
-  if (!inherits(ref_obj, "Seurat")) stop("scRNA reference RDS must be a Seurat object.")
-
-  assay_use <- if ("RNA" %in% names(ref_obj@assays)) "RNA" else Seurat::DefaultAssay(ref_obj)
-  Seurat::DefaultAssay(ref_obj) <- assay_use
-
-  get_mat_try <- function(...) {
-    tryCatch(as.matrix(Seurat::GetAssayData(ref_obj, assay = assay_use, ...)), error = function(e) NULL)
-  }
-
-  mat <- get_mat_try(slot = "data")
-  if (is.null(mat) || nrow(mat) == 0) mat <- get_mat_try(slot = "counts")
-  if (is.null(mat) || nrow(mat) == 0) mat <- get_mat_try(layer = "data")
-  if (is.null(mat) || nrow(mat) == 0) mat <- get_mat_try(layer = "counts")
-  if (is.null(mat) || nrow(mat) == 0) mat <- get_mat_try(layer = "scale.data")
-
-  if (is.null(mat) || nrow(mat) == 0) stop("Failed to extract expression matrix from scRNA reference.")
-  scrna_ref_mat <- mat
-
-  md <- ref_obj@meta.data
-  if ("seurat_clusters" %in% colnames(md)) {
-    cl <- as.character(md$seurat_clusters)
-    names(cl) <- rownames(md)
-  } else {
-    id <- Seurat::Idents(ref_obj)
-    cl <- as.character(id)
-    names(cl) <- names(id)
-  }
-  scrna_clusters <- cl[colnames(scrna_ref_mat)]
-}
-
-compute_tau <- function(mat, clusters, target_labels){
-  if (is.null(mat) || is.null(clusters)) return(NULL)
-
-  if (!is.null(names(clusters))) clusters <- clusters[colnames(mat)]
-  keep <- !is.na(clusters)
-  if (sum(keep) == 0) return(NULL)
-
-  mat <- mat[, keep, drop = FALSE]
-  clusters <- clusters[keep]
-
-  cluster_levels <- unique(clusters)
-  target_cols <- which(cluster_levels %in% target_labels)
-  if (!length(target_cols)) return(NULL)
-
-  pb <- sapply(cluster_levels, function(cl){
-    cells <- names(clusters)[clusters == cl]
-    rowMeans(mat[, cells, drop = FALSE], na.rm = TRUE)
-  })
-  rownames(pb) <- rownames(mat)
-
-  tau_vec <- apply(pb, 1, function(x){
-    mx <- max(x)
-    if (mx <= 0) return(0)
-    (sum(1 - (x / mx))) / (length(x) - 1)
-  })
-
-  target_expr <- apply(pb[, target_cols, drop = FALSE], 1, mean)
-  other_expr  <- apply(pb[, -target_cols, drop = FALSE], 1, max)
-  spec_ratio  <- ifelse(other_expr > 0, target_expr / other_expr, Inf)
-
-  tibble(gene = toupper(rownames(pb)), tau = tau_vec, aspc_specific_ratio = spec_ratio)
-}
-
-tau_tbl <- compute_tau(scrna_ref_mat, scrna_clusters, cfg$aspc_cluster_labels)
-
-# ================================
-# REVISION: set high tau threshold as tau >= 0.95 (fixed cutoff)
-# ================================
-cfg$tau_threshold <- 0.95
-msg("Fixed cfg$tau_threshold (tau >= 0.95) = %.6f", cfg$tau_threshold)
-
-# -----------------------------
-# NEW: load tau result tables from disk and merge into tau_tbl
-# -----------------------------
-read_tau_csv <- function(path) {
-  if (!file.exists(path)) {
-    warn_msg("Missing tau CSV: %s", path)
-    return(NULL)
-  }
-  df <- readr::read_csv(path, show_col_types = FALSE)
-  if (!("gene" %in% names(df))) {
-    warn_msg("tau CSV missing 'gene' column: %s", path)
-    return(NULL)
-  }
-  df %>%
-    dplyr::mutate(gene = toupper(as.character(gene)))
-}
-
-tau_nepc_disk  <- read_tau_csv(cfg$tau_nepc_all_csv)
-tau_adeno_disk <- read_tau_csv(cfg$tau_adeno_all_csv)
-
-tau_tbl <- tau_tbl %||% tibble(gene = character())
-
-if (!is.null(tau_nepc_disk)) {
-  tau_tbl <- dplyr::full_join(tau_tbl, tau_nepc_disk, by = "gene", suffix = c("", "_tauNEPC"))
-}
-if (!is.null(tau_adeno_disk)) {
-  tau_tbl <- dplyr::full_join(tau_tbl, tau_adeno_disk, by = "gene", suffix = c("", "_tauAdeno"))
-}
-
-# -----------------------------
-# Ratio summaries from NEPC/Adeno scRNA pooled tables
-# -----------------------------
-read_ratio_dataset <- function(path) {
-  if (!file.exists(path)) {
-    warn_msg("Missing ratio CSV: %s", path)
-    return(NULL)
-  }
-  readr::read_csv(path, show_col_types = FALSE) %>%
-    dplyr::mutate(
-      gene = toupper(as.character(gene)),
-      aspc_specific_ratio = suppressWarnings(as.numeric(aspc_specific_ratio)),
-      dataset = basename(path)
-    ) %>%
-    dplyr::filter(!is.na(gene) & gene != "")
-}
-
-aggregate_ratio_features <- function(df_all, prefix, thr) {
-  if (is.null(df_all) || nrow(df_all) == 0) return(NULL)
-
-  df_all %>%
-    dplyr::group_by(gene) %>%
-    dplyr::summarise(
-      "{prefix}_median" := median(aspc_specific_ratio, na.rm = TRUE),
-      "{prefix}_mean"   := mean(aspc_specific_ratio, na.rm = TRUE),
-      "{prefix}_max"    := max(aspc_specific_ratio, na.rm = TRUE),
-      "{prefix}_present_frac" := mean(aspc_specific_ratio > thr, na.rm = TRUE),
-      "{prefix}_n_datasets" := dplyr::n_distinct(dataset),
-      .groups = "drop"
-    )
-}
-
-nepc_ratio_all  <- dplyr::bind_rows(lapply(cfg$ratio_nepc_dataset_csvs, read_ratio_dataset))
-adeno_ratio_all <- dplyr::bind_rows(lapply(cfg$ratio_adeno_dataset_csvs, read_ratio_dataset))
-
-ratio_nepc_features  <- aggregate_ratio_features(nepc_ratio_all,  "ratio_nepc",  cfg$ratio_present_threshold)
-ratio_adeno_features <- aggregate_ratio_features(adeno_ratio_all, "ratio_adeno", cfg$ratio_present_threshold)
-
-ratio_features_tbl <- dplyr::full_join(ratio_nepc_features, ratio_adeno_features, by = "gene")
-
-if (!is.null(ratio_features_tbl) && nrow(ratio_features_tbl) > 0) {
-  if (is.null(tau_tbl) || nrow(tau_tbl) == 0) {
-    tau_tbl <- ratio_features_tbl
-  } else {
-    tau_tbl <- dplyr::full_join(tau_tbl, ratio_features_tbl, by = "gene")
-  }
-  tau_tbl <- tau_tbl %>%
-    dplyr::mutate(ratio_nepc_minus_adeno_median = ratio_nepc_median - ratio_adeno_median)
-}
-
-# -----------------------------
-# B2) ASPC-down markers FIRST
-# -----------------------------
-msg("Curating ASPC-down (ASPC-enriched) marker sources...")
-aspc_down_marker_tables <- list()
-
-for (src in cfg$aspc_down_marker_sources) {
-  nm <- paste0("ASPC_ENRICHED:", basename(src$file), "::cluster_", src$cluster)
-  df <- load_marker_source(src)
-  if (is.null(df)) warn_msg("Skipping ASPC-down source: %s", nm)
-  aspc_down_marker_tables[[nm]] <- df
-}
-
-aspc_down_criteria_lists <- lapply(
-  aspc_down_marker_tables,
-  filter_by_criteria,
-  log2fc_thr = cfg$de_log2fc_threshold,
-  fdr_thr    = cfg$fdr_threshold,
-  prev_thr   = cfg$min_aspc_down_prevalence
-)
-
-aspc_down_candidates <- sort(unique(toupper(unlist(aspc_down_criteria_lists))))
-msg("ASPC-down candidate count: %d", length(aspc_down_candidates))
-
-# -----------------------------
-# B) ASPC-up markers SECOND (NO exclusion here)
-# -----------------------------
-msg("Curating ASPC marker sources (ASPC-up candidates)...")
-marker_tables <- list()
-
-for (src in cfg$human_marker_sources){
-  nm <- paste0("HUMAN:", basename(src$file), "::cluster_", src$cluster)
-  df <- load_marker_source(src)
-  if (is.null(df)) warn_msg("Skipping source: %s", nm)
-  marker_tables[[nm]] <- df
-}
-for (src in cfg$mouse_marker_sources){
-  nm <- paste0("MOUSE:", basename(src$file), "::cluster_", src$cluster)
-  df <- load_marker_source(src)
-  if (is.null(df)) warn_msg("Skipping source: %s", nm)
-  marker_tables[[nm]] <- df
-}
-
-if (length(marker_tables) == 0) {
-  warn_msg("No marker sources loaded; fallback candidates used.")
-  aspc_candidates <- c("TNFSF12","MDK")
-} else {
-  criteria_lists <- lapply(
-    marker_tables,
-    filter_by_criteria,
-    log2fc_thr = cfg$de_log2fc_threshold,
-    fdr_thr    = cfg$fdr_threshold,
-    prev_thr   = cfg$min_aspc_prevalence
+  suppressWarnings(
+    df %>%
+      dplyr::group_by(gene) %>%
+      dplyr::summarise(
+        dplyr::across(dplyr::where(is.logical),   ~ any(.x, na.rm = TRUE)),
+        dplyr::across(dplyr::where(is.numeric),   ~ max(.x, na.rm = TRUE)),
+        dplyr::across(dplyr::where(is.character), ~ dplyr::first(stats::na.omit(.x))),
+        .groups = "drop") %>%
+      dplyr::mutate(dplyr::across(dplyr::where(is.numeric),
+                                  ~ ifelse(is.finite(.x), .x, NA_real_)))
   )
-  aspc_candidates <- sort(unique(unlist(criteria_lists)))
 }
 
-secreted  <- read_list_or_empty(cfg$secreted_file)
-matrisome <- read_list_or_empty(cfg$matrisome_file)
-ligands   <- read_list_or_empty(cfg$ligand_file)
-metabolic <- read_list_or_empty(cfg$metabolic_file)
-
-# -----------------------------
-# C) Bulk RNA-seq load
-# -----------------------------
-msg("Loading bulk RNA-seq & clinical...")
-clin_raw <- tryCatch(readxl::read_excel(cfg$bulk_clinical_xlsx), error = function(e) NULL)
-if (is.null(clin_raw)) stop("Clinical file missing.")
-clin_raw <- janitor::clean_names(clin_raw)
-
-counts_df <- tryCatch(readr::read_csv(cfg$bulk_counts_csv, show_col_types = FALSE),
-                     error = function(e) stop("Counts file missing."))
-
-gene_col <- names(counts_df)[1]
-genes_vec <- toupper(as.character(counts_df[[gene_col]]))
-
-expr_mat <- counts_df %>%
-  dplyr::select(-all_of(gene_col)) %>%
-  as.data.frame()
-
-expr_mat[] <- lapply(expr_mat, num_safely)
-expr_mat <- as.matrix(expr_mat)
-rownames(expr_mat) <- genes_vec
-
-# -----------------------------
-# D) NEPC / AR scores
-# -----------------------------
-score_from_genes <- function(gset, expr_mat) {
-  gset <- intersect(toupper(gset), rownames(expr_mat))
-  if (!length(gset)) return(rep(NA_real_, ncol(expr_mat)))
-  z <- zscale_cols(expr_mat[gset, , drop = FALSE])
-  colMeans(z, na.rm = TRUE)
-}
-
-NEPC_score <- score_from_genes(cfg$nepc_up, expr_mat) - score_from_genes(cfg$nepc_down, expr_mat)
-AR_score   <- score_from_genes(HALLMARK_ANDROGEN_RESPONSE, expr_mat)
-
-names(NEPC_score) <- colnames(expr_mat)
-names(AR_score)   <- colnames(expr_mat)
-
-nepc_vec <- NEPC_score[colnames(expr_mat)]
-ar_vec   <- AR_score[colnames(expr_mat)]
-
-# -----------------------------
-# D2) Correlations for ASPC candidates
-# -----------------------------
-aspc_candidates_uc <- sort(unique(toupper(aspc_candidates)))
-
-gene_nepc_cor_up <- sapply(aspc_candidates_uc, function(g) {
-  if (!g %in% rownames(expr_mat)) return(NA_real_)
-  x <- expr_mat[g, ]
-  if (sd(x, na.rm = TRUE) == 0 || sd(nepc_vec, na.rm = TRUE) == 0) return(NA_real_)
-  stats::cor(x, nepc_vec, use = "pairwise.complete.obs")
-})
-
-gene_ar_cor_up <- sapply(aspc_candidates_uc, function(g) {
-  if (!g %in% rownames(expr_mat)) return(NA_real_)
-  x <- expr_mat[g, ]
-  if (sd(x, na.rm = TRUE) == 0 || sd(ar_vec, na.rm = TRUE) == 0) return(NA_real_)
-  stats::cor(x, ar_vec, use = "pairwise.complete.obs")
-})
-
-nepc_ar_cor_tbl <- tibble(
-  gene    = aspc_candidates_uc,
-  cor_NEPC = as.numeric(gene_nepc_cor_up),
-  cor_AR   = as.numeric(gene_ar_cor_up)
-)
-
-# -----------------------------
-# E) Covariates
-# -----------------------------
-msg("Loading covariates (ASPC_fraction / purity / immune/stromal) ...")
-
-load_cov <- function(path, needed){
-  if (!file.exists(path)) {
-    warn_msg("Missing %s; substituting zeros.", path)
-    return(tibble())
-  }
-  df <- suppressMessages(readr::read_csv(path, show_col_types = FALSE))
-  miss <- setdiff(needed, names(df))
-  if (length(miss)) warn_msg("File %s missing columns: %s", path, paste(miss, collapse = ","))
-  df
-}
-
-aspc_frac_tbl <- load_cov(cfg$deconv_aspc_fraction_file, c("sample","ASPC_fraction"))
-purity_tbl    <- load_cov(cfg$purity_file,               c("sample","purity"))
-imm_str_tbl   <- load_cov(cfg$immune_stromal_file,       c("sample","immune_fraction","stromal_fraction"))
-
-samples <- colnames(expr_mat)
-
-cov_vec <- function(tbl, col){
-  if (!nrow(tbl)) return(setNames(rep(0, length(samples)), samples))
-  v <- tbl[[col]]; names(v) <- tbl$sample
-  v[samples] %>% tidyr::replace_na(0)
-}
-
-ASPC_fraction    <- cov_vec(aspc_frac_tbl, "ASPC_fraction")
-purity_vec       <- cov_vec(purity_tbl,    "purity")
-immune_fraction  <- cov_vec(imm_str_tbl,   "immune_fraction")
-stromal_fraction <- cov_vec(imm_str_tbl,   "stromal_fraction")
-
-# -----------------------------
-# F) Residualization (ASPC candidate genes)
-# -----------------------------
-msg("Residualizing ASPC candidate genes ...")
-aspc_features_bulk <- intersect(aspc_candidates_uc, rownames(expr_mat))
-
-cov_df <- data.frame(
-  purity           = purity_vec,
-  ASPC_fraction    = ASPC_fraction,
-  immune_fraction  = immune_fraction,
-  stromal_fraction = stromal_fraction
-)
-
-residualize_gene <- function(exp_vec, cov_df){
-  df <- cov_df
-  df$y <- as.numeric(exp_vec)
-
-  for (nm in names(df)) {
-    if (nm != "y" && any(is.na(df[[nm]]))) {
-      df[[nm]][is.na(df[[nm]])] <- median(df[[nm]], na.rm = TRUE)
-    }
-  }
-
-  fit <- try(lm(y ~ purity + ASPC_fraction + immune_fraction + stromal_fraction, data = df),
-             silent = TRUE)
-  if (inherits(fit, "try-error")) return(scale(df$y, center = TRUE, scale = TRUE)[, 1])
-  resid(fit)
-}
-
-expr_resid_mat <- sapply(aspc_features_bulk, function(g) residualize_gene(expr_mat[g, ], cov_df))
-expr_resid_mat <- as.data.frame(expr_resid_mat)
-rownames(expr_resid_mat) <- samples
-
-# -----------------------------
-# G) Partial correlations
-# -----------------------------
-partial_corr_tbl <- NULL
-if (has_ppcor) {
-  msg("Computing partial correlations (ppcor) ...")
-  partial_corr_tbl <- tibble(
-    gene = aspc_features_bulk,
-    partial_corr = purrr::map_dbl(aspc_features_bulk, function(g){
-      y <- expr_resid_mat[[g]]
-      if (sd(y, na.rm = TRUE) == 0) return(0)
-      covs <- data.frame(purity=purity_vec, immune_fraction=immune_fraction, stromal_fraction=stromal_fraction)
-      res <- try(ppcor::pcor.test(y, ASPC_fraction, covs), silent=TRUE)
-      if (inherits(res, "try-error")) return(0)
-      res$estimate
-    })
-  )
-} else {
-  warn_msg("ppcor not installed; partial_corr_tbl will be empty.")
-  partial_corr_tbl <- tibble(gene = aspc_features_bulk, partial_corr = NA_real_)
-}
-
-# -----------------------------
-# Evidence-component placeholders (minimal canvas)
-# PATCH: load WGCNA membership (kME + in_wgcna_module) from precomputed outputs
-# -----------------------------
-wgcna_dir <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/wgcna_runs/2026-01-17"
-wgcna_membership_csv <- file.path(wgcna_dir, "wgcna_module_membership.csv")
-wgcna_result_rds     <- file.path(wgcna_dir, "wgcna_result.rds")
-
-# default fallback (keeps pipeline runnable even if file missing)
-wgcna_membership <- tibble(gene = toupper(aspc_features_bulk), kME = NA_real_, in_wgcna_module = FALSE)
-
-if (file.exists(wgcna_membership_csv)) {
-  msg("Loading WGCNA membership: %s", wgcna_membership_csv)
-
-  wm <- readr::read_csv(wgcna_membership_csv, show_col_types = FALSE) %>%
-    dplyr::mutate(
-      gene = toupper(trimws(as.character(gene))),
-      kME  = suppressWarnings(as.numeric(kME))
-    ) %>%
-    dplyr::filter(!is.na(gene) & gene != "") %>%
-    dplyr::distinct(gene, .keep_all = TRUE)
-
-  if (!("in_wgcna_module" %in% names(wm))) {
-    kme_abs <- if ("kME_abs" %in% names(wm)) suppressWarnings(as.numeric(wm$kME_abs)) else abs(wm$kME)
-    wm$in_wgcna_module <- !is.na(kme_abs) & (kme_abs >= 0.30)
-  } else {
-    wm$in_wgcna_module <- as.logical(wm$in_wgcna_module)
-    if (all(is.na(wm$in_wgcna_module))) {
-      kme_abs <- if ("kME_abs" %in% names(wm)) suppressWarnings(as.numeric(wm$kME_abs)) else abs(wm$kME)
-      wm$in_wgcna_module <- !is.na(kme_abs) & (kme_abs >= 0.30)
-    }
-  }
-
-  wgcna_membership <- wm %>%
-    dplyr::select(gene, kME, in_wgcna_module)
-} else {
-  warn_msg("WGCNA membership CSV not found; using NA kME fallback: %s", wgcna_membership_csv)
-}
-
-if (file.exists(wgcna_result_rds)) {
-  msg("Found WGCNA result RDS (not required for join): %s", wgcna_result_rds)
-} else {
-  warn_msg("WGCNA result RDS not found (not fatal): %s", wgcna_result_rds)
-}
-
-multi_task_tbl   <- tibble(gene = aspc_features_bulk, coef_NEPC_like = NA_real_, coef_ASPC_fraction = NA_real_, multi_task_positive = FALSE)
-stability_tbl    <- tibble(gene = aspc_features_bulk, stability_freq = NA_real_, stability_selected = FALSE)
-
-atlas_supported_up_tbl <- if (!is.null(tau_tbl) && nrow(tau_tbl)) {
-  if (!("ratio_nepc_mean" %in% colnames(tau_tbl))) tau_tbl$ratio_nepc_mean <- NA_real_
-  if (!("tau" %in% colnames(tau_tbl))) tau_tbl$tau <- NA_real_
-  tau_tbl %>%
-    dplyr::mutate(
-      atlas_logFC = NA_real_,
-      atlas_supported = !is.na(tau) & tau >= cfg$tau_threshold &
-        !is.na(ratio_nepc_mean) & ratio_nepc_mean >= cfg$ratio_nepc_mean_threshold
-    ) %>%
-    dplyr::select(gene, atlas_logFC, atlas_supported)
-} else {
-  tibble(gene = aspc_features_bulk, atlas_logFC = NA_real_, atlas_supported = FALSE)
-}
-
-atlas_supported_down_tbl <- if (!is.null(tau_tbl) && nrow(tau_tbl)) {
-  if (!("ratio_adeno_mean" %in% colnames(tau_tbl))) tau_tbl$ratio_adeno_mean <- NA_real_
-  if (!("tau" %in% colnames(tau_tbl))) tau_tbl$tau <- NA_real_
-  tau_tbl %>%
-    dplyr::mutate(
-      atlas_logFC = NA_real_,
-      atlas_supported = !is.na(tau) & tau >= cfg$tau_threshold &
-        !is.na(ratio_adeno_mean) & ratio_adeno_mean >= cfg$ratio_adeno_mean_threshold
-    ) %>%
-    dplyr::select(gene, atlas_logFC, atlas_supported)
-} else {
-  tibble(gene = aspc_features_bulk, atlas_logFC = NA_real_, atlas_supported = FALSE)
-}
-
-# -----------------------------
-# Evidence helpers
-# -----------------------------
 empty_tibble_with_cols <- function(cols, n = 0) {
   out <- lapply(cols, function(cn) if (cn == "gene") character(n) else numeric(n))
   names(out) <- cols
@@ -771,225 +341,857 @@ empty_tibble_with_cols <- function(cols, n = 0) {
 
 ensure_joinable <- function(obj, cols = c("gene")) {
   if (is.null(obj)) return(empty_tibble_with_cols(cols, n = 0))
-  if (is.vector(obj) && is.character(obj)) return(tibble::tibble(gene = obj))
+  if (is.vector(obj) && is.character(obj)) obj <- tibble::tibble(gene = obj)
   df <- tibble::as_tibble(obj)
-  if ("gene" %in% cols && !"gene" %in% names(df)) df$gene <- character(nrow(df))
-  if ("gene" %in% names(df)) df$gene <- as.character(df$gene)
+  if (!"gene" %in% names(df)) df$gene <- character(nrow(df))
+  df$gene <- as.character(df$gene)
   missing_cols <- setdiff(cols, names(df))
-  if (length(missing_cols)) df <- dplyr::bind_cols(df, empty_tibble_with_cols(missing_cols, n = nrow(df)))
-  df[, unique(c(cols, names(df))), drop = FALSE]
+  if (length(missing_cols)) {
+    df <- dplyr::bind_cols(df, empty_tibble_with_cols(missing_cols, n = nrow(df)))
+  }
+  df %>% dplyr::select(dplyr::all_of(cols))
 }
 
-# -----------------------------
-# PATCH: enforce 1 row per gene BEFORE joins to avoid many-to-many explosion
-# -----------------------------
-aspc_features_bulk <- unique(toupper(aspc_features_bulk))
+pick_column <- function(df, candidates, out_name, label) {
+  hit <- intersect(candidates, names(df))
+  if (!length(hit)) {
+    warn_msg("  %s: none of [%s] present. Columns are: %s",
+             label, paste(candidates, collapse = ", "),
+             paste(names(df), collapse = ", "))
+    return(NULL)
+  }
+  if (length(hit) > 1) {
+    msg("  %s: using '%s' (also saw %s)", label, hit[1], paste(hit[-1], collapse = ", "))
+  }
+  out <- tibble::tibble(gene = toupper(as.character(df$gene)),
+                        v = suppressWarnings(as.numeric(df[[hit[1]]])))
+  names(out)[2] <- out_name
+  out %>% dplyr::filter(!is.na(gene), gene != "")
+}
 
-tau_tbl                  <- collapse_to_unique_gene(tau_tbl)
-partial_corr_tbl         <- collapse_to_unique_gene(partial_corr_tbl)
-wgcna_membership         <- collapse_to_unique_gene(wgcna_membership)
-multi_task_tbl           <- collapse_to_unique_gene(multi_task_tbl)
-stability_tbl            <- collapse_to_unique_gene(stability_tbl)
-atlas_supported_up_tbl   <- collapse_to_unique_gene(atlas_supported_up_tbl)
-atlas_supported_down_tbl <- collapse_to_unique_gene(atlas_supported_down_tbl)
-nepc_ar_cor_tbl          <- collapse_to_unique_gene(nepc_ar_cor_tbl)
+# ============================================================================
+# STEP 1 — ANNOTATION LISTS
+# ============================================================================
+hdr("STEP 1 — annotation lists")
 
-# -----------------------------
-# Evidence Matrix (ASPC candidates)
-# -----------------------------
-evidence_df <- tibble(gene = aspc_features_bulk) %>%
-  mutate(
-    is_secreted  = gene %in% secreted,
-    is_ecm       = gene %in% matrisome,
-    is_ligand    = gene %in% ligands | gene %in% c("TNFSF12","MDK"),
-    is_metabolic = gene %in% metabolic,
-    is_TF_Cof_Chromatin = gene %in% tf_cof_chromatin
-  ) %>%
-  left_join(ensure_joinable(tau_tbl, c(
-    "gene","tau",
-    "ratio_nepc_median","ratio_nepc_mean","ratio_nepc_max","ratio_nepc_present_frac","ratio_nepc_n_datasets",
-    "ratio_adeno_median","ratio_adeno_mean","ratio_adeno_max","ratio_adeno_present_frac","ratio_adeno_n_datasets",
-    "ratio_nepc_minus_adeno_median"
-  )), by="gene") %>%
-  left_join(ensure_joinable(partial_corr_tbl, c("gene","partial_corr")), by="gene") %>%
-  left_join(ensure_joinable(wgcna_membership, c("gene","kME","in_wgcna_module")), by="gene") %>%
-  left_join(ensure_joinable(multi_task_tbl, c("gene","coef_NEPC_like","coef_ASPC_fraction","multi_task_positive")), by="gene") %>%
-  left_join(ensure_joinable(stability_tbl, c("gene","stability_freq","stability_selected")), by="gene") %>%
-  left_join(ensure_joinable(atlas_supported_up_tbl, c("gene","atlas_logFC","atlas_supported")), by="gene") %>%
-  left_join(nepc_ar_cor_tbl, by="gene") %>%
-  mutate(
-    high_tau          = !is.na(tau) & tau >= cfg$tau_threshold,
-    high_partial_corr = !is.na(partial_corr) & partial_corr >= cfg$partial_corr_threshold,
-    atlas_supported     = ifelse(is.na(atlas_supported), FALSE, atlas_supported),
-    multi_task_positive = ifelse(is.na(multi_task_positive), FALSE, multi_task_positive),
-    in_wgcna_module     = ifelse(is.na(in_wgcna_module), FALSE, in_wgcna_module),
-    stability_selected  = ifelse(is.na(stability_selected), FALSE, stability_selected),
-    is_TF_Cof_Chromatin = ifelse(is.na(is_TF_Cof_Chromatin), FALSE, is_TF_Cof_Chromatin),
-    evidence_score =
-      w$high_tau            * as.integer(high_tau) +
-      w$high_partial_corr   * as.integer(high_partial_corr) +
-      w$in_wgcna_module     * as.integer(in_wgcna_module) +
-      w$multi_task_positive * as.integer(multi_task_positive) +
-      w$stability_selected  * as.integer(stability_selected) +
-      w$atlas_supported     * as.integer(atlas_supported) +
-      w$is_ligand           * as.integer(is_ligand) +
-      w$is_secreted         * as.integer(is_secreted) +
-      w$is_ecm              * as.integer(is_ecm) +
-      w$is_metabolic        * as.integer(is_metabolic) +
-      w$is_TF_Cof_Chromatin * as.integer(is_TF_Cof_Chromatin)
-  )
+looks_like_html_waf <- function(lines) {
+  any(grepl("<html|</html|<script|aliyunwaf|acw_sc", lines, ignore.case = TRUE))
+}
 
-# -----------------------------
-# ASPC_DOWN evidence + signature -> FIBROBLAST_STROMA_SIGNATURE
-# -----------------------------
-aspc_down_candidates_uc <- sort(unique(toupper(aspc_down_candidates)))
-aspc_down_features_bulk <- intersect(aspc_down_candidates_uc, rownames(expr_mat))
+if (!file.exists(cfg$tf_cof_chromatin_union_txt)) {
+  stop("TF/cofactor/chromatin union list not found: ", cfg$tf_cof_chromatin_union_txt)
+}
+tf_cof_chromatin <- readLines(cfg$tf_cof_chromatin_union_txt, warn = FALSE)
+tf_cof_chromatin <- toupper(trimws(gsub("\r", "", tf_cof_chromatin)))
+tf_cof_chromatin <- tf_cof_chromatin[!is.na(tf_cof_chromatin) & tf_cof_chromatin != ""]
 
-gene_nepc_cor_down <- sapply(aspc_down_candidates_uc, function(g) {
-  if (!g %in% rownames(expr_mat)) return(NA_real_)
-  x <- expr_mat[g, ]
-  if (sd(x, na.rm = TRUE) == 0 || sd(nepc_vec, na.rm = TRUE) == 0) return(NA_real_)
-  stats::cor(x, nepc_vec, use = "pairwise.complete.obs")
-})
-gene_ar_cor_down <- sapply(aspc_down_candidates_uc, function(g) {
-  if (!g %in% rownames(expr_mat)) return(NA_real_)
-  x <- expr_mat[g, ]
-  if (sd(x, na.rm = TRUE) == 0 || sd(ar_vec, na.rm = TRUE) == 0) return(NA_real_)
-  stats::cor(x, ar_vec, use = "pairwise.complete.obs")
-})
+if (!length(tf_cof_chromatin)) {
+  stop("TF list is empty: ", cfg$tf_cof_chromatin_union_txt)
+}
+if (looks_like_html_waf(head(tf_cof_chromatin, 50))) {
+  stop("TF list looks like HTML/WAF content, not gene symbols: ", cfg$tf_cof_chromatin_union_txt)
+}
+msg("TF/cofactor/chromatin union: %d genes", length(tf_cof_chromatin))
 
-nepc_ar_cor_down_tbl <- tibble(
-  gene     = aspc_down_candidates_uc,
-  cor_NEPC = as.numeric(gene_nepc_cor_down),
-  cor_AR   = as.numeric(gene_ar_cor_down)
+secreted  <- read_list_or_empty(cfg$secreted_file)
+matrisome <- read_list_or_empty(cfg$matrisome_file)
+ligands   <- read_list_or_empty(cfg$ligand_file)
+metabolic <- read_list_or_empty(cfg$metabolic_file)
+msg("secreted %d | matrisome %d | ligands %d | metabolic %d",
+    length(secreted), length(matrisome), length(ligands), length(metabolic))
+
+# ============================================================================
+# STEP 2 — TAU FROM 02_
+# ============================================================================
+hdr("STEP 2 — tau tables from 02_")
+
+TAU_CANDIDATES <- c("tau", "tau_median", "tau_mean", "tau_max")
+
+read_tau_column <- function(path, out_name, label) {
+  df <- read_req(path, label, required = FALSE)
+  if (is.null(df)) return(NULL)
+  if (!"gene" %in% names(df)) {
+    warn_msg("  %s has no 'gene' column; ignoring.", label)
+    return(NULL)
+  }
+  msg("  %s columns: %s", label, paste(names(df), collapse = ", "))
+  out <- pick_column(df, TAU_CANDIDATES, out_name, label)
+  if (is.null(out)) return(NULL)
+
+  if ("n_datasets" %in% names(df)) {
+    nd <- tibble::tibble(gene = toupper(as.character(df$gene)),
+                         v = suppressWarnings(as.numeric(df$n_datasets)))
+    names(nd)[2] <- paste0(out_name, "_n_datasets")
+    out <- dplyr::left_join(out, nd, by = "gene")
+  }
+  collapse_to_unique_gene(out)
+}
+
+tau_nepc_tbl  <- read_tau_column(cfg$tau_nepc_csv,  "tau_nepc",  "02_ tau NEPC")
+tau_adeno_tbl <- read_tau_column(cfg$tau_adeno_csv, "tau_adeno", "02_ tau Adeno")
+
+if (is.null(tau_nepc_tbl) && is.null(tau_adeno_tbl)) {
+  stop("Neither tau table could be read.\n  ", cfg$tau_nepc_csv,
+       "\n  ", cfg$tau_adeno_csv, "\n  -> run 02_calculate_tau.R first.")
+}
+
+tau_tbl <- tibble::tibble(gene = character())
+if (!is.null(tau_nepc_tbl))  tau_tbl <- dplyr::full_join(tau_tbl, tau_nepc_tbl,  by = "gene")
+if (!is.null(tau_adeno_tbl)) tau_tbl <- dplyr::full_join(tau_tbl, tau_adeno_tbl, by = "gene")
+
+if (!"tau_nepc" %in% names(tau_tbl)) {
+  tau_tbl$tau_nepc <- NA_real_
+  warn_msg("tau_nepc absent — ASPC-up branch has no specificity evidence.")
+}
+if (!"tau_adeno" %in% names(tau_tbl)) {
+  tau_tbl$tau_adeno <- NA_real_
+  warn_msg("tau_adeno absent — ASPC-down branch has no specificity evidence.")
+}
+
+msg("Genes with tau: %d (NEPC %d, Adeno %d)", nrow(tau_tbl),
+    sum(!is.na(tau_tbl$tau_nepc)), sum(!is.na(tau_tbl$tau_adeno)))
+
+# v6: show the tau distribution so the ladder's tiers are interpretable
+show_tau_dist <- function(v, label) {
+  v <- v[!is.na(v)]
+  if (!length(v)) {
+    warn_msg("  %s: no values.", label)
+    return(invisible(NULL))
+  }
+  qs <- stats::quantile(v, c(0.50, 0.75, 0.90, 0.95, 0.99), na.rm = TRUE)
+  msg("  %s quantiles: 50%%=%.3f 75%%=%.3f 90%%=%.3f 95%%=%.3f 99%%=%.3f",
+      label, qs[1], qs[2], qs[3], qs[4], qs[5])
+  for (th in c(0.95, 0.90, 0.85, 0.80, 0.70, 0.60, 0.50)) {
+    cat(sprintf("      >= %.2f : %6d genes\n", th, sum(v >= th)))
+  }
+}
+show_tau_dist(tau_tbl$tau_nepc,  "tau_nepc")
+show_tau_dist(tau_tbl$tau_adeno, "tau_adeno")
+
+# ============================================================================
+# STEP 3 — RATIO + MARKER RECURRENCE FROM 03_
+# ============================================================================
+hdr("STEP 3 — ratio and marker tables from 03_")
+
+RATIO_CANDIDATES <- c("aspc_specific_ratio", "ratio_mean", "ratio_median", "ratio_max")
+
+read_ratio_pooled <- function(path, prefix, label) {
+  df <- read_req(path, label, required = FALSE)
+  if (is.null(df) || !"gene" %in% names(df)) return(NULL)
+  msg("  %s columns: %s", label, paste(names(df), collapse = ", "))
+
+  base <- pick_column(df, RATIO_CANDIDATES, paste0(prefix, "_mean"), label)
+  if (is.null(base)) return(NULL)
+
+  gene_uc <- toupper(as.character(df$gene))
+  add_num <- function(tbl, src_col, new_col) {
+    if (!src_col %in% names(df)) return(tbl)
+    x <- tibble::tibble(gene = gene_uc, v = suppressWarnings(as.numeric(df[[src_col]])))
+    names(x)[2] <- new_col
+    dplyr::left_join(tbl, x, by = "gene")
+  }
+  base <- base %>%
+    add_num("ratio_max",            paste0(prefix, "_max")) %>%
+    add_num("aspc_specific_ratio",  paste0(prefix, "_median")) %>%
+    add_num("n_datasets",           paste0(prefix, "_n_datasets")) %>%
+    add_num("n_datasets_ratio_gt2", paste0(prefix, "_n_high"))
+
+  collapse_to_unique_gene(base)
+}
+
+read_ratio_long <- function(path, prefix, thr) {
+  if (!file.exists(path)) {
+    warn_msg("Long ratio table absent: %s", basename(path))
+    return(NULL)
+  }
+  df <- readr::read_csv(path, show_col_types = FALSE)
+  if (!all(c("gene", "aspc_specific_ratio", "dataset") %in% names(df))) return(NULL)
+  df %>%
+    dplyr::mutate(gene = toupper(gene)) %>%
+    dplyr::group_by(gene) %>%
+    dplyr::summarise("{prefix}_present_frac" := mean(aspc_specific_ratio > thr, na.rm = TRUE),
+                     .groups = "drop")
+}
+
+ratio_nepc_tbl  <- read_ratio_pooled(cfg$ratio_nepc_csv,  "ratio_nepc",  "03_ ratio NEPC")
+ratio_adeno_tbl <- read_ratio_pooled(cfg$ratio_adeno_csv, "ratio_adeno", "03_ ratio Adeno")
+pf_nepc  <- read_ratio_long(cfg$ratio_nepc_long,  "ratio_nepc",  cfg$ratio_present_threshold)
+pf_adeno <- read_ratio_long(cfg$ratio_adeno_long, "ratio_adeno", cfg$ratio_present_threshold)
+
+ratio_tbl <- tibble::tibble(gene = character())
+for (t in list(ratio_nepc_tbl, ratio_adeno_tbl, pf_nepc, pf_adeno)) {
+  if (!is.null(t)) ratio_tbl <- dplyr::full_join(ratio_tbl, t, by = "gene")
+}
+for (cn in c("ratio_nepc_mean", "ratio_adeno_mean",
+             "ratio_nepc_median", "ratio_adeno_median")) {
+  if (!cn %in% names(ratio_tbl)) ratio_tbl[[cn]] <- NA_real_
+}
+ratio_tbl <- ratio_tbl %>%
+  dplyr::mutate(ratio_nepc_minus_adeno_median = ratio_nepc_median - ratio_adeno_median)
+
+msg("Genes with ratio data: %d", nrow(ratio_tbl))
+for (th in c(2.0, 1.5, 1.2, 1.0)) {
+  msg("  ratio_nepc_mean >= %.1f : %5d | ratio_adeno_mean >= %.1f : %5d", th,
+      sum(ratio_tbl$ratio_nepc_mean >= th, na.rm = TRUE), th,
+      sum(ratio_tbl$ratio_adeno_mean >= th, na.rm = TRUE))
+}
+
+recur_nepc  <- read_req(cfg$recur_nepc_csv,  "03_ recurrence NEPC",  required = FALSE)
+recur_adeno <- read_req(cfg$recur_adeno_csv, "03_ recurrence Adeno", required = FALSE)
+
+get_candidates <- function(df, label) {
+  if (is.null(df) || !all(c("gene", "n_datasets") %in% names(df))) {
+    warn_msg("%s unusable; no candidates from this source.", label)
+    return(character(0))
+  }
+  # report the pool at several recurrence levels — the ceiling on signature size
+  for (k in 1:4) {
+    msg("  %s: n_datasets >= %d -> %d genes", label, k, sum(df$n_datasets >= k, na.rm = TRUE))
+  }
+  g <- df %>%
+    dplyr::filter(n_datasets >= cfg$min_marker_cohorts) %>%
+    dplyr::pull(gene) %>% toupper() %>% unique() %>% sort()
+  msg("%s: using %d candidates (min_marker_cohorts = %d)",
+      label, length(g), cfg$min_marker_cohorts)
+  g
+}
+
+aspc_candidates      <- get_candidates(recur_nepc,  "ASPC-up (NEPC)")
+aspc_down_candidates <- get_candidates(recur_adeno, "ASPC-down (Adeno stroma)")
+
+if (!length(aspc_candidates)) {
+  stop("No ASPC-up candidates. Check that 03_ wrote:\n  ", cfg$recur_nepc_csv)
+}
+if (length(aspc_candidates) < cfg$target_size) {
+  warn_msg("ASPC-up candidate pool (%d) is smaller than target_size (%d).",
+           length(aspc_candidates), cfg$target_size)
+  warn_msg("  No threshold relaxation can exceed the pool. To enlarge it, raise")
+  warn_msg("  03_'s cfg$top_n_markers above 200, or keep min_marker_cohorts = 1.")
+}
+if (length(aspc_down_candidates) < cfg$target_size) {
+  warn_msg("ASPC-down candidate pool (%d) is smaller than target_size (%d).",
+           length(aspc_down_candidates), cfg$target_size)
+}
+
+# ============================================================================
+# STEP 4 — ELASTIC NET EVIDENCE FROM 04_
+# ============================================================================
+hdr("STEP 4 — elastic net evidence from 04_")
+
+multi_task_tbl <- read_req(cfg$multi_task_csv, "04_ coefficients", required = FALSE)
+if (!is.null(multi_task_tbl) && "gene" %in% names(multi_task_tbl)) {
+  if (!"multi_task_positive" %in% names(multi_task_tbl)) {
+    warn_msg("  multi_task_positive absent; deriving from coefficient signs.")
+    cn_v <- multi_task_tbl[["coef_NEPC_like"]]     %||% rep(0, nrow(multi_task_tbl))
+    ca_v <- multi_task_tbl[["coef_ASPC_fraction"]] %||% rep(0, nrow(multi_task_tbl))
+    multi_task_tbl$multi_task_positive <- (cn_v > 0) & (ca_v > 0)
+  }
+  multi_task_tbl <- multi_task_tbl %>%
+    dplyr::mutate(gene = toupper(as.character(gene)),
+                  multi_task_positive = as.logical(multi_task_positive)) %>%
+    collapse_to_unique_gene()
+  msg("multi_task_positive TRUE: %d genes",
+      sum(multi_task_tbl$multi_task_positive, na.rm = TRUE))
+} else {
+  warn_msg("04_ coefficients missing — w$multi_task_positive (%.1f) contributes NOTHING.",
+           w$multi_task_positive)
+  multi_task_tbl <- tibble::tibble(gene = character(), coef_NEPC_like = numeric(),
+                                   coef_ASPC_fraction = numeric(),
+                                   multi_task_positive = logical())
+}
+
+stability_tbl <- read_req(cfg$stability_csv, "04_ stability", required = FALSE)
+if (!is.null(stability_tbl) && "gene" %in% names(stability_tbl)) {
+  if (!"stability_selected" %in% names(stability_tbl)) {
+    warn_msg("  stability_selected absent; deriving from stability_freq >= 0.20.")
+    sf <- stability_tbl[["stability_freq"]] %||% rep(NA_real_, nrow(stability_tbl))
+    stability_tbl$stability_selected <- !is.na(sf) & sf >= 0.20
+  }
+  stability_tbl <- stability_tbl %>%
+    dplyr::mutate(gene = toupper(as.character(gene)),
+                  stability_selected = as.logical(stability_selected)) %>%
+    collapse_to_unique_gene()
+  msg("stability_selected TRUE: %d genes",
+      sum(stability_tbl$stability_selected, na.rm = TRUE))
+} else {
+  warn_msg("04_ stability missing — w$stability_selected (%.1f) contributes NOTHING.",
+           w$stability_selected)
+  stability_tbl <- tibble::tibble(gene = character(), stability_freq = numeric(),
+                                  stability_selected = logical())
+}
+
+# ============================================================================
+# STEP 5 — WGCNA MEMBERSHIP FROM 05_
+# ============================================================================
+hdr("STEP 5 — WGCNA membership from 05_")
+
+wgcna_dir <- cfg$wgcna_dir
+if (is.null(wgcna_dir)) {
+  cand <- list.dirs(WGCNA_BASE, recursive = FALSE)
+  cand <- cand[grepl("\\d{4}-\\d{2}-\\d{2}$", cand)]
+  if (length(cand)) {
+    wgcna_dir <- sort(cand, decreasing = TRUE)[1]
+    msg("Auto-detected newest WGCNA run: %s", basename(wgcna_dir))
+  }
+}
+
+wgcna_membership <- tibble::tibble(gene = character(), kME = numeric(),
+                                   in_wgcna_module = logical(), in_any_module = logical())
+
+if (!is.null(wgcna_dir)) {
+  wm_csv <- file.path(wgcna_dir, "wgcna_module_membership.csv")
+  if (file.exists(wm_csv)) {
+    wm <- readr::read_csv(wm_csv, show_col_types = FALSE) %>%
+      dplyr::mutate(gene = toupper(trimws(as.character(gene))),
+                    kME  = suppressWarnings(as.numeric(kME))) %>%
+      dplyr::filter(!is.na(gene), gene != "")
+
+    msg("  membership columns: %s", paste(names(wm), collapse = ", "))
+
+    if (!"in_wgcna_module" %in% names(wm)) {
+      kabs <- if ("kME_abs" %in% names(wm)) suppressWarnings(as.numeric(wm$kME_abs)) else abs(wm$kME)
+      wm$in_wgcna_module <- !is.na(kabs) & kabs >= 0.30
+      warn_msg("  in_wgcna_module absent; derived from |kME| >= 0.30.")
+    } else {
+      wm$in_wgcna_module <- as.logical(wm$in_wgcna_module)
+    }
+    if (!"in_any_module" %in% names(wm)) wm$in_any_module <- wm$in_wgcna_module
+
+    keep_cols <- intersect(c("gene", "kME", "in_wgcna_module", "in_any_module", "module"),
+                           names(wm))
+    wgcna_membership <- wm %>%
+      dplyr::select(dplyr::all_of(keep_cols)) %>%
+      collapse_to_unique_gene()
+
+    n_aspc <- sum(wgcna_membership$in_wgcna_module, na.rm = TRUE)
+    n_any  <- sum(wgcna_membership$in_any_module,  na.rm = TRUE)
+    n_tot  <- nrow(wgcna_membership)
+
+    msg("in_wgcna_module TRUE (ASPC module): %d genes", n_aspc)
+    msg("in_any_module   TRUE (any module) : %d genes", n_any)
+
+    frac <- if (n_tot > 0) n_aspc / n_tot else 0
+    msg("ASPC module covers %.1f%% of the %d genes in the network.", 100 * frac, n_tot)
+
+    if (frac > cfg$wgcna_max_frac) {
+      warn_msg("Above cfg$wgcna_max_frac (%.0f%%). A module this large is usually",
+               100 * cfg$wgcna_max_frac)
+      warn_msg("the dominant variance axis, not an ASPC programme, so")
+      warn_msg("w$in_wgcna_module (%.1f) fires for nearly every candidate and",
+               w$in_wgcna_module)
+      warn_msg("cannot discriminate. Inspect:")
+      warn_msg("  %s", file.path(wgcna_dir, "wgcna_module_summary.csv"))
+      warn_msg("Consider lowering 05_'s mergeCutHeight or raising kme_cutoff.")
+    }
+  } else {
+    warn_msg("WGCNA membership CSV not found in %s", wgcna_dir)
+  }
+} else {
+  warn_msg("No WGCNA run directory found under %s", WGCNA_BASE)
+}
+
+# ============================================================================
+# STEP 6 — BULK EXPRESSION, NEPC / AR SCORES
+# ============================================================================
+hdr("STEP 6 — bulk expression")
+
+clin_raw <- suppressWarnings(
+  tryCatch(readxl::read_excel(cfg$bulk_clinical_xlsx), error = function(e) NULL)
 )
 
-nepc_ar_cor_down_tbl <- collapse_to_unique_gene(nepc_ar_cor_down_tbl)
+if (is.null(clin_raw)) {
+  warn_msg("Clinical file unreadable (non-fatal): %s", basename(cfg$bulk_clinical_xlsx))
+} else {
+  clin_raw <- janitor::clean_names(clin_raw)
+  msg("Clinical table: %d rows x %d columns", nrow(clin_raw), ncol(clin_raw))
+}
 
-evidence_down_df <- tibble(gene = aspc_down_features_bulk) %>%
-  mutate(
-    is_secreted  = gene %in% secreted,
-    is_ecm       = gene %in% matrisome,
-    is_ligand    = gene %in% ligands | gene %in% c("TNFSF12","MDK"),
-    is_metabolic = gene %in% metabolic,
-    is_TF_Cof_Chromatin = gene %in% tf_cof_chromatin
-  ) %>%
-  left_join(ensure_joinable(tau_tbl, c(
-    "gene","tau",
-    "ratio_nepc_median","ratio_nepc_mean","ratio_nepc_max","ratio_nepc_present_frac","ratio_nepc_n_datasets",
-    "ratio_adeno_median","ratio_adeno_mean","ratio_adeno_max","ratio_adeno_present_frac","ratio_adeno_n_datasets",
-    "ratio_nepc_minus_adeno_median"
-  )), by="gene") %>%
-  left_join(ensure_joinable(partial_corr_tbl, c("gene","partial_corr")), by="gene") %>%
-  left_join(ensure_joinable(wgcna_membership, c("gene","kME","in_wgcna_module")), by="gene") %>%
-  left_join(ensure_joinable(multi_task_tbl, c("gene","coef_NEPC_like","coef_ASPC_fraction","multi_task_positive")), by="gene") %>%
-  left_join(ensure_joinable(stability_tbl, c("gene","stability_freq","stability_selected")), by="gene") %>%
-  left_join(ensure_joinable(atlas_supported_down_tbl, c("gene","atlas_logFC","atlas_supported")), by="gene") %>%
-  left_join(nepc_ar_cor_down_tbl, by="gene") %>%
-  mutate(
-    high_tau          = !is.na(tau) & tau >= cfg$tau_threshold,
-    high_partial_corr = !is.na(partial_corr) & partial_corr >= cfg$partial_corr_threshold,
-    atlas_supported     = ifelse(is.na(atlas_supported), FALSE, atlas_supported),
-    multi_task_positive = ifelse(is.na(multi_task_positive), FALSE, multi_task_positive),
-    in_wgcna_module     = ifelse(is.na(in_wgcna_module), FALSE, in_wgcna_module),
-    stability_selected  = ifelse(is.na(stability_selected), FALSE, stability_selected),
-    is_TF_Cof_Chromatin = ifelse(is.na(is_TF_Cof_Chromatin), FALSE, is_TF_Cof_Chromatin),
-    evidence_score =
-      w$high_tau            * as.integer(high_tau) +
-      w$high_partial_corr   * as.integer(high_partial_corr) +
-      w$in_wgcna_module     * as.integer(in_wgcna_module) +
-      w$multi_task_positive * as.integer(multi_task_positive) +
-      w$stability_selected  * as.integer(stability_selected) +
-      w$atlas_supported     * as.integer(atlas_supported) +
-      w$is_ligand           * as.integer(is_ligand) +
-      w$is_secreted         * as.integer(is_secreted) +
-      w$is_ecm              * as.integer(is_ecm) +
-      w$is_metabolic        * as.integer(is_metabolic) +
-      w$is_TF_Cof_Chromatin * as.integer(is_TF_Cof_Chromatin)
+counts_df <- tryCatch(readr::read_csv(cfg$bulk_counts_csv, show_col_types = FALSE),
+                      error = function(e) stop("Counts file missing: ", cfg$bulk_counts_csv))
+
+gene_col  <- names(counts_df)[1]
+genes_vec <- toupper(as.character(counts_df[[gene_col]]))
+
+expr_mat <- counts_df %>% dplyr::select(-dplyr::all_of(gene_col)) %>% as.data.frame()
+expr_mat[] <- lapply(expr_mat, num_safely)
+expr_mat <- as.matrix(expr_mat)
+rownames(expr_mat) <- genes_vec
+
+if (any(duplicated(rownames(expr_mat)))) {
+  msg("Summing %d duplicated gene symbols.", sum(duplicated(rownames(expr_mat))))
+  expr_mat <- rowsum(expr_mat, group = rownames(expr_mat), reorder = FALSE)
+}
+msg("Bulk matrix: %d genes x %d samples", nrow(expr_mat), ncol(expr_mat))
+
+score_from_genes <- function(gset, mat) {
+  gset <- intersect(toupper(gset), rownames(mat))
+  if (!length(gset)) return(setNames(rep(NA_real_, ncol(mat)), colnames(mat)))
+  z <- zscale_cols(mat[gset, , drop = FALSE])
+  setNames(colMeans(z, na.rm = TRUE), colnames(mat))
+}
+
+NEPC_score <- score_from_genes(cfg$nepc_up, expr_mat) - score_from_genes(cfg$nepc_down, expr_mat)
+AR_score   <- score_from_genes(HALLMARK_ANDROGEN_RESPONSE, expr_mat)
+nepc_vec <- NEPC_score[colnames(expr_mat)]
+ar_vec   <- AR_score[colnames(expr_mat)]
+
+msg("NEPC_score sd %.3f | AR_score sd %.3f",
+    stats::sd(nepc_vec, na.rm = TRUE), stats::sd(ar_vec, na.rm = TRUE))
+
+# ============================================================================
+# STEP 7 — COVARIATES
+# ============================================================================
+hdr("STEP 7 — covariates")
+
+load_cov <- function(path, needed){
+  if (!file.exists(path)) {
+    warn_msg("Missing %s; substituting zeros.", basename(path))
+    return(tibble::tibble())
+  }
+  df <- suppressMessages(readr::read_csv(path, show_col_types = FALSE))
+  miss <- setdiff(needed, names(df))
+  if (length(miss)) warn_msg("%s missing: %s", basename(path), paste(miss, collapse = ","))
+  df
+}
+
+aspc_frac_tbl <- load_cov(cfg$deconv_aspc_fraction_file, c("sample","ASPC_fraction"))
+purity_tbl    <- load_cov(cfg$purity_file,               c("sample","purity"))
+imm_str_tbl   <- load_cov(cfg$immune_stromal_file,       c("sample","immune_fraction","stromal_fraction"))
+
+samples <- colnames(expr_mat)
+cov_vec <- function(tbl, col){
+  if (!nrow(tbl) || !col %in% names(tbl)) {
+    return(setNames(rep(0, length(samples)), samples))
+  }
+  v <- tbl[[col]]; names(v) <- tbl$sample
+  out <- v[samples]; out[is.na(out)] <- 0
+  setNames(as.numeric(out), samples)
+}
+
+ASPC_fraction    <- cov_vec(aspc_frac_tbl, "ASPC_fraction")
+purity_vec       <- cov_vec(purity_tbl,    "purity")
+immune_fraction  <- cov_vec(imm_str_tbl,   "immune_fraction")
+stromal_fraction <- cov_vec(imm_str_tbl,   "stromal_fraction")
+
+if (stats::sd(ASPC_fraction) < 1e-8) {
+  warn_msg("ASPC_fraction is constant — partial correlations will all be 0.")
+}
+
+# ============================================================================
+# STEP 8 — RESIDUALISATION + PARTIAL CORRELATION
+# ============================================================================
+hdr("STEP 8 — residualisation and partial correlation")
+
+msg("Residualising on: %s", paste(cfg$resid_covariates, collapse = ", "))
+msg("  ASPC_fraction EXCLUDED (v1 forced this channel to ~0).")
+
+all_candidates <- unique(c(aspc_candidates, aspc_down_candidates))
+features_bulk  <- intersect(all_candidates, rownames(expr_mat))
+msg("Candidates measured in bulk: %d / %d", length(features_bulk), length(all_candidates))
+if (!length(features_bulk)) {
+  stop("No candidate gene is present in the bulk matrix.")
+}
+
+cov_df <- data.frame(
+  purity           = purity_vec,
+  immune_fraction  = immune_fraction,
+  stromal_fraction = stromal_fraction
+)[, intersect(cfg$resid_covariates,
+              c("purity","immune_fraction","stromal_fraction")), drop = FALSE]
+
+for (nm in names(cov_df)) {
+  cov_df[[nm]][is.na(cov_df[[nm]])] <- stats::median(cov_df[[nm]], na.rm = TRUE)
+}
+keep_cov <- vapply(cov_df, function(v) stats::sd(v, na.rm = TRUE) > 1e-8, logical(1))
+cov_df <- cov_df[, keep_cov, drop = FALSE]
+
+Y <- t(expr_mat[features_bulk, , drop = FALSE])
+if (ncol(cov_df) > 0) {
+  Xcov <- stats::model.matrix(~ ., data = cov_df)
+  expr_resid <- qr.resid(qr(Xcov), Y)
+  dimnames(expr_resid) <- dimnames(Y)
+  msg("Residualised %d genes in a single QR solve.", ncol(Y))
+} else {
+  warn_msg("No usable covariates; using raw expression.")
+  expr_resid <- Y
+}
+
+if (has_ppcor && stats::sd(ASPC_fraction) > 1e-8 && ncol(cov_df) > 0) {
+  msg("Computing partial correlations with ASPC_fraction (ppcor) ...")
+  partial_corr_tbl <- tibble::tibble(
+    gene = features_bulk,
+    partial_corr = purrr::map_dbl(features_bulk, function(g){
+      y <- expr_resid[, g]
+      if (stats::sd(y, na.rm = TRUE) < 1e-12) return(0)
+      res <- try(ppcor::pcor.test(y, ASPC_fraction, cov_df), silent = TRUE)
+      if (inherits(res, "try-error")) return(0)
+      as.numeric(res$estimate)
+    })
   )
+} else {
+  warn_msg("Partial correlation unavailable; setting NA.")
+  partial_corr_tbl <- tibble::tibble(gene = features_bulk, partial_corr = NA_real_)
+}
+partial_corr_tbl <- collapse_to_unique_gene(partial_corr_tbl)
 
-FIBROBLAST_STROMA_SIGNATURE <- evidence_down_df %>%
-  filter(
-    high_tau,
-    evidence_score >= score_threshold,
-    !is.na(cor_NEPC),
-    !is.na(cor_AR),
-    cor_NEPC  <= cfg$cor_NEPC_down_max,
-    cor_AR    >= cfg$cor_AR_down_min,
-    !is.na(ratio_adeno_mean),
-    ratio_adeno_mean >= cfg$ratio_adeno_mean_threshold
-  ) %>%
-  arrange(
-    desc(evidence_score),
-    desc(ratio_adeno_mean),
-    desc(high_tau),
-    desc(high_partial_corr),
-    desc(abs(partial_corr)),
-    desc(abs(cor_NEPC))
-  ) %>%
-  pull(gene) %>%
-  unique()
+if (any(!is.na(partial_corr_tbl$partial_corr))) {
+  msg("partial_corr: median %.3f | %d genes >= %.2f",
+      stats::median(partial_corr_tbl$partial_corr, na.rm = TRUE),
+      sum(partial_corr_tbl$partial_corr >= cfg$partial_corr_threshold, na.rm = TRUE),
+      cfg$partial_corr_threshold)
+}
 
-# -----------------------------
-# ASPC_UP selection -> ASPC_SIGNATURE
-# -----------------------------
-ASPC_SIGNATURE <- evidence_df %>%
-  filter(
-    high_tau,
-    evidence_score >= score_threshold,
-    !is.na(cor_NEPC),
-    !is.na(cor_AR),
-    cor_NEPC  >= cfg$cor_NEPC_min,
-    cor_AR    <= cfg$cor_AR_max,
-    !is.na(ratio_nepc_mean),
-    ratio_nepc_mean >= cfg$ratio_nepc_mean_threshold,
-    !(gene %in% FIBROBLAST_STROMA_SIGNATURE)
-  ) %>%
-  arrange(
-    desc(evidence_score),
-    desc(ratio_nepc_mean),
-    desc(high_tau),
-    desc(high_partial_corr),
-    desc(abs(partial_corr)),
-    desc(abs(cor_NEPC))
-  ) %>%
-  pull(gene) %>%
-  unique()
+# ============================================================================
+# STEP 9 — NEPC / AR CORRELATIONS
+# ============================================================================
+cor_with <- function(genes, trait_vec) {
+  vapply(genes, function(g) {
+    if (!g %in% rownames(expr_mat)) return(NA_real_)
+    x <- expr_mat[g, ]
+    if (stats::sd(x, na.rm = TRUE) == 0 || stats::sd(trait_vec, na.rm = TRUE) == 0) {
+      return(NA_real_)
+    }
+    stats::cor(x, trait_vec, use = "pairwise.complete.obs")
+  }, numeric(1))
+}
 
-# -----------------------------
-# Output per-sample signature scores
-# -----------------------------
+cor_tbl <- tibble::tibble(
+  gene     = features_bulk,
+  cor_NEPC = as.numeric(cor_with(features_bulk, nepc_vec)),
+  cor_AR   = as.numeric(cor_with(features_bulk, ar_vec))
+) %>% collapse_to_unique_gene()
+
+# ============================================================================
+# STEP 10 — ATLAS SUPPORT
+# ============================================================================
+sc_tbl <- dplyr::full_join(tau_tbl, ratio_tbl, by = "gene") %>% collapse_to_unique_gene()
+for (cn in c("tau_nepc","tau_adeno","ratio_nepc_mean","ratio_adeno_mean")) {
+  if (!cn %in% names(sc_tbl)) sc_tbl[[cn]] <- NA_real_
+}
+
+atlas_up_tbl <- sc_tbl %>%
+  dplyr::transmute(gene,
+    atlas_supported = !is.na(tau_nepc) & tau_nepc >= cfg$tau_threshold &
+                      !is.na(ratio_nepc_mean) &
+                      ratio_nepc_mean >= cfg$ratio_nepc_mean_threshold)
+
+atlas_down_tbl <- sc_tbl %>%
+  dplyr::transmute(gene,
+    atlas_supported = !is.na(tau_adeno) & tau_adeno >= cfg$tau_threshold &
+                      !is.na(ratio_adeno_mean) &
+                      ratio_adeno_mean >= cfg$ratio_adeno_mean_threshold)
+
+msg("atlas_supported (up)   : %d genes", sum(atlas_up_tbl$atlas_supported, na.rm = TRUE))
+msg("atlas_supported (down) : %d genes", sum(atlas_down_tbl$atlas_supported, na.rm = TRUE))
+
+# ============================================================================
+# STEP 11 — EVIDENCE MATRICES
+# ============================================================================
+hdr("STEP 11 — evidence matrices")
+
+sc_cols <- intersect(
+  c("gene", "tau_nepc", "tau_adeno",
+    "ratio_nepc_mean", "ratio_nepc_median", "ratio_nepc_max",
+    "ratio_nepc_present_frac", "ratio_nepc_n_datasets",
+    "ratio_adeno_mean", "ratio_adeno_median", "ratio_adeno_max",
+    "ratio_adeno_present_frac", "ratio_adeno_n_datasets",
+    "ratio_nepc_minus_adeno_median"),
+  names(sc_tbl))
+
+build_evidence <- function(cand_genes, atlas_tbl, tau_col) {
+  tibble::tibble(gene = intersect(cand_genes, rownames(expr_mat))) %>%
+    dplyr::mutate(
+      is_secreted         = gene %in% secreted,
+      is_ecm              = gene %in% matrisome,
+      is_ligand           = gene %in% ligands | gene %in% c("TNFSF12", "MDK"),
+      is_metabolic        = gene %in% metabolic,
+      is_TF_Cof_Chromatin = gene %in% tf_cof_chromatin
+    ) %>%
+    dplyr::left_join(ensure_joinable(sc_tbl, sc_cols), by = "gene") %>%
+    dplyr::left_join(ensure_joinable(partial_corr_tbl, c("gene","partial_corr")), by = "gene") %>%
+    dplyr::left_join(ensure_joinable(wgcna_membership,
+                     c("gene","kME","in_wgcna_module","in_any_module")), by = "gene") %>%
+    dplyr::left_join(ensure_joinable(multi_task_tbl,
+                     c("gene","coef_NEPC_like","coef_ASPC_fraction",
+                       "multi_task_positive")), by = "gene") %>%
+    dplyr::left_join(ensure_joinable(stability_tbl,
+                     c("gene","stability_freq","stability_selected")), by = "gene") %>%
+    dplyr::left_join(ensure_joinable(atlas_tbl, c("gene","atlas_supported")), by = "gene") %>%
+    dplyr::left_join(cor_tbl, by = "gene") %>%
+    dplyr::mutate(
+      tau_used            = .data[[tau_col]],
+      high_tau            = !is.na(tau_used) & tau_used >= cfg$tau_threshold,
+      high_partial_corr   = !is.na(partial_corr) & partial_corr >= cfg$partial_corr_threshold,
+      atlas_supported     = dplyr::coalesce(as.logical(atlas_supported), FALSE),
+      multi_task_positive = dplyr::coalesce(as.logical(multi_task_positive), FALSE),
+      in_wgcna_module     = dplyr::coalesce(as.logical(in_wgcna_module), FALSE),
+      in_any_module       = dplyr::coalesce(as.logical(in_any_module), FALSE),
+      stability_selected  = dplyr::coalesce(as.logical(stability_selected), FALSE),
+      is_TF_Cof_Chromatin = dplyr::coalesce(is_TF_Cof_Chromatin, FALSE),
+      evidence_score =
+        w$high_tau            * as.integer(high_tau) +
+        w$high_partial_corr   * as.integer(high_partial_corr) +
+        w$in_wgcna_module     * as.integer(in_wgcna_module) +
+        w$multi_task_positive * as.integer(multi_task_positive) +
+        w$stability_selected  * as.integer(stability_selected) +
+        w$atlas_supported     * as.integer(atlas_supported) +
+        w$is_ligand           * as.integer(is_ligand) +
+        w$is_secreted         * as.integer(is_secreted) +
+        w$is_ecm              * as.integer(is_ecm) +
+        w$is_metabolic        * as.integer(is_metabolic) +
+        w$is_TF_Cof_Chromatin * as.integer(is_TF_Cof_Chromatin)
+    )
+}
+
+evidence_df      <- build_evidence(aspc_candidates,      atlas_up_tbl,   "tau_nepc")
+evidence_down_df <- build_evidence(aspc_down_candidates, atlas_down_tbl, "tau_adeno")
+
+msg("ASPC-up   evidence rows: %d", nrow(evidence_df))
+msg("ASPC-down evidence rows: %d", nrow(evidence_down_df))
+
+report_channels <- function(df, label) {
+  cat(sprintf("\n--- Evidence channel activity: %s ---\n", label))
+  ch <- c("high_tau","high_partial_corr","in_wgcna_module","multi_task_positive",
+          "stability_selected","atlas_supported","is_ligand","is_secreted",
+          "is_ecm","is_metabolic","is_TF_Cof_Chromatin")
+  n_row <- nrow(df)
+  for (cn in ch) {
+    n <- if (cn %in% names(df)) sum(df[[cn]], na.rm = TRUE) else 0L
+    pct <- if (n_row > 0) 100 * n / n_row else 0
+    flag <- if (n == 0) {
+      "  <-- CONTRIBUTES NOTHING"
+    } else if (pct > 90) {
+      "  <-- fires for >90%, non-discriminating"
+    } else {
+      ""
+    }
+    cat(sprintf("  %-22s weight %4.1f   TRUE %5d (%5.1f%%)%s\n", cn, w[[cn]], n, pct, flag))
+  }
+}
+report_channels(evidence_df,      "ASPC-up")
+report_channels(evidence_down_df, "ASPC-down")
+
+# ============================================================================
+# STEP 12 — TARGET-SIZE SIGNATURE SELECTION   [v6]
+# ============================================================================
+hdr("STEP 12 — signature selection (target = %d genes, mode = '%s')",
+    cfg$target_size, cfg$selection_mode)
+
+# Apply one tier's gates. `direction` is "up" or "down".
+apply_tier <- function(df, tier, tau_col, ratio_col, direction) {
+  keep <- rep(TRUE, nrow(df))
+
+  # tau gate (bounded by cfg$tau_floor)
+  tau_thr <- max(tier$tau, cfg$tau_floor)
+  tv <- df[[tau_col]]
+  keep <- keep & !is.na(tv) & tv >= tau_thr
+
+  # evidence score
+  keep <- keep & !is.na(df$evidence_score) &
+          df$evidence_score >= max(tier$score, cfg$score_floor)
+
+  # ratio gate (bounded by cfg$ratio_floor)
+  ratio_thr <- max(tier$ratio, cfg$ratio_floor)
+  rv <- df[[ratio_col]]
+  keep <- keep & !is.na(rv) & rv >= ratio_thr
+
+  # correlations
+  if (isTRUE(tier$require_cor)) {
+    keep <- keep & !is.na(df$cor_NEPC) & !is.na(df$cor_AR)
+  }
+  if (isTRUE(tier$cor_gates)) {
+    if (direction == "up") {
+      keep <- keep & !is.na(df$cor_NEPC) & df$cor_NEPC >= cfg$cor_NEPC_min &
+                     !is.na(df$cor_AR)   & df$cor_AR   <= cfg$cor_AR_max
+    } else {
+      keep <- keep & !is.na(df$cor_NEPC) & df$cor_NEPC <= cfg$cor_NEPC_down_max &
+                     !is.na(df$cor_AR)   & df$cor_AR   >= cfg$cor_AR_down_min
+    }
+  }
+  df[keep, , drop = FALSE]
+}
+
+rank_within <- function(df, tau_col, ratio_col) {
+  df %>%
+    dplyr::arrange(
+      dplyr::desc(evidence_score),
+      dplyr::desc(dplyr::coalesce(.data[[ratio_col]], 0)),
+      dplyr::desc(dplyr::coalesce(.data[[tau_col]],   0)),
+      dplyr::desc(abs(dplyr::coalesce(partial_corr, 0)))
+    )
+}
+
+select_signature <- function(df, label, tau_col, ratio_col, direction,
+                             exclude = character(0)) {
+  if (length(exclude)) {
+    df <- df %>% dplyr::filter(!(gene %in% exclude))
+  }
+
+  tiers <- build_tiers()
+  if (identical(cfg$selection_mode, "strict")) tiers <- tiers[1]
+  if (identical(cfg$selection_mode, "rank_only")) tiers <- tiers[length(tiers)]
+
+  trace <- list()
+  chosen <- NULL
+  chosen_tier <- NULL
+
+  for (tr in tiers) {
+    sub <- apply_tier(df, tr, tau_col, ratio_col, direction)
+    trace[[length(trace) + 1]] <- tibble::tibble(
+      branch = label, tier = tr$id, tier_label = tr$label,
+      tau_thr = max(tr$tau, cfg$tau_floor),
+      ratio_thr = max(tr$ratio, cfg$ratio_floor),
+      score_thr = max(tr$score, cfg$score_floor),
+      cor_gates = tr$cor_gates, require_cor = tr$require_cor,
+      n_eligible = nrow(sub))
+    cat(sprintf("  tier %d  %-42s eligible = %5d\n", tr$id, tr$label, nrow(sub)))
+
+    if (is.null(chosen) || nrow(sub) > nrow(chosen)) {
+      chosen <- sub
+      chosen_tier <- tr
+    }
+    if (nrow(sub) >= cfg$target_size) {
+      chosen <- sub
+      chosen_tier <- tr
+      break
+    }
+  }
+
+  trace_df <- dplyr::bind_rows(trace)
+
+  if (is.null(chosen) || !nrow(chosen)) {
+    warn_msg("%s: no gene passes even the loosest tier.", label)
+    return(list(genes = character(0), tier = chosen_tier, trace = trace_df,
+                table = chosen))
+  }
+
+  ranked <- rank_within(chosen, tau_col, ratio_col)
+  n_take <- min(cfg$target_size, nrow(ranked))
+  out <- utils::head(ranked, n_take)
+
+  msg("%s: tier %d ('%s') -> %d eligible, taking top %d",
+      label, chosen_tier$id, chosen_tier$label, nrow(chosen), n_take)
+  msg("  effective thresholds: tau >= %.2f | ratio >= %.2f | score >= %.1f | cor gates %s",
+      max(chosen_tier$tau, cfg$tau_floor),
+      max(chosen_tier$ratio, cfg$ratio_floor),
+      max(chosen_tier$score, cfg$score_floor),
+      ifelse(chosen_tier$cor_gates, "ON", "OFF"))
+
+  if (n_take < cfg$target_size) {
+    warn_msg("  Only %d genes available (target %d). The candidate pool or the",
+             n_take, cfg$target_size)
+    warn_msg("  floors (tau >= %.2f, ratio >= %.2f) are the binding constraint.",
+             cfg$tau_floor, cfg$ratio_floor)
+  }
+  if (chosen_tier$id >= 6) {
+    warn_msg("  Tier %d drops the correlation gates. Describe this signature as", chosen_tier$id)
+    warn_msg("  'top %d by evidence among genes with tau >= %.2f', not as", n_take,
+             max(chosen_tier$tau, cfg$tau_floor))
+    warn_msg("  'genes with high cell-type specificity'.")
+  }
+
+  list(genes = unique(out$gene), tier = chosen_tier, trace = trace_df, table = out)
+}
+
+cat("\n--- ASPC-down (fibroblast / stroma) ---\n")
+fib_sel <- select_signature(evidence_down_df, "FIBROBLAST_STROMA",
+                            "tau_adeno", "ratio_adeno_mean", "down")
+FIBROBLAST_STROMA_SIGNATURE <- fib_sel$genes
+
+cat("\n--- ASPC-up ---\n")
+aspc_sel <- select_signature(evidence_df, "ASPC",
+                             "tau_nepc", "ratio_nepc_mean", "up",
+                             exclude = FIBROBLAST_STROMA_SIGNATURE)
+ASPC_SIGNATURE <- aspc_sel$genes
+
+selection_trace <- dplyr::bind_rows(fib_sel$trace, aspc_sel$trace)
+readr::write_csv(selection_trace,
+                 file.path(cfg$results_dir, "signature_selection_diagnostics.csv"))
+
+# overlap check between the two branches
+ov <- intersect(ASPC_SIGNATURE, FIBROBLAST_STROMA_SIGNATURE)
+msg("Overlap between the two signatures after exclusion: %d genes", length(ov))
+
+# ============================================================================
+# STEP 13 — OUTPUTS
+# ============================================================================
+hdr("STEP 13 — outputs")
+
 ASPC_bulk_score <- score_from_genes(ASPC_SIGNATURE, expr_mat)
-FIBROBLAST_STROMA_bulk_score <- score_from_genes(FIBROBLAST_STROMA_SIGNATURE, expr_mat)
+FIB_bulk_score  <- score_from_genes(FIBROBLAST_STROMA_SIGNATURE, expr_mat)
 
-bulk_signature_scores_tbl <- tibble(
+bulk_signature_scores_tbl <- tibble::tibble(
   sample = colnames(expr_mat),
   NEPC_score = as.numeric(NEPC_score[colnames(expr_mat)]),
-  AR_score = as.numeric(AR_score[colnames(expr_mat)]),
+  AR_score   = as.numeric(AR_score[colnames(expr_mat)]),
   ASPC_signature_score = as.numeric(ASPC_bulk_score[colnames(expr_mat)]),
-  FIBROBLAST_STROMA_signature_score = as.numeric(FIBROBLAST_STROMA_bulk_score[colnames(expr_mat)])
+  FIBROBLAST_STROMA_signature_score = as.numeric(FIB_bulk_score[colnames(expr_mat)]),
+  ASPC_fraction = as.numeric(ASPC_fraction[colnames(expr_mat)])
 )
 
-write_csv(
-  bulk_signature_scores_tbl,
-  file.path(cfg$results_dir, "bulk_signature_scores_NEPC_AR_ASPC_up_down.csv")
-)
-
-msg("Wrote bulk signature scores: %s",
-    file.path(cfg$results_dir, "bulk_signature_scores_NEPC_AR_ASPC_up_down.csv"))
-
-# -----------------------------
-# Outputs
-# -----------------------------
+readr::write_csv(bulk_signature_scores_tbl,
+                 file.path(cfg$results_dir, "bulk_signature_scores_NEPC_AR_ASPC_up_down.csv"))
 writeLines(ASPC_SIGNATURE,              file.path(cfg$results_dir, "ASPC_SIGNATURE.txt"))
 writeLines(FIBROBLAST_STROMA_SIGNATURE, file.path(cfg$results_dir, "FIBROBLAST_STROMA_SIGNATURE.txt"))
+readr::write_csv(evidence_df,      file.path(cfg$results_dir, "evidence_matrix_ASPC_UP.csv"))
+readr::write_csv(evidence_down_df, file.path(cfg$results_dir, "evidence_matrix_ASPC_DOWN.csv"))
 
-write_csv(evidence_df,      file.path(cfg$results_dir, "evidence_matrix_ASPC_UP.csv"))
-write_csv(evidence_down_df, file.path(cfg$results_dir, "evidence_matrix_ASPC_DOWN.csv"))
+if (!is.null(aspc_sel$table) && nrow(aspc_sel$table)) {
+  readr::write_csv(aspc_sel$table, file.path(cfg$results_dir, "ASPC_SIGNATURE_ranked.csv"))
+}
+if (!is.null(fib_sel$table) && nrow(fib_sel$table)) {
+  readr::write_csv(fib_sel$table, file.path(cfg$results_dir, "FIBROBLAST_STROMA_SIGNATURE_ranked.csv"))
+}
 
-msg("score_threshold: %.3f", score_threshold)
-msg("ASPC_SIGNATURE size: %d", length(ASPC_SIGNATURE))
-msg("FIBROBLAST_STROMA_SIGNATURE size: %d", length(FIBROBLAST_STROMA_SIGNATURE))
-msg("TF flag TRUE count (evidence_df): %d", sum(evidence_df$is_TF_Cof_Chromatin, na.rm = TRUE))
-msg("TF flag TRUE count (evidence_down_df): %d", sum(evidence_down_df$is_TF_Cof_Chromatin, na.rm = TRUE))
-msg("Pipeline complete. Results in: %s", cfg$results_dir)
+tier_line <- function(sel) {
+  if (is.null(sel$tier)) return("none")
+  sprintf("tier %d (%s): tau>=%.2f ratio>=%.2f score>=%.1f cor_gates=%s",
+          sel$tier$id, sel$tier$label,
+          max(sel$tier$tau, cfg$tau_floor),
+          max(sel$tier$ratio, cfg$ratio_floor),
+          max(sel$tier$score, cfg$score_floor),
+          sel$tier$cor_gates)
+}
+
+prov <- c(
+  paste0("date: ", Sys.time()),
+  "script: 06_integrate_signatures.R v6",
+  paste0("selection_mode: ", cfg$selection_mode),
+  paste0("target_size: ", cfg$target_size),
+  paste0("min_marker_cohorts: ", cfg$min_marker_cohorts),
+  paste0("floors: tau >= ", cfg$tau_floor, " | ratio >= ", cfg$ratio_floor,
+         " | score >= ", cfg$score_floor),
+  paste0("ASPC achieved: ", tier_line(aspc_sel)),
+  paste0("FIB  achieved: ", tier_line(fib_sel)),
+  paste0("ASPC candidate pool: ", length(aspc_candidates)),
+  paste0("FIB  candidate pool: ", length(aspc_down_candidates)),
+  paste0("tau NEPC : ", cfg$tau_nepc_csv,  " [", file.exists(cfg$tau_nepc_csv),  "]"),
+  paste0("tau Adeno: ", cfg$tau_adeno_csv, " [", file.exists(cfg$tau_adeno_csv), "]"),
+  paste0("ratio NEPC : ", cfg$ratio_nepc_csv,  " [", file.exists(cfg$ratio_nepc_csv),  "]"),
+  paste0("ratio Adeno: ", cfg$ratio_adeno_csv, " [", file.exists(cfg$ratio_adeno_csv), "]"),
+  paste0("04_ coefficients: ", cfg$multi_task_csv, " [", file.exists(cfg$multi_task_csv), "]"),
+  paste0("04_ stability   : ", cfg$stability_csv,  " [", file.exists(cfg$stability_csv),  "]"),
+  paste0("05_ WGCNA dir   : ", wgcna_dir %||% "NONE"),
+  paste0("bulk counts: ", cfg$bulk_counts_csv),
+  paste0("residualized on: ", paste(cfg$resid_covariates, collapse = ", ")),
+  "ASPC_fraction EXCLUDED from residualization",
+  paste0("ASPC_SIGNATURE size: ", length(ASPC_SIGNATURE)),
+  paste0("FIBROBLAST_STROMA_SIGNATURE size: ", length(FIBROBLAST_STROMA_SIGNATURE)),
+  paste0("overlap after exclusion: ", length(ov))
+)
+writeLines(prov, file.path(cfg$results_dir, "signatures.PROVENANCE.txt"))
+
+msg("ASPC_SIGNATURE size: %d  [%s]", length(ASPC_SIGNATURE), tier_line(aspc_sel))
+msg("FIBROBLAST_STROMA_SIGNATURE size: %d  [%s]",
+    length(FIBROBLAST_STROMA_SIGNATURE), tier_line(fib_sel))
+
+if (length(ASPC_SIGNATURE)) {
+  cat("\n--- ASPC_SIGNATURE (top 30) ---\n")
+  print(utils::head(ASPC_SIGNATURE, 30))
+}
+if (length(FIBROBLAST_STROMA_SIGNATURE)) {
+  cat("\n--- FIBROBLAST_STROMA_SIGNATURE (top 30) ---\n")
+  print(utils::head(FIBROBLAST_STROMA_SIGNATURE, 30))
+}
+
+hdr("06_ COMPLETE — results in %s", cfg$results_dir)
