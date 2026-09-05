@@ -1,0 +1,934 @@
+# ============================================================================
+# Multi-cohort single-cell RNA-seq batch pipeline  (v8 — GSE185344 removed)
+# ============================================================================
+# Each folder = one independent dataset (cohort). For every cohort the script:
+#   1. Scans the folder and auto-detects samples + their file format
+#   2. Triages duplicate matrices for the same GSM (raw vs processed)
+#   3. Loads each sample with the format-appropriate reader
+#   4. Merges & preprocesses (Normalize, HVGs, Scale, PCA, neighbours, cluster, UMAP)
+#   5. Calls cluster markers (stratified by placeholder genotype = Unknown)
+#   6. Annotates cell types via SingleR using a species-matched reference
+#   7. Names clusters and draws UMAPs
+#   8. Writes every output into THAT cohort's own folder
+#   9. Moves on to the next cohort
+#
+# ---------------------------------------------------------------------------
+# CHANGES IN v8 — GSE185344 withdrawn from the study
+# ---------------------------------------------------------------------------
+# Removed:
+#   * The Adeno_GSE185344 cohort entry.
+#   * All serialised-R-object machinery, which existed ONLY to read that
+#     series' GSE185344_PH_scRNA.final.rds(.gz):
+#       - read_rds_seurat()            reader
+#       - load_r_object()              multi-strategy loader
+#       - probe_file_magic()           byte-level format probe
+#       - classify_magic() / read_magic() / raw_to_text() helpers
+#       - check_gzip_intact()          gzip integrity test
+#       - triage_duplicate_robjects()  .rds vs .rds.gz selection
+#       - rds_stem()                   filename stem helper
+#       - the "rds_seurat" sample type and its scan/dispatch branches
+#       - cfg$rds_preference, cfg$allow_temp_decompress,
+#         cfg$max_decompress_layers, cfg$keep_author_annotations
+#       - author annotation transfer, umap_author_annotation.pdf and
+#         author_annotations.csv (only RDS objects carried author metadata)
+#       - robject_file_comparison.csv output
+#   * The ANNOTATION_ONLY_PATTERNS entries that existed for the two GSE185344
+#     companion CSVs are retained, since the same guard usefully protects
+#     other cohorts from ingesting metadata/TCR tables as expression.
+#
+# Cohort count is now 18 (8 NEPC + 10 Adenocarcinoma).
+#
+# NOTE: scan_cohort() still SKIPS any *.rds / *.rda / *.RData it encounters,
+# so a stray Seurat object in a folder is ignored rather than misparsed by a
+# text reader. Nothing attempts to load it.
+#
+# ---------------------------------------------------------------------------
+# CHANGES CARRIED OVER
+#   v3 — raw/processed matrix triage (GSE141445 GSM4203181)
+#   v2 FIX 1 — chunked dense->sparse conversion (16 GB limit, GSE181294)
+#   v2 FIX 2 — annotation-column sniffing for labelled CSVs
+#   v2 FIX 3 — header/data column-offset detection for DGE files
+#   Plus: per-sample error capture, gc() between samples, output-file skipping.
+#
+# Sample formats handled (auto-dispatched):
+#   triplet_10x      <pfx>_barcodes.tsv.gz + _features.tsv.gz + _matrix.mtx.gz
+#   triplet_custom   <pfx>.barcode.csv.gz  + .genes.csv.gz    + .counts.mtx.gz
+#   dense_csv        <pfx>_dense.csv.gz            cells x genes, has CLUSTER col
+#   gene_cell_table  <pfx>_gene_cell_exprs_table.txt.gz   Gene_ID + Symbol + cells
+#   matrix_txt       <pfx>_dge.txt.gz / data.matrix.txt.gz / data.raw.matrix.txt.gz
+#   matrix_csv       <pfx>.count.csv.gz                    genes x cells CSV
+#   labelled_csv     matrix + embedded annotation columns
+#   archive_tar      <pfx>.tar.gz    wraps a 10x matrix directory
+#   archive_zip      <pfx>.zip       wraps a 10x matrix directory
+# ============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(SingleR)
+  library(celldex)
+  library(Matrix)
+  library(SingleCellExperiment)
+  library(data.table)
+  library(stringr)
+  library(tools)
+  library(patchwork)
+})
+
+set.seed(123)
+options(future.globals.maxSize = 8 * 1024^3)
+
+# ---- raise the macOS vector memory ceiling if the R build supports it -----
+if (exists("mem.maxVSize")) {
+  cur <- try(mem.maxVSize(), silent = TRUE)
+  if (!inherits(cur, "try-error")) {
+    try(mem.maxVSize(vsize = 64 * 1024), silent = TRUE)  # 64 GB ceiling (MB units)
+    cat("[INFO] mem.maxVSize raised from", cur, "to", mem.maxVSize(), "MB\n")
+  }
+}
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+cfg <- list(
+  nfeatures            = 1000,
+  npcs                 = 20,
+  resolution           = 0.05,
+  min_cells_gene       = 3,
+  min_features_cell    = 200,
+  run_singler          = TRUE,
+  singler_max_cells    = 20000,
+  save_rds             = TRUE,
+
+  # memory controls (v2)
+  chunk_cols           = 2000,      # columns per chunk when densifying
+  max_cells_per_sample = Inf,       # set e.g. 5000 to subsample huge samples
+  gc_after_each_sample = TRUE,
+
+  # raw/processed preference (v3): "raw" | "processed" | "auto"
+  matrix_preference    = "raw",
+  classify_n_rows      = 40,
+  classify_n_cols      = 60
+)
+
+NEPC_ROOT  <- "/Volumes/Jingjing_Chen/NEPC scRNA dataset"
+ADENO_ROOT <- "/Volumes/Jingjing_Chen/Adenocarcinoma scRNA dataset"
+
+msg      <- function(...) cat("[INFO]", sprintf(...), "\n")
+warn_msg <- function(...) cat("[WARN]", sprintf(...), "\n")
+hdr      <- function(...) cat("\n========================================\n",
+                              sprintf(...), "\n========================================\n", sep = "")
+
+# ============================================================================
+# COHORT DEFINITIONS  (18 cohorts: 8 NEPC + 10 Adenocarcinoma)
+# ============================================================================
+cohorts <- list(
+  # ---------------- NEPC ----------------
+  list(name = "NEPC_GSE210358",      dir = file.path(NEPC_ROOT, "GSE210358"),      species = "human", group = "NEPC"),
+  list(name = "NEPC_GSE264573",      dir = file.path(NEPC_ROOT, "GSE264573"),      species = "human", group = "NEPC"),
+  list(name = "NEPC_GSE292074",      dir = file.path(NEPC_ROOT, "GSE292074"),      species = "human", group = "NEPC"),
+  list(name = "NEPC_GSE137829",      dir = file.path(NEPC_ROOT, "GSE137829"),      species = "human", group = "NEPC"),
+  list(name = "NEPC_GSE221755",      dir = file.path(NEPC_ROOT, "GSE221755"),      species = "mouse", group = "NEPC"),
+  list(name = "NEPC_GSE296986",      dir = file.path(NEPC_ROOT, "GSE296986"),      species = "mouse", group = "NEPC"),
+  list(name = "NEPC_GSE210358_TKO",  dir = file.path(NEPC_ROOT, "GSE210358_TKO"),  species = "mouse", group = "NEPC"),
+  list(name = "NEPC_GSE235036_TKO",  dir = file.path(NEPC_ROOT, "GSE235036_TKO"),  species = "mouse", group = "NEPC"),
+
+  # ------------- Adenocarcinoma -------------
+  list(name = "Adeno_GSE210358",     dir = file.path(ADENO_ROOT, "GSE210358"),     species = "human", group = "Adeno"),
+  list(name = "Adeno_GSE264573",     dir = file.path(ADENO_ROOT, "GSE264573"),     species = "human", group = "Adeno"),
+  list(name = "Adeno_GSE181294",     dir = file.path(ADENO_ROOT, "GSE181294"),     species = "human", group = "Adeno"),
+
+  # GSE141445: folder holds both processed and raw matrices for GSM4203181;
+  # the raw counts file is selected by triage_duplicate_matrices().
+  list(name = "Adeno_GSE141445",     dir = file.path(ADENO_ROOT, "GSE141445"),     species = "human", group = "Adeno"),
+
+  list(name = "Adeno_GSE235036",     dir = file.path(ADENO_ROOT, "GSE235036"),     species = "mouse", group = "Adeno"),
+  list(name = "Adeno_GSE292074",     dir = file.path(ADENO_ROOT, "GSE292074"),     species = "human", group = "Adeno"),
+  list(name = "Adeno_GSE137829",     dir = file.path(ADENO_ROOT, "GSE137829"),     species = "human", group = "Adeno"),
+  list(name = "Adeno_GSE176031",     dir = file.path(ADENO_ROOT, "GSE176031"),     species = "human", group = "Adeno"),
+  list(name = "Adeno_GSE268307",     dir = file.path(ADENO_ROOT, "GSE268307"),     species = "human", group = "Adeno"),
+  list(name = "Adeno_GSE296986",     dir = file.path(ADENO_ROOT, "GSE296986"),     species = "mouse", group = "Adeno")
+)
+
+# ============================================================================
+# GENERIC HELPERS
+# ============================================================================
+sanitize_gene_names <- function(x) {
+  x <- as.character(x); x <- str_trim(x)
+  x <- gsub("\uFEFF", "", x, fixed = TRUE)
+  x <- gsub("\r", "", x, fixed = TRUE)
+  x <- gsub('"', "", x, fixed = TRUE)
+  x[x == "" | is.na(x)] <- "NA_FEATURE"
+  x
+}
+
+sanitize_cell_names <- function(x) {
+  x <- as.character(x); x <- str_trim(x)
+  x <- gsub("\uFEFF", "", x, fixed = TRUE)
+  x <- gsub("\r", "", x, fixed = TRUE)
+  x <- gsub('"', "", x, fixed = TRUE)
+  x[x == "" | is.na(x)] <- "NA_CELL"
+  x
+}
+
+collapse_duplicate_features <- function(mat) {
+  rn <- rownames(mat)
+  if (is.null(rn) || !any(duplicated(rn))) return(mat)
+  msg("  Collapsing %d duplicated feature name(s).", sum(duplicated(rn)))
+  f <- factor(rn, levels = unique(rn))
+  G <- Matrix::sparse.model.matrix(~ 0 + f)
+  agg <- Matrix::t(G) %*% mat
+  rownames(agg) <- levels(f)
+  agg
+}
+
+finalize_matrix <- function(mat) {
+  if (!inherits(mat, "dgCMatrix")) mat <- as(mat, "dgCMatrix")
+  rownames(mat) <- sanitize_gene_names(rownames(mat))
+  colnames(mat) <- make.unique(sanitize_cell_names(colnames(mat)))
+  collapse_duplicate_features(mat)
+}
+
+check_not_spatial <- function(n_barcodes, sample_name, dir_path = NULL) {
+  if (!is.null(dir_path) && dir.exists(dir_path)) {
+    hits <- list.files(dir_path,
+      pattern = "tissue_positions|scalefactors_json|tissue_(hi|low)res_image",
+      recursive = TRUE)
+    if (length(hits)) {
+      warn_msg("[SPATIAL] %s contains Space Ranger files (%s). Barcodes are SPOTS, not cells.",
+               sample_name, paste(head(hits, 3), collapse = ", "))
+    }
+  }
+  if (n_barcodes <= 4992) {
+    warn_msg("[SPATIAL?] %s has only %d barcodes (<= 4992, the Visium maximum). Verify Cell Ranger origin.",
+             sample_name, n_barcodes)
+  }
+  invisible(NULL)
+}
+
+open_maybe_gz <- function(path) if (grepl("\\.gz$", path)) gzfile(path) else file(path)
+
+peek_lines <- function(path, n = 5) {
+  con <- open_maybe_gz(path)
+  on.exit(close(con), add = TRUE)
+  readLines(con, n = n, warn = FALSE)
+}
+
+detect_sep <- function(lines) {
+  if (!length(lines)) return("\t")
+  counts <- c(
+    "\t" = max(lengths(strsplit(lines, "\t", fixed = TRUE))) - 1,
+    ","  = max(lengths(strsplit(lines, ",",  fixed = TRUE))) - 1,
+    " "  = max(lengths(strsplit(lines, " ",  fixed = TRUE))) - 1
+  )
+  names(which.max(counts))
+}
+
+looks_like_barcodes <- function(x, n = 200) {
+  x <- head(as.character(x), n)
+  if (!length(x)) return(FALSE)
+  frac_acgt <- mean(grepl("^[ACGTN]{8,}(-[0-9]+)?$", toupper(x)))
+  frac_long <- mean(nchar(x) >= 14)
+  frac_acgt > 0.5 || frac_long > 0.7
+}
+
+sniff_table <- function(path, sample_name) {
+  lines <- peek_lines(path, n = 3)
+  sep <- detect_sep(lines)
+  hdr_n  <- length(strsplit(lines[1], sep, fixed = TRUE)[[1]])
+  data_n <- if (length(lines) >= 2) length(strsplit(lines[2], sep, fixed = TRUE)[[1]]) else hdr_n
+  msg("  %s: sep='%s'  header_fields=%d  data_fields=%d",
+      sample_name, ifelse(sep == "\t", "\\t", sep), hdr_n, data_n)
+  list(sep = sep, header_fields = hdr_n, data_fields = data_n,
+       offset = (data_n == hdr_n + 1))
+}
+
+# ============================================================================
+# v3 — MATRIX FILE CLASSIFICATION (raw counts vs processed values)
+# ============================================================================
+classify_matrix_file <- function(path, label = basename(path)) {
+  out <- list(
+    file = basename(path), path = path,
+    size_mb = round(file.info(path)$size / 1024^2, 2),
+    sep = NA_character_, n_fields = NA_integer_,
+    all_integer = NA, has_negative = NA,
+    min_val = NA_real_, max_val = NA_real_,
+    pct_zero = NA_real_, verdict = "unknown", reason = ""
+  )
+
+  lines <- tryCatch(peek_lines(path, n = cfg$classify_n_rows + 1),
+                    error = function(e) character(0))
+  if (length(lines) < 2) {
+    out$verdict <- "unreadable"; out$reason <- "fewer than 2 lines"; return(out)
+  }
+
+  sep <- detect_sep(lines)
+  out$sep <- ifelse(sep == "\t", "\\t", sep)
+
+  vals <- unlist(lapply(lines[-1], function(l) {
+    f <- strsplit(l, sep, fixed = TRUE)[[1]]
+    if (length(f) < 2) return(numeric(0))
+    suppressWarnings(as.numeric(f[2:min(length(f), cfg$classify_n_cols + 1)]))
+  }))
+  vals <- vals[is.finite(vals)]
+
+  out$n_fields <- length(strsplit(lines[2], sep, fixed = TRUE)[[1]])
+  if (!length(vals)) {
+    out$verdict <- "no_numeric"; out$reason <- "no parseable numeric values"; return(out)
+  }
+
+  out$all_integer  <- all(abs(vals - round(vals)) < 1e-8)
+  out$has_negative <- any(vals < 0)
+  out$min_val      <- min(vals)
+  out$max_val      <- max(vals)
+  out$pct_zero     <- round(100 * mean(vals == 0), 1)
+
+  fname_raw <- grepl("raw", basename(path), ignore.case = TRUE)
+
+  if (out$has_negative) {
+    out$verdict <- "processed"; out$reason <- "negative values present (scaled / z-scored)"
+  } else if (isTRUE(out$all_integer)) {
+    out$verdict <- "raw_counts"
+    out$reason  <- if (fname_raw) "integer values and 'raw' in filename" else "integer values"
+  } else {
+    out$verdict <- "processed"; out$reason <- "non-integer values (normalised / log-transformed)"
+  }
+  out
+}
+
+triage_duplicate_matrices <- function(samples, dir_path, cohort_name) {
+  collide_types <- c("matrix_txt", "matrix_csv", "labelled_csv", "dense_csv", "gene_cell_table")
+  idx <- which(vapply(samples, function(s) s$type %in% collide_types && !is.null(s$path), logical(1)))
+  if (!length(idx)) return(list(samples = samples, report = NULL))
+
+  gsm_of <- function(s) {
+    m <- regmatches(s$sample_id, regexpr("^GSM[0-9]+", s$sample_id))
+    if (length(m)) m else s$sample_id
+  }
+  keys <- vapply(samples[idx], gsm_of, character(1))
+  dup_keys <- unique(keys[duplicated(keys)])
+  if (!length(dup_keys)) return(list(samples = samples, report = NULL))
+
+  msg("Duplicate matrices detected for %d accession(s): %s",
+      length(dup_keys), paste(dup_keys, collapse = ", "))
+
+  report <- list(); drop_idx <- integer(0)
+
+  for (k in dup_keys) {
+    grp <- idx[keys == k]
+    cls <- lapply(samples[grp], function(s) classify_matrix_file(s$path))
+
+    for (i in seq_along(grp)) {
+      c_i <- cls[[i]]
+      msg("  %-42s %-11s  int=%-5s neg=%-5s range=[%g, %g]  zero=%.1f%%  %.1f MB",
+          c_i$file, c_i$verdict, c_i$all_integer, c_i$has_negative,
+          c_i$min_val, c_i$max_val, c_i$pct_zero, c_i$size_mb)
+    }
+
+    is_raw_name <- grepl("raw", vapply(cls, function(c) c$file, character(1)), ignore.case = TRUE)
+    is_raw_val  <- vapply(cls, function(c) identical(c$verdict, "raw_counts"), logical(1))
+
+    pick <- switch(cfg$matrix_preference,
+      raw       = if (any(is_raw_val & is_raw_name)) which(is_raw_val & is_raw_name)[1]
+                  else if (any(is_raw_val)) which(is_raw_val)[1]
+                  else if (any(is_raw_name)) which(is_raw_name)[1]
+                  else 1L,
+      processed = if (any(!is_raw_name)) which(!is_raw_name)[1] else 1L,
+      auto      = if (any(is_raw_val)) which(is_raw_val)[1] else 1L,
+      1L
+    )
+
+    msg("  -> keeping %s (preference='%s'); skipping %d other file(s)",
+        cls[[pick]]$file, cfg$matrix_preference, length(grp) - 1)
+
+    drop_idx <- c(drop_idx, grp[-pick])
+
+    for (i in seq_along(grp)) {
+      report[[length(report) + 1]] <- data.frame(
+        cohort = cohort_name, accession = k,
+        file = cls[[i]]$file, size_mb = cls[[i]]$size_mb,
+        sep = cls[[i]]$sep, n_fields = cls[[i]]$n_fields,
+        all_integer = cls[[i]]$all_integer, has_negative = cls[[i]]$has_negative,
+        min_val = cls[[i]]$min_val, max_val = cls[[i]]$max_val,
+        pct_zero = cls[[i]]$pct_zero,
+        verdict = cls[[i]]$verdict, reason = cls[[i]]$reason,
+        selected = (i == pick), preference = cfg$matrix_preference,
+        stringsAsFactors = FALSE)
+    }
+  }
+
+  if (length(drop_idx)) samples <- samples[-drop_idx]
+  list(samples = samples, report = if (length(report)) bind_rows(report) else NULL)
+}
+
+# ---- v2 FIX 1: chunked dense -> sparse conversion -------------------------
+df_to_sparse_by_chunks <- function(df, chunk = cfg$chunk_cols, label = "") {
+  nc <- ncol(df)
+  if (nc == 0) stop("No numeric columns to convert (", label, ")")
+  starts <- seq(1, nc, by = chunk)
+  blocks <- vector("list", length(starts))
+
+  for (i in seq_along(starts)) {
+    a <- starts[i]; b <- min(a + chunk - 1, nc)
+    blk <- as.matrix(df[, a:b, drop = FALSE])
+    suppressWarnings(storage.mode(blk) <- "double")
+    blk[is.na(blk)] <- 0
+    blocks[[i]] <- as(blk, "dgCMatrix")
+    rm(blk)
+    if (i %% 5 == 0 || i == length(starts)) gc(verbose = FALSE)
+  }
+  out <- if (length(blocks) == 1) blocks[[1]] else do.call(cbind, blocks)
+  rm(blocks); gc(verbose = FALSE)
+  out
+}
+
+# ============================================================================
+# READERS  — each returns a dgCMatrix (genes x cells)
+# ============================================================================
+
+# ---- 1. Standard 10x triplet ----------------------------------------------
+read_triplet_10x <- function(barcodes, features, matrix_mtx, sample_name) {
+  bc <- readLines(open_maybe_gz(barcodes))
+  bc <- make.unique(sanitize_cell_names(bc))
+
+  ft <- data.table::fread(features, header = FALSE)
+  genes <- if (ncol(ft) >= 2) ft[[2]] else ft[[1]]
+  genes <- sanitize_gene_names(genes)
+
+  m <- as(Matrix::readMM(open_maybe_gz(matrix_mtx)), "dgCMatrix")
+
+  if (nrow(m) != length(genes) || ncol(m) != length(bc)) {
+    if (ncol(m) == length(genes) && nrow(m) == length(bc)) {
+      msg("  %s: matrix transposed; correcting.", sample_name)
+      m <- Matrix::t(m)
+    } else {
+      stop(sprintf("Dimension mismatch for %s: matrix %dx%d, features %d, barcodes %d",
+                   sample_name, nrow(m), ncol(m), length(genes), length(bc)))
+    }
+  }
+  rownames(m) <- genes; colnames(m) <- bc
+  finalize_matrix(m)
+}
+
+# ---- 2. Custom triplet: barcode.csv / genes.csv / counts.mtx ---------------
+read_triplet_custom <- function(barcode_csv, genes_csv, counts_mtx, sample_name) {
+  bc_df <- data.table::fread(cmd = paste("gzip -cdf", shQuote(barcode_csv)), data.table = FALSE)
+  bc <- if (ncol(bc_df) == 1) bc_df[[1]] else bc_df[[ncol(bc_df)]]
+  bc <- make.unique(sanitize_cell_names(bc))
+
+  g_df <- data.table::fread(cmd = paste("gzip -cdf", shQuote(genes_csv)), data.table = FALSE)
+  genes <- if (ncol(g_df) == 1) g_df[[1]] else g_df[[ncol(g_df)]]
+  genes <- sanitize_gene_names(genes)
+
+  m <- as(Matrix::readMM(open_maybe_gz(counts_mtx)), "dgCMatrix")
+
+  if (nrow(m) == length(genes) && ncol(m) == length(bc)) {
+    rownames(m) <- genes; colnames(m) <- bc
+  } else if (ncol(m) == length(genes) && nrow(m) == length(bc)) {
+    msg("  %s: matrix transposed; correcting.", sample_name)
+    m <- Matrix::t(m); rownames(m) <- genes; colnames(m) <- bc
+  } else {
+    stop(sprintf("Dimension mismatch for %s: matrix %dx%d, genes %d, barcodes %d",
+                 sample_name, nrow(m), ncol(m), length(genes), length(bc)))
+  }
+  finalize_matrix(m)
+}
+
+# ---- 3. Dense CSV: cells x genes, first col = cell ID, may carry CLUSTER ---
+read_dense_csv <- function(path, sample_name) {
+  dt <- data.table::fread(cmd = paste("gzip -cdf", shQuote(path)), data.table = FALSE)
+  if (!("V1" %in% colnames(dt))) colnames(dt)[1] <- "V1"
+
+  cells <- make.unique(sanitize_cell_names(dt[["V1"]]))
+  drop  <- intersect(c("V1", "CLUSTER", "Cluster", "cluster"), colnames(dt))
+  keep  <- setdiff(colnames(dt), drop)
+  genes <- sanitize_gene_names(keep)
+
+  sp <- df_to_sparse_by_chunks(dt[, keep, drop = FALSE], label = sample_name)
+  rm(dt); gc(verbose = FALSE)
+
+  rownames(sp) <- cells
+  colnames(sp) <- genes
+  msg("  %s: dense_csv %d cells x %d genes -> transposing.", sample_name, nrow(sp), ncol(sp))
+  finalize_matrix(Matrix::t(sp))
+}
+
+# ---- 4. Gene_ID + Symbol + cell columns ------------------------------------
+read_gene_cell_table <- function(path, sample_name) {
+  dt <- data.table::fread(cmd = paste("gzip -cdf", shQuote(path)), data.table = FALSE)
+  nms <- colnames(dt)
+  if (!all(c("Gene_ID", "Symbol") %in% nms)) {
+    stop("Unrecognised gene_cell_exprs_table format: ", basename(path))
+  }
+  genes <- sanitize_gene_names(dt[["Symbol"]])
+  keep  <- setdiff(nms, c("Gene_ID", "Symbol"))
+
+  sp <- df_to_sparse_by_chunks(dt[, keep, drop = FALSE], label = sample_name)
+  rm(dt); gc(verbose = FALSE)
+
+  rownames(sp) <- genes
+  colnames(sp) <- make.unique(sanitize_cell_names(keep))
+  finalize_matrix(sp)
+}
+
+# ---- 5. genes x cells plain matrix (TSV/CSV/space-delimited) --------------
+#        v2 FIX 3: header/data column offset + delimiter fallback
+read_matrix_flat <- function(path, sample_name) {
+  sn <- sniff_table(path, sample_name)
+
+  read_try <- function(sep, header_offset) {
+    args <- list(cmd = paste("gzip -cdf", shQuote(path)),
+                 sep = sep, data.table = FALSE, showProgress = FALSE)
+    if (header_offset) {
+      args$header <- FALSE
+      d <- do.call(data.table::fread, args)
+      hdr <- as.character(unlist(d[1, ]))
+      d <- d[-1, , drop = FALSE]
+      hdr <- hdr[!is.na(hdr) & hdr != ""]
+      colnames(d) <- c("GENE", hdr)[seq_len(ncol(d))]
+      d
+    } else {
+      args$header <- TRUE
+      do.call(data.table::fread, args)
+    }
+  }
+
+  dt <- NULL
+  attempts <- list(
+    list(sep = sn$sep, off = sn$offset),
+    list(sep = sn$sep, off = !sn$offset),
+    list(sep = "\t",   off = FALSE),
+    list(sep = ",",    off = FALSE),
+    list(sep = " ",    off = TRUE),
+    list(sep = " ",    off = FALSE)
+  )
+  for (a in attempts) {
+    dt <- tryCatch(read_try(a$sep, a$off), error = function(e) NULL)
+    if (!is.null(dt) && ncol(dt) >= 2 && nrow(dt) >= 2) {
+      msg("  %s: parsed with sep='%s' header_offset=%s (%d x %d)",
+          sample_name, ifelse(a$sep == "\t", "\\t", a$sep), a$off, nrow(dt), ncol(dt))
+      break
+    }
+    dt <- NULL
+  }
+  if (is.null(dt)) stop("Could not parse flat matrix: ", basename(path))
+
+  ids  <- sanitize_gene_names(dt[[1]])
+  keep <- colnames(dt)[-1]
+
+  sp <- df_to_sparse_by_chunks(dt[, keep, drop = FALSE], label = sample_name)
+  rm(dt); gc(verbose = FALSE)
+
+  rownames(sp) <- ids
+  colnames(sp) <- make.unique(sanitize_cell_names(keep))
+
+  if (looks_like_barcodes(rownames(sp)) && !looks_like_barcodes(colnames(sp))) {
+    msg("  %s: row IDs look like barcodes -> transposing.", sample_name)
+    sp <- Matrix::t(sp)
+  }
+  finalize_matrix(sp)
+}
+
+# ---- 6. Labelled CSV with embedded annotation columns ---------------------
+#        v2 FIX 2: drop non-numeric columns, detect orientation
+read_labelled_csv <- function(path, sample_name) {
+  sn <- sniff_table(path, sample_name)
+
+  dt <- data.table::fread(cmd = paste("gzip -cdf", shQuote(path)),
+                          sep = sn$sep, data.table = FALSE, showProgress = FALSE)
+  if (ncol(dt) < 2) stop("Labelled CSV has < 2 columns: ", basename(path))
+  if (!nzchar(colnames(dt)[1]) || colnames(dt)[1] %in% c("V1", "")) colnames(dt)[1] <- "ROWID"
+
+  rowid <- make.unique(sanitize_cell_names(dt[[1]]))
+
+  is_num <- vapply(dt[-1], function(v) {
+    if (is.numeric(v)) return(TRUE)
+    mean(!is.na(suppressWarnings(as.numeric(head(v, 500))))) > 0.9
+  }, logical(1))
+
+  ann_cols <- names(is_num)[!is_num]
+  if (length(ann_cols)) {
+    msg("  %s: dropping %d non-numeric annotation column(s): %s",
+        sample_name, length(ann_cols), paste(head(ann_cols, 6), collapse = ", "))
+  }
+  keep <- names(is_num)[is_num]
+  if (!length(keep)) {
+    stop("No numeric columns found in ", basename(path),
+         " — this file is an annotation table, not an expression matrix")
+  }
+
+  sp <- df_to_sparse_by_chunks(dt[, keep, drop = FALSE], label = sample_name)
+  rm(dt); gc(verbose = FALSE)
+
+  rownames(sp) <- rowid
+  colnames(sp) <- sanitize_gene_names(keep)
+
+  row_bc <- looks_like_barcodes(rownames(sp))
+  col_bc <- looks_like_barcodes(colnames(sp))
+  if (row_bc && !col_bc) {
+    msg("  %s: rows are barcodes -> transposing to genes x cells.", sample_name)
+    sp <- Matrix::t(sp)
+  } else if (!row_bc && !col_bc && ncol(sp) > nrow(sp)) {
+    msg("  %s: more columns than rows -> transposing (shape heuristic).", sample_name)
+    sp <- Matrix::t(sp)
+  }
+  finalize_matrix(sp)
+}
+
+# ---- 7. Archives (tar.gz / zip) wrapping a 10x matrix directory -----------
+read_archive <- function(path, sample_name, kind = c("tar", "zip")) {
+  kind <- match.arg(kind)
+  exdir <- file.path(tempdir(), paste0("ex_", sample_name, "_", as.integer(Sys.time())))
+  dir.create(exdir, recursive = TRUE, showWarnings = FALSE)
+  on.exit(unlink(exdir, recursive = TRUE, force = TRUE), add = TRUE)
+
+  if (kind == "tar") utils::untar(path, exdir = exdir) else utils::unzip(path, exdir = exdir)
+
+  mtx <- list.files(exdir, pattern = "matrix\\.mtx(\\.gz)?$", recursive = TRUE, full.names = TRUE)
+  if (!length(mtx)) stop("No matrix.mtx found inside archive: ", basename(path))
+  mat_dir <- dirname(mtx[1])
+  msg("  Archive matrix dir: %s", sub(exdir, "<tmp>", mat_dir, fixed = TRUE))
+
+  bc <- list.files(mat_dir, pattern = "^barcodes\\.tsv(\\.gz)?$", full.names = TRUE)
+  ft <- list.files(mat_dir, pattern = "^(features|genes)\\.tsv(\\.gz)?$", full.names = TRUE)
+  if (!length(bc) || !length(ft)) stop("Incomplete 10x directory inside archive: ", basename(path))
+
+  m <- read_triplet_10x(bc[1], ft[1], mtx[1], sample_name)
+  check_not_spatial(ncol(m), sample_name, exdir)
+  m
+}
+
+# ============================================================================
+# SAMPLE DISCOVERY — scan a folder and build a sample manifest
+# ============================================================================
+# Files that are annotation-only and must never be treated as expression.
+ANNOTATION_ONLY_PATTERNS <- paste(
+  "rename_cluster", "TCRresult", "TCR_result", "tcr",
+  "cell_annotation", "cellannotation", "_metadata", "metadata_",
+  "clonotype", "barcode_annotation",
+  sep = "|"
+)
+
+scan_cohort <- function(dir_path) {
+  files <- list.files(dir_path, full.names = FALSE, recursive = FALSE)
+  files <- files[!grepl("^\\.", files)]
+  samples <- list()
+  claimed <- character(0)
+
+  add <- function(s) samples[[length(samples) + 1]] <<- s
+
+  # --- standard 10x triplets ---
+  bc10x <- grep("_barcodes\\.tsv(\\.gz)?$", files, value = TRUE)
+  for (b in bc10x) {
+    pfx <- sub("_barcodes\\.tsv(\\.gz)?$", "", b)
+    f <- grep(paste0("^", pfx, "_(features|genes)\\.tsv(\\.gz)?$"), files, value = TRUE)
+    m <- grep(paste0("^", pfx, "_matrix\\.mtx(\\.gz)?$"), files, value = TRUE)
+    if (length(f) && length(m)) {
+      add(list(sample_id = pfx, type = "triplet_10x",
+               barcodes = file.path(dir_path, b),
+               features = file.path(dir_path, f[1]),
+               matrix   = file.path(dir_path, m[1])))
+      claimed <- c(claimed, b, f[1], m[1])
+    }
+  }
+
+  # --- custom triplets: .barcode.csv / .genes.csv / .counts.mtx ---
+  bccus <- grep("\\.barcode\\.csv(\\.gz)?$", files, value = TRUE)
+  for (b in bccus) {
+    pfx <- sub("\\.barcode\\.csv(\\.gz)?$", "", b)
+    g <- grep(paste0("^", pfx, "\\.genes\\.csv(\\.gz)?$"), files, value = TRUE)
+    m <- grep(paste0("^", pfx, "\\.counts\\.mtx(\\.gz)?$"), files, value = TRUE)
+    if (length(g) && length(m)) {
+      add(list(sample_id = pfx, type = "triplet_custom",
+               barcodes = file.path(dir_path, b),
+               features = file.path(dir_path, g[1]),
+               matrix   = file.path(dir_path, m[1])))
+      claimed <- c(claimed, b, g[1], m[1])
+    }
+  }
+
+  # --- single-file / archive samples ---
+  for (f in setdiff(files, claimed)) {
+    fp <- file.path(dir_path, f)
+    if (dir.exists(fp)) next
+
+    # Serialised R objects are NOT handled by this pipeline (v8). Skip them
+    # rather than let a text reader attempt to parse binary content.
+    if (grepl("\\.(rds|rda|RData)(\\.gz)?$", f, ignore.case = TRUE)) {
+      msg("  Skipping serialised R object (not supported): %s", f)
+      next
+    }
+
+    if (grepl("\\.(pdf|log|md|json|png|jpg)$", f, ignore.case = TRUE)) next
+    if (grepl("^(metadata_merged|sample_summary|cluster_counts|sample_manifest|batch_run_log|matrix_file_comparison|cluster\\.markers)", f)) next
+
+    if (grepl(ANNOTATION_ONLY_PATTERNS, f, ignore.case = TRUE)) {
+      msg("  Skipping annotation-only file (no expression data): %s", f)
+      next
+    }
+
+    ty <- if (grepl("_dense\\.csv\\.gz$", f))                        "dense_csv"
+    else if (grepl("_gene_cell_exprs_table\\.txt\\.gz$", f))         "gene_cell_table"
+    else if (grepl("(_dge|data\\.raw\\.matrix|data\\.matrix)\\.txt\\.gz$", f)) "matrix_txt"
+    else if (grepl("\\.count\\.csv\\.gz$", f))                       "matrix_csv"
+    else if (grepl("\\.tar\\.gz$|\\.tgz$", f))                       "archive_tar"
+    else if (grepl("\\.zip$", f))                                    "archive_zip"
+    else if (grepl("\\.csv\\.gz$", f))                               "labelled_csv"
+    else NA_character_
+
+    if (is.na(ty)) next
+
+    sid <- f
+    sid <- sub("_dense\\.csv\\.gz$", "", sid)
+    sid <- sub("_gene_cell_exprs_table\\.txt\\.gz$", "", sid)
+    sid <- sub("_filtered_feature_bc_matrix", "", sid)
+    sid <- sub("\\.count\\.csv\\.gz$", "", sid)
+    sid <- sub("(_dge)?\\.txt\\.gz$", "", sid)
+    sid <- sub("\\.csv\\.gz$", "", sid)
+    sid <- sub("\\.tar\\.gz$|\\.tgz$|\\.zip$", "", sid)
+
+    add(list(sample_id = sid, type = ty, path = fp))
+  }
+
+  samples
+}
+
+load_sample <- function(s, cohort) {
+  m <- switch(s$type,
+    triplet_10x     = read_triplet_10x(s$barcodes, s$features, s$matrix, s$sample_id),
+    triplet_custom  = read_triplet_custom(s$barcodes, s$features, s$matrix, s$sample_id),
+    dense_csv       = read_dense_csv(s$path, s$sample_id),
+    gene_cell_table = read_gene_cell_table(s$path, s$sample_id),
+    matrix_txt      = read_matrix_flat(s$path, s$sample_id),
+    matrix_csv      = read_matrix_flat(s$path, s$sample_id),
+    labelled_csv    = read_labelled_csv(s$path, s$sample_id),
+    archive_tar     = read_archive(s$path, s$sample_id, "tar"),
+    archive_zip     = read_archive(s$path, s$sample_id, "zip"),
+    stop("Unknown sample type: ", s$type)
+  )
+
+  if (!s$type %in% c("archive_tar", "archive_zip")) {
+    check_not_spatial(ncol(m), s$sample_id)
+  }
+
+  if (is.finite(cfg$max_cells_per_sample) && ncol(m) > cfg$max_cells_per_sample) {
+    msg("  %s: subsampling %d -> %d cells.", s$sample_id, ncol(m), cfg$max_cells_per_sample)
+    m <- m[, sample(colnames(m), cfg$max_cells_per_sample), drop = FALSE]
+  }
+
+  colnames(m) <- paste0(s$sample_id, "__", colnames(m))
+
+  seu <- CreateSeuratObject(counts = m, project = s$sample_id,
+                            min.cells = cfg$min_cells_gene,
+                            min.features = cfg$min_features_cell)
+  rm(m)
+  if (isTRUE(cfg$gc_after_each_sample)) gc(verbose = FALSE)
+
+  seu$sample        <- s$sample_id
+  seu$dataset       <- cohort$name
+  seu$disease_group <- cohort$group
+  seu$species       <- cohort$species
+  seu$genotype      <- "Unknown"
+
+  msg("  Imported %s [%s]: %d genes x %d cells", s$sample_id, s$type, nrow(seu), ncol(seu))
+  seu
+}
+
+get_singler_ref <- function(species) {
+  if (identical(species, "mouse")) celldex::MouseRNAseqData()
+  else celldex::HumanPrimaryCellAtlasData()
+}
+
+# ============================================================================
+# PER-COHORT PROCESSING
+# ============================================================================
+process_cohort <- function(cohort) {
+  hdr("COHORT: %s", cohort$name)
+
+  in_dir  <- cohort$dir
+  out_dir <- cohort$dir   # results written back into the same folder
+
+  if (!dir.exists(in_dir)) stop("Cohort directory not found: ", in_dir)
+  if (file.access(out_dir, mode = 2) != 0) stop("Output directory not writable: ", out_dir)
+  msg("Directory: %s", in_dir)
+
+  # ---- STEP 1: discover samples ----
+  samples <- scan_cohort(in_dir)
+  if (!length(samples)) stop("No recognisable samples found in ", in_dir)
+  msg("Detected %d candidate file group(s): %s", length(samples),
+      paste(vapply(samples, function(s) s$sample_id, character(1)), collapse = ", "))
+
+  # ---- STEP 2: triage raw vs processed duplicates ----
+  tri <- triage_duplicate_matrices(samples, in_dir, cohort$name)
+  samples <- tri$samples
+  if (!is.null(tri$report)) {
+    write.csv(tri$report, file.path(out_dir, "matrix_file_comparison.csv"), row.names = FALSE)
+    msg("Wrote matrix_file_comparison.csv")
+  }
+
+  msg("Proceeding with %d sample(s): %s", length(samples),
+      paste(vapply(samples, function(s) sprintf("%s[%s]", s$sample_id, s$type), character(1)),
+            collapse = ", "))
+
+  # ---- STEP 3: load (errors captured per sample) ----
+  seurat_list <- list()
+  load_log <- list()
+  for (s in samples) {
+    err <- NA_character_
+    res <- tryCatch(load_sample(s, cohort), error = function(e) {
+      err <<- conditionMessage(e)
+      warn_msg("  FAILED %s: %s", s$sample_id, err); NULL
+    })
+    load_log[[length(load_log) + 1]] <- data.frame(
+      sample_id = s$sample_id, type = s$type,
+      file = if (!is.null(s$path)) basename(s$path) else basename(s$matrix),
+      status = if (is.null(res)) "failed" else "ok",
+      error  = err,
+      n_cells = if (is.null(res)) NA_integer_ else ncol(res),
+      n_genes = if (is.null(res)) NA_integer_ else nrow(res),
+      stringsAsFactors = FALSE)
+    if (!is.null(res)) seurat_list[[s$sample_id]] <- res
+    gc(verbose = FALSE)
+  }
+  write.csv(bind_rows(load_log), file.path(out_dir, "sample_manifest.csv"), row.names = FALSE)
+
+  if (!length(seurat_list)) {
+    stop("All samples failed to load in ", cohort$name,
+         " — see sample_manifest.csv for per-sample error messages")
+  }
+
+  # ---- STEP 4: merge & preprocess ----
+  seurat_obj <- if (length(seurat_list) == 1) seurat_list[[1]] else
+    merge(seurat_list[[1]], y = seurat_list[-1])
+  rm(seurat_list); gc(verbose = FALSE)
+  msg("Merged: %d genes x %d cells", nrow(seurat_obj), ncol(seurat_obj))
+
+  seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE)
+  seurat_obj <- FindVariableFeatures(seurat_obj, nfeatures = cfg$nfeatures, verbose = FALSE)
+  seurat_obj <- ScaleData(seurat_obj, features = VariableFeatures(seurat_obj), verbose = FALSE)
+
+  npcs <- min(cfg$npcs, ncol(seurat_obj) - 1, length(VariableFeatures(seurat_obj)) - 1)
+  seurat_obj <- RunPCA(seurat_obj, npcs = npcs, verbose = FALSE)
+  seurat_obj <- FindNeighbors(seurat_obj, dims = 1:npcs, verbose = FALSE)
+  seurat_obj <- FindClusters(seurat_obj, resolution = cfg$resolution, verbose = FALSE)
+  seurat_obj <- RunUMAP(seurat_obj, dims = 1:npcs, verbose = FALSE)
+  msg("Clusters found: %d", length(levels(seurat_obj$seurat_clusters)))
+  gc(verbose = FALSE)
+
+  # ---- STEP 5: cluster markers by genotype ----
+  tmp_obj <- JoinLayers(seurat_obj)
+  for (g in unique(tmp_obj$genotype)) {
+    seu_g <- JoinLayers(subset(tmp_obj, genotype == g))
+    if (length(unique(Idents(seu_g))) < 2) {
+      warn_msg("Only one cluster for genotype %s; skipping markers.", g); next
+    }
+    markers_g <- tryCatch(
+      FindAllMarkers(seu_g, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, verbose = FALSE),
+      error = function(e) { warn_msg("FindAllMarkers failed: %s", conditionMessage(e)); NULL })
+    if (is.null(markers_g) || !nrow(markers_g)) next
+
+    p_col <- if ("p_val_adj" %in% colnames(markers_g)) "p_val_adj" else "p_val"
+    sig <- dplyr::filter(markers_g, .data[[p_col]] < 0.05)
+    write.csv(sig, file.path(out_dir, paste0("cluster.markers.sig_", g, ".csv")), row.names = FALSE)
+    msg("Wrote %d significant markers for genotype %s", nrow(sig), g)
+  }
+  rm(tmp_obj); gc(verbose = FALSE)
+
+  # ---- STEP 6: SingleR annotation ----
+  seurat_obj <- JoinLayers(seurat_obj)
+  if (isTRUE(cfg$run_singler)) {
+    ann <- tryCatch({
+      obj_sr <- seurat_obj
+      if (ncol(obj_sr) > cfg$singler_max_cells) {
+        msg("Downsampling to %d cells for SingleR.", cfg$singler_max_cells)
+        obj_sr <- subset(obj_sr, cells = sample(colnames(obj_sr), cfg$singler_max_cells))
+      }
+      sce <- suppressWarnings(as.SingleCellExperiment(obj_sr))
+      ref <- get_singler_ref(cohort$species)
+      msg("SingleR reference: %s",
+          if (cohort$species == "mouse") "MouseRNAseqData" else "HumanPrimaryCellAtlasData")
+      sr <- SingleR(test = sce, ref = ref, labels = ref$label.main, assay.type.test = "counts")
+      out <- setNames(sr$labels, colnames(obj_sr))
+      rm(sce, obj_sr, sr); gc(verbose = FALSE)
+      out
+    }, error = function(e) { warn_msg("SingleR failed: %s", conditionMessage(e)); NULL })
+
+    lab <- rep(NA_character_, ncol(seurat_obj)); names(lab) <- colnames(seurat_obj)
+    if (!is.null(ann)) lab[names(ann)] <- ann
+    seurat_obj$celltype <- lab
+  } else {
+    seurat_obj$celltype <- NA_character_
+  }
+  Idents(seurat_obj) <- seurat_obj$seurat_clusters
+
+  # ---- STEP 7: naming & plots ----
+  cl_ids <- Idents(seurat_obj)
+  nm <- setNames(paste0("Cluster_", levels(cl_ids)), levels(cl_ids))
+  vec <- nm[as.character(cl_ids)]; names(vec) <- colnames(seurat_obj)
+  seurat_obj$cluster_name <- vec
+
+  p_clusters <- DimPlot(seurat_obj, group.by = "cluster_name", label = TRUE, repel = TRUE, label.size = 4) +
+    ggtitle(paste0(cohort$name, " — Named Clusters")) + labs(color = "Cluster")
+  p_celltype <- DimPlot(seurat_obj, group.by = "celltype", label = TRUE, repel = TRUE, label.size = 3) +
+    ggtitle(paste0(cohort$name, " — Cell Type (SingleR)")) + labs(color = "Cell Type")
+  p_sample <- DimPlot(seurat_obj, group.by = "sample") +
+    ggtitle(paste0(cohort$name, " — Sample")) + labs(color = "Sample")
+
+  pdf(file.path(out_dir, "umap_clusters_named.pdf"), width = 8, height = 6); print(p_clusters); dev.off()
+  pdf(file.path(out_dir, "umap_celltypes.pdf"),      width = 9, height = 6); print(p_celltype); dev.off()
+  pdf(file.path(out_dir, "umap_sample.pdf"),         width = 9, height = 6); print(p_sample);   dev.off()
+  pdf(file.path(out_dir, "umap_clusters_named_and_celltypes.pdf"), width = 14, height = 6)
+  print(p_clusters + p_celltype); dev.off()
+
+  # ---- STEP 8: exports ----
+  if (isTRUE(cfg$save_rds)) saveRDS(seurat_obj, file.path(out_dir, "seurat_merged.rds"))
+  write.csv(seurat_obj@meta.data, file.path(out_dir, "metadata_merged.csv"), row.names = TRUE)
+
+  summary_tbl <- seurat_obj@meta.data %>%
+    dplyr::count(sample, dataset, disease_group, species, name = "n_cells")
+  write.csv(summary_tbl, file.path(out_dir, "sample_summary.csv"), row.names = FALSE)
+
+  cluster_tbl <- seurat_obj@meta.data %>%
+    dplyr::count(seurat_clusters, name = "n_cells")
+  write.csv(cluster_tbl, file.path(out_dir, "cluster_counts.csv"), row.names = FALSE)
+
+  msg("Outputs written to: %s", out_dir)
+
+  res <- data.frame(cohort = cohort$name, dir = out_dir, status = "ok",
+                    n_samples = nrow(summary_tbl), n_cells = ncol(seurat_obj),
+                    n_clusters = length(levels(seurat_obj$seurat_clusters)),
+                    stringsAsFactors = FALSE)
+  rm(seurat_obj); gc(verbose = FALSE)
+  res
+}
+
+# ============================================================================
+# MAIN LOOP — one cohort at a time
+# ============================================================================
+run_log <- list()
+
+for (co in cohorts) {
+  t0 <- Sys.time()
+  res <- tryCatch(process_cohort(co), error = function(e) {
+    warn_msg("COHORT FAILED [%s]: %s", co$name, conditionMessage(e))
+    data.frame(cohort = co$name, dir = co$dir, status = paste("failed:", conditionMessage(e)),
+               n_samples = NA_integer_, n_cells = NA_integer_, n_clusters = NA_integer_,
+               stringsAsFactors = FALSE)
+  })
+  res$minutes <- round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 2)
+  run_log[[length(run_log) + 1]] <- res
+  gc(verbose = FALSE)
+}
+
+run_log_df <- bind_rows(run_log)
+print(run_log_df)
+
+for (root in unique(c(NEPC_ROOT, ADENO_ROOT))) {
+  if (dir.exists(root) && file.access(root, mode = 2) == 0) {
+    write.csv(run_log_df, file.path(root, "batch_run_log.csv"), row.names = FALSE)
+  }
+}
+
+hdr("BATCH COMPLETE — %d/%d cohorts succeeded",
+    sum(run_log_df$status == "ok"), nrow(run_log_df))
