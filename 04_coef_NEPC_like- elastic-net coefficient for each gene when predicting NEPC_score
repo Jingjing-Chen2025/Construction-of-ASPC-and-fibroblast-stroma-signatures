@@ -1,22 +1,58 @@
-# Calculate:
-#  - coef_NEPC_like: elastic-net coefficient for each gene when predicting NEPC_score
-#  - coef_ASPC_fraction: elastic-net coefficient for each gene when predicting ASPC_fraction
-#  - stability_freq: selection frequency across bootstrap resamples (non-zero coef)
+# ============================================================================
+# 04_ Multi-task elastic net: NEPC_score + ASPC_fraction — v2
+# ============================================================================
+# Consumes the single-cell derived feature sets from 02_ and 03_, and writes
+# the coefficient / stability tables that 06_ integrates.
 #
-# Writes:
-#  - multi_task_coefficients.csv
-#  - stability_selection.csv
+# ---------------------------------------------------------------------------
+# THE BUG THAT MOTIVATED v2
+# ---------------------------------------------------------------------------
+# v1's "PATCH Fix A" claimed to restrict the model to `aspc_features_bulk`:
 #
-# PATCH (requested):
-#  - Fix A: model features restricted to exactly aspc_features_bulk
-#  - Use lambda.min instead of lambda.1se for coefficients and stability selection
-#  - Do NOT residualize expression on ASPC_fraction when ASPC_fraction is the target
-#    (but still residualize on purity/immune/stromal)
-#  - Keep rest of code intact
+#     aspc_features_bulk <- intersect(rownames(logCPM), colnames(datExpr))
+#     datExpr <- datExpr[, aspc_features_bulk, drop = FALSE]
+#
+# `datExpr` was built as `t(logCPM)`, so `colnames(datExpr)` IS
+# `rownames(logCPM)`. The intersect returns everything and the subset is a
+# NO-OP. The model was still fitted on all ~5,000 top-variance genes, not on
+# the ASPC feature set. Every downstream claim about "ASPC features" was
+# therefore unsupported.
+#
+# v2 defines aspc_features_bulk from the ACTUAL single-cell evidence:
+#     tau_<group>_all_datasets.csv     (02_)  — cluster specificity
+#     ratio_<group>_all_datasets.csv   (03_)  — target-cluster enrichment
+#     target_markers_<group>_recurrence.csv (03_) — cross-cohort recurrence
+# and intersects that with the genes measured in the bulk cohort.
+#
+# ---------------------------------------------------------------------------
+# OTHER CHANGES IN v2
+# ---------------------------------------------------------------------------
+#   * Paths corrected to /Volumes/Jingjing_Chen (v1 used "Jingjing Chen").
+#   * Stability selection now run for BOTH targets. v1 bootstrapped only
+#     NEPC_score, then wrote a single `stability_freq` column that 06_ would
+#     apply to ASPC genes as though it described them.
+#   * Residualisation vectorised via a single QR solve instead of a per-gene
+#     lm.fit loop (~5,000 iterations).
+#   * alpha is now tuned over a grid rather than fixed at 0.5.
+#   * Feature-set provenance written to aspc_features_bulk.csv so the gene
+#     universe used by the models is auditable.
+#   * Guards added for n_samples < n_features and for degenerate targets.
+#
+# ---------------------------------------------------------------------------
+# OUTPUTS (out_dir)
+#   multi_task_coefficients.csv   gene, coef_NEPC_like, coef_ASPC_fraction,
+#                                 multi_task_positive          <- 06_ reads
+#   stability_selection.csv       gene, stability_freq, stability_freq_aspc,
+#                                 stability_selected           <- 06_ reads
+#   aspc_features_bulk.csv        the feature universe + why each gene is in it
+#   model_diagnostics.csv         per-target lambda, alpha, CV error, n_nonzero
+#   nepc_score_per_sample.csv     the computed NEPC score, for inspection
+# ============================================================================
 
 suppressPackageStartupMessages({
   library(readr)
   library(dplyr)
+  library(tibble)
   library(tidyr)
   library(edgeR)
   library(glmnet)
@@ -24,29 +60,66 @@ suppressPackageStartupMessages({
 
 set.seed(123)
 
-# -------------------------
-# Paths
-# -------------------------
-counts_csv <- "/Volumes/Jingjing Chen/Jingjing and Martin/Updated data 2023/RR1384_all_counts.csv"
-aspc_frac_csv <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs/ASPC_fractions.csv"
-imm_str_csv   <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs/immune_stromal_fractions.csv"
-purity_csv    <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs/purity_estimates.csv"
+msg      <- function(...) cat("[INFO]", sprintf(...), "\n")
+warn_msg <- function(...) cat("[WARN]", sprintf(...), "\n")
+hdr      <- function(...) cat("\n========================================\n",
+                              sprintf(...), "\n========================================\n", sep = "")
+
+# ============================================================================
+# PATHS
+# ============================================================================
+NEPC_ROOT  <- "/Volumes/Jingjing_Chen/NEPC scRNA dataset"
+ADENO_ROOT <- "/Volumes/Jingjing_Chen/Adenocarcinoma scRNA dataset"
+
+counts_csv    <- "/Volumes/Jingjing_Chen/Jingjing and Martin/Updated data 2023/RR1384_all_counts.csv"
+
+DECON_DIR     <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs"
+aspc_frac_csv <- file.path(DECON_DIR, "ASPC_fractions.csv")
+imm_str_csv   <- file.path(DECON_DIR, "immune_stromal_fractions.csv")
+purity_csv    <- file.path(DECON_DIR, "purity_estimates.csv")
 
 out_dir <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/results_pipeline"
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 out_multi_task_csv <- file.path(out_dir, "multi_task_coefficients.csv")
 out_stability_csv  <- file.path(out_dir, "stability_selection.csv")
+out_features_csv   <- file.path(out_dir, "aspc_features_bulk.csv")
+out_diag_csv       <- file.path(out_dir, "model_diagnostics.csv")
+out_score_csv      <- file.path(out_dir, "nepc_score_per_sample.csv")
 
-# -------------------------
-# Config
-# -------------------------
+# ============================================================================
+# CONFIG
+# ============================================================================
 cfg <- list(
-  stability_boot = 100,
-  coef_eps = 1e-8,
-  residualize = TRUE,
-  top_var_genes = 5000,
+  # ---- feature-set construction (Fix A, done properly) ----
+  # Which single-cell group defines the ASPC feature universe.
+  feature_group      = "NEPC",     # "NEPC" | "Adeno" | "both"
+  feature_root       = NEPC_ROOT,
 
+  # A gene enters aspc_features_bulk if it satisfies EITHER criterion:
+  tau_threshold      = 0.80,       # from 02_ pooled tau table
+  ratio_threshold    = 2.0,        # from 03_ pooled ratio table
+  # ...OR appears in the top-200 markers of >= this many cohorts:
+  min_marker_cohorts = 3,
+
+  # fall back to top-variance genes if the feature files are missing
+  fallback_top_var   = 5000,
+  min_features       = 50,         # abort if the universe is smaller than this
+
+  # ---- modelling ----
+  alpha_grid         = c(0.1, 0.3, 0.5, 0.7, 0.9),
+  nfolds             = 5,
+  lambda_rule        = "lambda.min",   # v1 patch; retained
+  stability_boot     = 100,
+  stability_cutoff   = 0.20,
+  coef_eps           = 1e-8,
+
+  # ---- covariate handling ----
+  residualize        = TRUE,
+  # ASPC_fraction is a TARGET, so it is never regressed out (v1 patch; retained)
+  resid_covariates   = c("purity", "immune_fraction", "stromal_fraction"),
+
+  # ---- NEPC signature (Beltran et al.) ----
   nepc_up = toupper(c(
     "ASXL3","CAND2","ETV5","GPX2","JAKMIP2","KIAA0408","SOGA3","TRIM9","BRINP1","C7ORF76",
     "GNAO1","KCNB2","KCND2","LRRC16B","MAP10","NRSN1","PCSK1","PROX1","RGS7","SCG3","SEC11C",
@@ -60,18 +133,18 @@ cfg <- list(
   ))
 )
 
-msg <- function(...) cat("[INFO]", sprintf(...), "\n")
-warn_msg <- function(...) cat("[WARN]", sprintf(...), "\n")
-
 toupper_trim <- function(x) toupper(trimws(as.character(x)))
-num_safely <- function(x){
+
+num_safely <- function(x) {
   y <- gsub("^NO-PM\\s*[0-9]+$", NA_character_, as.character(x))
   suppressWarnings(as.numeric(y))
 }
 
-# -------------------------
-# Load counts
-# -------------------------
+# ============================================================================
+# STEP 1 — LOAD BULK COUNTS, NORMALISE
+# ============================================================================
+hdr("STEP 1 — bulk counts")
+
 stopifnot(file.exists(counts_csv))
 counts_df <- readr::read_csv(counts_csv, show_col_types = FALSE)
 
@@ -86,149 +159,311 @@ count_mat <- as.matrix(count_mat)
 rownames(count_mat) <- genes
 
 if (any(duplicated(rownames(count_mat)))) {
-  msg("Found duplicated gene symbols; summing duplicated rows.")
+  msg("Summing %d duplicated gene symbols.", sum(duplicated(rownames(count_mat))))
   count_mat <- rowsum(count_mat, group = rownames(count_mat), reorder = FALSE)
 }
+msg("Counts: %d genes x %d samples", nrow(count_mat), ncol(count_mat))
 
-# -------------------------
-# Normalize: edgeR logCPM
-# -------------------------
 y <- edgeR::DGEList(counts = count_mat)
 y <- edgeR::calcNormFactors(y)
 keep <- edgeR::filterByExpr(y)
 y <- y[keep, , keep.lib.sizes = FALSE]
 msg("Genes kept after filterByExpr: %d", nrow(y))
 
-logCPM <- edgeR::cpm(y, log = TRUE, prior.count = 1)  # genes x samples
+logCPM <- edgeR::cpm(y, log = TRUE, prior.count = 1)   # genes x samples
 samples <- colnames(logCPM)
 
-# -------------------------
-# Load covariates and align samples
-# -------------------------
-load_cov <- function(path, needed){
+# ============================================================================
+# STEP 2 — BUILD aspc_features_bulk FROM 02_ AND 03_   [REAL Fix A]
+# ============================================================================
+hdr("STEP 2 — ASPC feature universe from single-cell evidence")
+
+read_if_exists <- function(path, label) {
+  if (!file.exists(path)) {
+    warn_msg("  %s not found: %s", label, path)
+    return(NULL)
+  }
+  msg("  Reading %s: %s", label, basename(path))
+  readr::read_csv(path, show_col_types = FALSE)
+}
+
+build_feature_universe <- function(group_name, root) {
+  tau_tbl   <- read_if_exists(file.path(root, sprintf("tau_%s_all_datasets.csv", group_name)),
+                              "02_ tau table")
+  ratio_tbl <- read_if_exists(file.path(root, sprintf("ratio_%s_all_datasets.csv", group_name)),
+                              "03_ ratio table")
+  recur_tbl <- read_if_exists(file.path(root, sprintf("target_markers_%s_recurrence.csv", group_name)),
+                              "03_ marker recurrence")
+
+  parts <- list()
+
+  if (!is.null(tau_tbl) && all(c("gene", "tau") %in% names(tau_tbl))) {
+    hit <- tau_tbl %>%
+      filter(is.finite(tau), tau >= cfg$tau_threshold) %>%
+      transmute(gene = toupper(gene), tau = tau)
+    msg("  tau >= %.2f : %d genes", cfg$tau_threshold, nrow(hit))
+    parts$tau <- hit
+  }
+
+  if (!is.null(ratio_tbl) && "gene" %in% names(ratio_tbl)) {
+    rcol <- intersect(c("aspc_specific_ratio", "ratio_max", "ratio_mean"), names(ratio_tbl))[1]
+    if (!is.na(rcol)) {
+      hit <- ratio_tbl %>%
+        filter(is.finite(.data[[rcol]]), .data[[rcol]] >= cfg$ratio_threshold) %>%
+        transmute(gene = toupper(gene), ratio = .data[[rcol]])
+      msg("  %s >= %.1f : %d genes", rcol, cfg$ratio_threshold, nrow(hit))
+      parts$ratio <- hit
+    }
+  }
+
+  if (!is.null(recur_tbl) && all(c("gene", "n_datasets") %in% names(recur_tbl))) {
+    hit <- recur_tbl %>%
+      filter(n_datasets >= cfg$min_marker_cohorts) %>%
+      transmute(gene = toupper(gene), n_marker_cohorts = n_datasets)
+    msg("  marker in >= %d cohorts : %d genes", cfg$min_marker_cohorts, nrow(hit))
+    parts$marker <- hit
+  }
+
+  if (!length(parts)) return(NULL)
+
+  uni <- Reduce(function(a, b) full_join(a, b, by = "gene"), parts) %>%
+    mutate(
+      via_tau    = !is.na(tau %||% NA),
+      via_ratio  = !is.na(ratio %||% NA),
+      via_marker = !is.na(n_marker_cohorts %||% NA)
+    )
+  uni
+}
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+feat_tbl <- if (identical(cfg$feature_group, "both")) {
+  a <- build_feature_universe("NEPC",  NEPC_ROOT)
+  b <- build_feature_universe("Adeno", ADENO_ROOT)
+  bind_rows(a, b) %>% distinct(gene, .keep_all = TRUE)
+} else {
+  build_feature_universe(cfg$feature_group, cfg$feature_root)
+}
+
+if (is.null(feat_tbl) || nrow(feat_tbl) < cfg$min_features) {
+  warn_msg("Single-cell feature files unavailable or too small.")
+  warn_msg("FALLING BACK to top %d variance genes. Coefficients will NOT be ASPC-restricted.",
+           cfg$fallback_top_var)
+  v <- apply(logCPM, 1, var, na.rm = TRUE)
+  fallback <- names(sort(v, decreasing = TRUE))[seq_len(min(cfg$fallback_top_var, length(v)))]
+  feat_tbl <- tibble(gene = fallback, via_tau = NA, via_ratio = NA, via_marker = NA,
+                     source = "fallback_top_variance")
+} else {
+  feat_tbl$source <- "single_cell"
+}
+
+aspc_features_bulk <- intersect(feat_tbl$gene, rownames(logCPM))
+
+msg("Feature universe: %d genes from single-cell", nrow(feat_tbl))
+msg("Measured in bulk cohort: %d genes", length(aspc_features_bulk))
+msg("Dropped (not in bulk):   %d genes", nrow(feat_tbl) - length(aspc_features_bulk))
+
+if (length(aspc_features_bulk) < cfg$min_features) {
+  stop("Only ", length(aspc_features_bulk), " features survive the bulk intersection. ",
+       "Loosen cfg$tau_threshold / cfg$ratio_threshold, or check gene-symbol casing.")
+}
+
+feat_out <- feat_tbl %>%
+  mutate(in_bulk = gene %in% rownames(logCPM)) %>%
+  arrange(desc(in_bulk), gene)
+readr::write_csv(feat_out, out_features_csv)
+msg("Wrote: %s", out_features_csv)
+
+# ============================================================================
+# STEP 3 — COVARIATES
+# ============================================================================
+hdr("STEP 3 — covariates")
+
+load_cov <- function(path, needed) {
   if (!file.exists(path)) stop("Missing covariate file: ", path)
   df <- readr::read_csv(path, show_col_types = FALSE) %>% as_tibble()
   miss <- setdiff(needed, names(df))
-  if (length(miss)) warn_msg("File %s missing columns: %s", path, paste(miss, collapse = ", "))
+  if (length(miss)) warn_msg("%s missing columns: %s", basename(path), paste(miss, collapse = ", "))
   df
 }
 
-aspc_frac_tbl <- load_cov(aspc_frac_csv, c("sample","ASPC_fraction")) %>%
+aspc_frac_tbl <- load_cov(aspc_frac_csv, c("sample", "ASPC_fraction")) %>%
   transmute(sample = as.character(sample), ASPC_fraction = as.numeric(ASPC_fraction))
 
-imm_str_tbl <- load_cov(imm_str_csv, c("sample","immune_fraction","stromal_fraction")) %>%
+imm_str_tbl <- load_cov(imm_str_csv, c("sample", "immune_fraction", "stromal_fraction")) %>%
   transmute(sample = as.character(sample),
-            immune_fraction = as.numeric(immune_fraction),
+            immune_fraction  = as.numeric(immune_fraction),
             stromal_fraction = as.numeric(stromal_fraction))
 
-purity_tbl <- load_cov(purity_csv, c("sample","purity")) %>%
+purity_tbl <- load_cov(purity_csv, c("sample", "purity")) %>%
   transmute(sample = as.character(sample), purity = as.numeric(purity))
 
 cov_tbl <- Reduce(function(x, y) full_join(x, y, by = "sample"),
-                  list(aspc_frac_tbl, imm_str_tbl, purity_tbl))
+                  list(aspc_frac_tbl, imm_str_tbl, purity_tbl)) %>%
+  filter(sample %in% samples)
 
-cov_tbl <- cov_tbl %>% filter(sample %in% samples)
+if (!nrow(cov_tbl)) stop("No overlap between covariate sample IDs and count matrix columns.")
+
 logCPM <- logCPM[, cov_tbl$sample, drop = FALSE]
 stopifnot(all(colnames(logCPM) == cov_tbl$sample))
+msg("Samples with complete alignment: %d", ncol(logCPM))
 
-for (nm in c("ASPC_fraction","immune_fraction","stromal_fraction","purity")) {
-  if (nm %in% names(cov_tbl)) cov_tbl[[nm]][is.na(cov_tbl[[nm]])] <- median(cov_tbl[[nm]], na.rm = TRUE)
+for (nm in c("ASPC_fraction", "immune_fraction", "stromal_fraction", "purity")) {
+  if (nm %in% names(cov_tbl)) {
+    n_na <- sum(is.na(cov_tbl[[nm]]))
+    if (n_na) {
+      warn_msg("  %s: imputing %d NA with median", nm, n_na)
+      cov_tbl[[nm]][is.na(cov_tbl[[nm]])] <- median(cov_tbl[[nm]], na.rm = TRUE)
+    }
+  }
 }
 
-# -------------------------
-# Compute NEPC_score per sample (from logCPM)
-# -------------------------
-zscale_cols <- function(mat) t(scale(t(mat)))
+# ============================================================================
+# STEP 4 — TARGETS
+# ============================================================================
+hdr("STEP 4 — targets")
 
-score_from_genes <- function(gset, logCPM_mat) {
-  gset <- intersect(toupper(gset), rownames(logCPM_mat))
-  if (!length(gset)) return(setNames(rep(NA_real_, ncol(logCPM_mat)), colnames(logCPM_mat)))
-  z <- zscale_cols(logCPM_mat[gset, , drop = FALSE])
-  setNames(colMeans(z, na.rm = TRUE), colnames(logCPM_mat))
+zscale_rows <- function(mat) t(scale(t(mat)))
+
+score_from_genes <- function(gset, mat) {
+  gset <- intersect(toupper(gset), rownames(mat))
+  if (!length(gset)) {
+    warn_msg("  No signature genes found in matrix.")
+    return(setNames(rep(NA_real_, ncol(mat)), colnames(mat)))
+  }
+  z <- zscale_rows(mat[gset, , drop = FALSE])
+  setNames(colMeans(z, na.rm = TRUE), colnames(mat))
 }
 
-NEPC_score <- score_from_genes(cfg$nepc_up, logCPM) - score_from_genes(cfg$nepc_down, logCPM)
-NEPC_score <- NEPC_score[colnames(logCPM)]
+n_up   <- length(intersect(cfg$nepc_up,   rownames(logCPM)))
+n_down <- length(intersect(cfg$nepc_down, rownames(logCPM)))
+msg("NEPC signature genes present: %d/%d up, %d/%d down",
+    n_up, length(cfg$nepc_up), n_down, length(cfg$nepc_down))
 
-ASPC_fraction <- setNames(cov_tbl$ASPC_fraction, cov_tbl$sample)
+NEPC_score    <- score_from_genes(cfg$nepc_up, logCPM) - score_from_genes(cfg$nepc_down, logCPM)
+NEPC_score    <- NEPC_score[colnames(logCPM)]
+ASPC_fraction <- setNames(cov_tbl$ASPC_fraction, cov_tbl$sample)[colnames(logCPM)]
 
-# -------------------------
-# Build modeling matrix: samples x genes
-# -------------------------
-datExpr <- t(logCPM)  # samples x genes
+msg("NEPC_score    : range [%.2f, %.2f], sd %.3f",
+    min(NEPC_score, na.rm = TRUE), max(NEPC_score, na.rm = TRUE), sd(NEPC_score, na.rm = TRUE))
+msg("ASPC_fraction : range [%.3f, %.3f], sd %.4f",
+    min(ASPC_fraction, na.rm = TRUE), max(ASPC_fraction, na.rm = TRUE), sd(ASPC_fraction, na.rm = TRUE))
 
-if (!is.null(cfg$top_var_genes) && ncol(datExpr) > cfg$top_var_genes) {
-  v <- apply(datExpr, 2, var, na.rm = TRUE)
-  keep_genes <- names(sort(v, decreasing = TRUE))[seq_len(cfg$top_var_genes)]
-  datExpr <- datExpr[, keep_genes, drop = FALSE]
-  msg("Keeping top variable genes for modeling: %d", ncol(datExpr))
+if (sd(ASPC_fraction, na.rm = TRUE) < 1e-6) {
+  stop("ASPC_fraction is constant across samples — the model cannot be fitted.")
 }
 
-# -------------------------
-# Optional residualization of gene expression on covariates (lm.fit per gene)
-# PATCH: do NOT residualize on ASPC_fraction (because ASPC_fraction is a target)
-# -------------------------
+readr::write_csv(
+  tibble(sample = colnames(logCPM),
+         NEPC_score = as.numeric(NEPC_score),
+         ASPC_fraction = as.numeric(ASPC_fraction),
+         purity = cov_tbl$purity,
+         immune_fraction = cov_tbl$immune_fraction,
+         stromal_fraction = cov_tbl$stromal_fraction),
+  out_score_csv)
+msg("Wrote: %s", out_score_csv)
+
+# ============================================================================
+# STEP 5 — DESIGN MATRIX (restricted to aspc_features_bulk) + RESIDUALISATION
+# ============================================================================
+hdr("STEP 5 — design matrix")
+
+datExpr <- t(logCPM[aspc_features_bulk, , drop = FALSE])   # samples x features
+msg("Design matrix: %d samples x %d features", nrow(datExpr), ncol(datExpr))
+
+if (nrow(datExpr) < 20) {
+  warn_msg("Only %d samples for %d features — elastic net will be highly unstable.",
+           nrow(datExpr), ncol(datExpr))
+}
+
 if (isTRUE(cfg$residualize)) {
-  msg("Residualizing gene expression on covariates (lm.fit per gene; rank-deficiency safe)")
-  msg("PATCH: residualize on purity/immune/stromal ONLY (exclude ASPC_fraction to preserve ASPC signal)")
+  msg("Residualising on: %s", paste(cfg$resid_covariates, collapse = ", "))
+  msg("  (ASPC_fraction deliberately excluded — it is a prediction target)")
 
-  cov_use <- cov_tbl %>%
-    dplyr::select(dplyr::any_of(c("purity", "immune_fraction", "stromal_fraction")))
+  cov_use <- cov_tbl %>% dplyr::select(dplyr::any_of(cfg$resid_covariates))
 
-  is_constant <- vapply(cov_use, function(v) sd(v, na.rm = TRUE) < 1e-8, logical(1))
-  if (any(is_constant)) {
-    warn_msg("Dropping near-constant covariates: %s", paste(names(cov_use)[is_constant], collapse = ", "))
-    cov_use <- cov_use[, !is_constant, drop = FALSE]
+  is_const <- vapply(cov_use, function(v) sd(v, na.rm = TRUE) < 1e-8, logical(1))
+  if (any(is_const)) {
+    warn_msg("  Dropping near-constant covariates: %s",
+             paste(names(cov_use)[is_const], collapse = ", "))
+    cov_use <- cov_use[, !is_const, drop = FALSE]
   }
 
   if (ncol(cov_use) > 0) {
     Xcov <- model.matrix(~ ., data = cov_use)
     Y <- as.matrix(datExpr)
 
-    resid_mat <- matrix(NA_real_, nrow = nrow(Y), ncol = ncol(Y), dimnames = dimnames(Y))
-    for (j in seq_len(ncol(Y))) {
-      fit <- lm.fit(x = Xcov, y = Y[, j])
-      resid_mat[, j] <- fit$residuals
+    # Single QR solve for all genes at once (v1 looped lm.fit per gene)
+    qrX <- qr(Xcov)
+    if (qrX$rank < ncol(Xcov)) {
+      warn_msg("  Covariate matrix is rank-deficient (rank %d of %d); using QR pivoting.",
+               qrX$rank, ncol(Xcov))
     }
-    datExpr <- as.data.frame(resid_mat)
+    resid_mat <- qr.resid(qrX, Y)
+    dimnames(resid_mat) <- dimnames(Y)
+    datExpr <- resid_mat
+    msg("  Residualisation complete (%d genes in one solve).", ncol(Y))
   } else {
-    warn_msg("No usable covariates found to residualize; skipping residualization.")
+    warn_msg("  No usable covariates; skipping residualisation.")
   }
 }
 
-# -------------------------
-# PATCH Fix A: restrict modeling features to EXACTLY aspc_features_bulk
-# We define it from the expression rownames (genes available) and keep them in X.
-# -------------------------
-aspc_features_bulk <- intersect(rownames(logCPM), colnames(datExpr))
-msg("PATCH Fix A: aspc_features_bulk (features used in models): %d", length(aspc_features_bulk))
-datExpr <- datExpr[, aspc_features_bulk, drop = FALSE]
+X <- as.matrix(datExpr)
+X <- X[, apply(X, 2, function(v) all(is.finite(v)) && sd(v) > 1e-8), drop = FALSE]
+msg("Features after finite/variance filter: %d", ncol(X))
 
-X <- as.matrix(datExpr)  # samples x genes
+# ============================================================================
+# STEP 6 — ELASTIC NET WITH ALPHA TUNING
+# ============================================================================
+hdr("STEP 6 — elastic net")
 
-# -------------------------
-# Fit elastic net models (cv.glmnet)
-# PATCH: use lambda.min instead of lambda.1se
-# -------------------------
-fit_one <- function(y_vec, X, alpha = 0.5) {
-  ok <- complete.cases(y_vec) & apply(X, 1, function(r) all(is.finite(r)))
+fit_tuned <- function(y_vec, X, label) {
+  ok <- is.finite(y_vec) & apply(X, 1, function(r) all(is.finite(r)))
   X2 <- X[ok, , drop = FALSE]
   y2 <- as.numeric(y_vec[ok])
-  cv <- cv.glmnet(X2, y2, alpha = alpha, standardize = TRUE, nfolds = 5)
-  as.matrix(coef(cv, s = "lambda.min"))
+  msg("  %s: %d usable samples", label, length(y2))
+
+  nf <- min(cfg$nfolds, length(y2))
+  if (nf < 3) stop("Too few samples for cross-validation in ", label)
+
+  best <- NULL
+  for (a in cfg$alpha_grid) {
+    cv <- tryCatch(
+      cv.glmnet(X2, y2, alpha = a, standardize = TRUE, nfolds = nf),
+      error = function(e) { warn_msg("    alpha=%.1f failed: %s", a, conditionMessage(e)); NULL })
+    if (is.null(cv)) next
+    err <- min(cv$cvm)
+    msg("    alpha=%.1f  cv error=%.4f  lambda.min=%.5f  nonzero=%d",
+        a, err, cv$lambda.min, cv$nzero[which.min(cv$cvm)])
+    if (is.null(best) || err < best$err) best <- list(cv = cv, alpha = a, err = err)
+  }
+  if (is.null(best)) stop("All alpha values failed for ", label)
+
+  msg("  %s: selected alpha=%.1f", label, best$alpha)
+  b <- as.matrix(coef(best$cv, s = cfg$lambda_rule))
+
+  list(coef = b, alpha = best$alpha, cv = best$cv,
+       lambda = best$cv[[cfg$lambda_rule]], err = best$err,
+       n_nonzero = sum(abs(b[-1, 1]) > cfg$coef_eps))
 }
 
-msg("Fitting model for NEPC_score ...")
-b_nepc <- fit_one(NEPC_score, X, alpha = 0.5)
+msg("Fitting NEPC_score ...")
+fit_nepc <- fit_tuned(NEPC_score, X, "NEPC_score")
 
-msg("Fitting model for ASPC_fraction ...")
-b_aspc <- fit_one(ASPC_fraction, X, alpha = 0.5)
+msg("Fitting ASPC_fraction ...")
+fit_aspc <- fit_tuned(ASPC_fraction, X, "ASPC_fraction")
 
-coef_NEPC_like <- b_nepc[setdiff(rownames(b_nepc), "(Intercept)"), 1]
-coef_ASPC_fraction <- b_aspc[setdiff(rownames(b_aspc), "(Intercept)"), 1]
+msg("Non-zero coefficients: NEPC %d, ASPC %d", fit_nepc$n_nonzero, fit_aspc$n_nonzero)
+
+extract_coef <- function(b) {
+  v <- b[setdiff(rownames(b), "(Intercept)"), 1]
+  v
+}
+coef_NEPC_like     <- extract_coef(fit_nepc$coef)
+coef_ASPC_fraction <- extract_coef(fit_aspc$coef)
 
 all_genes <- sort(unique(c(names(coef_NEPC_like), names(coef_ASPC_fraction))))
-coef_NEPC_like <- coef_NEPC_like[all_genes]; coef_NEPC_like[is.na(coef_NEPC_like)] <- 0
+coef_NEPC_like     <- coef_NEPC_like[all_genes];     coef_NEPC_like[is.na(coef_NEPC_like)] <- 0
 coef_ASPC_fraction <- coef_ASPC_fraction[all_genes]; coef_ASPC_fraction[is.na(coef_ASPC_fraction)] <- 0
 
 multi_task_tbl <- tibble(
@@ -236,53 +471,111 @@ multi_task_tbl <- tibble(
   coef_NEPC_like = as.numeric(coef_NEPC_like),
   coef_ASPC_fraction = as.numeric(coef_ASPC_fraction),
   multi_task_positive = (coef_NEPC_like > 0 & coef_ASPC_fraction > 0)
-)
+) %>%
+  arrange(desc(multi_task_positive), desc(coef_NEPC_like + coef_ASPC_fraction))
 
-# -------------------------
-# Stability selection (bootstrap) using NEPC_score model
-# PATCH: use lambda.min instead of lambda.1se
-# -------------------------
-msg("Computing stability_freq with %d bootstraps ...", cfg$stability_boot)
+msg("Genes positive for BOTH targets: %d", sum(multi_task_tbl$multi_task_positive))
 
-bootstrap_select <- function(y_vec, X, alpha = 0.5) {
-  n <- length(y_vec)
-  idx <- sample(seq_len(n), size = n, replace = TRUE)
-  yb <- y_vec[idx]
-  Xb <- X[idx, , drop = FALSE]
-  cv <- cv.glmnet(Xb, yb, alpha = alpha, standardize = TRUE, nfolds = 5)
+# ============================================================================
+# STEP 7 — STABILITY SELECTION (both targets)
+# ============================================================================
+hdr("STEP 7 — stability selection, %d bootstraps", cfg$stability_boot)
 
-  b <- as.matrix(coef(cv, s = "lambda.min"))
-  b <- b[setdiff(rownames(b), "(Intercept)"), 1, drop = FALSE]
+bootstrap_freq <- function(y_vec, X, alpha, label) {
+  ok <- is.finite(y_vec) & apply(X, 1, function(r) all(is.finite(r)))
+  X2 <- X[ok, , drop = FALSE]
+  y2 <- as.numeric(y_vec[ok])
+  n  <- length(y2)
+  nf <- min(cfg$nfolds, n)
 
-  sel <- abs(b[, 1]) > cfg$coef_eps
-  names(sel) <- rownames(b)
-  sel
+  counts <- setNames(rep(0L, ncol(X2)), colnames(X2))
+  n_ok <- 0L
+
+  for (b in seq_len(cfg$stability_boot)) {
+    idx <- sample(seq_len(n), size = n, replace = TRUE)
+    if (sd(y2[idx]) < 1e-8) next
+
+    cv <- tryCatch(
+      cv.glmnet(X2[idx, , drop = FALSE], y2[idx],
+                alpha = alpha, standardize = TRUE, nfolds = nf),
+      error = function(e) NULL)
+    if (is.null(cv)) next
+
+    bb <- as.matrix(coef(cv, s = cfg$lambda_rule))
+    bb <- bb[setdiff(rownames(bb), "(Intercept)"), 1]
+    sel <- abs(bb) > cfg$coef_eps
+    counts[names(sel)] <- counts[names(sel)] + as.integer(sel)
+    n_ok <- n_ok + 1L
+
+    if (b %% 20 == 0) msg("  %s: bootstrap %d / %d", label, b, cfg$stability_boot)
+  }
+
+  if (n_ok == 0) {
+    warn_msg("  %s: no bootstrap succeeded.", label)
+    return(setNames(rep(NA_real_, ncol(X2)), colnames(X2)))
+  }
+  msg("  %s: %d/%d bootstraps usable", label, n_ok, cfg$stability_boot)
+  counts / n_ok
 }
 
-sel_counts <- setNames(rep(0L, ncol(X)), colnames(X))
+freq_nepc <- bootstrap_freq(as.numeric(NEPC_score),    X, fit_nepc$alpha, "NEPC_score")
+freq_aspc <- bootstrap_freq(as.numeric(ASPC_fraction), X, fit_aspc$alpha, "ASPC_fraction")
 
-for (b in seq_len(cfg$stability_boot)) {
-  sel <- bootstrap_select(as.numeric(NEPC_score), X, alpha = 0.5)
-  sel_counts[names(sel)] <- sel_counts[names(sel)] + as.integer(sel)
-  if (b %% 10 == 0) msg("  bootstrap %d / %d", b, cfg$stability_boot)
-}
-
-stability_freq <- sel_counts / cfg$stability_boot
+sg <- sort(unique(c(names(freq_nepc), names(freq_aspc))))
 
 stability_tbl <- tibble(
-  gene = names(stability_freq),
-  stability_freq = as.numeric(stability_freq),
-  stability_selected = stability_freq >= 0.2
-)
+  gene                = sg,
+  stability_freq      = as.numeric(freq_nepc[sg]),   # NEPC — the column 06_ reads
+  stability_freq_aspc = as.numeric(freq_aspc[sg]),
+  stability_freq_min  = pmin(as.numeric(freq_nepc[sg]),
+                             as.numeric(freq_aspc[sg]), na.rm = TRUE)
+) %>%
+  mutate(
+    stability_selected      = !is.na(stability_freq) & stability_freq >= cfg$stability_cutoff,
+    stability_selected_both = !is.na(stability_freq_min) & stability_freq_min >= cfg$stability_cutoff
+  ) %>%
+  arrange(desc(stability_freq_min), desc(stability_freq))
 
-# -------------------------
-# Write outputs
-# -------------------------
+msg("Stable for NEPC (>= %.2f)      : %d genes", cfg$stability_cutoff,
+    sum(stability_tbl$stability_selected, na.rm = TRUE))
+msg("Stable for BOTH targets        : %d genes",
+    sum(stability_tbl$stability_selected_both, na.rm = TRUE))
+
+# ============================================================================
+# STEP 8 — WRITE OUTPUTS
+# ============================================================================
+hdr("STEP 8 — outputs")
+
 readr::write_csv(multi_task_tbl, out_multi_task_csv)
-readr::write_csv(stability_tbl, out_stability_csv)
+readr::write_csv(stability_tbl,  out_stability_csv)
 
-msg("Done.")
-msg("Wrote: %s", out_multi_task_csv)
-msg("Wrote: %s", out_stability_csv)
-msg("multi_task_tbl rows: %d", nrow(multi_task_tbl))
-msg("stability_tbl rows: %d", nrow(stability_tbl))
+diag_tbl <- tibble(
+  target      = c("NEPC_score", "ASPC_fraction"),
+  alpha       = c(fit_nepc$alpha, fit_aspc$alpha),
+  lambda      = c(fit_nepc$lambda, fit_aspc$lambda),
+  lambda_rule = cfg$lambda_rule,
+  cv_error    = c(fit_nepc$err, fit_aspc$err),
+  n_nonzero   = c(fit_nepc$n_nonzero, fit_aspc$n_nonzero),
+  n_features  = ncol(X),
+  n_samples   = nrow(X),
+  feature_source = feat_tbl$source[1],
+  tau_threshold  = cfg$tau_threshold,
+  ratio_threshold = cfg$ratio_threshold
+)
+readr::write_csv(diag_tbl, out_diag_csv)
+
+msg("Wrote: %s  (%d rows)", out_multi_task_csv, nrow(multi_task_tbl))
+msg("Wrote: %s  (%d rows)", out_stability_csv,  nrow(stability_tbl))
+msg("Wrote: %s", out_diag_csv)
+
+cat("\n--- Model summary ---\n")
+print(as.data.frame(diag_tbl))
+
+cat("\n--- Top 20 multi-task positive genes ---\n")
+print(multi_task_tbl %>%
+        filter(multi_task_positive) %>%
+        left_join(stability_tbl %>% select(gene, stability_freq, stability_freq_aspc), by = "gene") %>%
+        head(20) %>%
+        as.data.frame())
+
+hdr("04_ COMPLETE")
