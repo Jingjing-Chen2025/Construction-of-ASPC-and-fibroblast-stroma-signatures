@@ -142,8 +142,6 @@ cohorts <- list(
   # GSE141445: folder holds both processed and raw matrices for GSM4203181;
   # the raw counts file is selected by triage_duplicate_matrices().
   list(name = "Adeno_GSE141445",     dir = file.path(ADENO_ROOT, "GSE141445"),     species = "human", group = "Adeno"),
-
-  list(name = "Adeno_GSE235036",     dir = file.path(ADENO_ROOT, "GSE235036"),     species = "mouse", group = "Adeno"),
   list(name = "Adeno_GSE292074",     dir = file.path(ADENO_ROOT, "GSE292074"),     species = "human", group = "Adeno"),
   list(name = "Adeno_GSE137829",     dir = file.path(ADENO_ROOT, "GSE137829"),     species = "human", group = "Adeno"),
   list(name = "Adeno_GSE176031",     dir = file.path(ADENO_ROOT, "GSE176031"),     species = "human", group = "Adeno"),
