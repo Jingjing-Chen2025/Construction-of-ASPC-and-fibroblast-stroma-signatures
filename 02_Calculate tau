@@ -98,11 +98,9 @@ cohorts <- list(
   list(name = "NEPC_GSE235036_TKO",  dir = file.path(NEPC_ROOT, "GSE235036_TKO"),  species = "mouse", group = "NEPC"),
 
   # ------------- Adenocarcinoma -------------
-  list(name = "Adeno_GSE210358",     dir = file.path(ADENO_ROOT, "GSE210358"),     species = "human", group = "Adeno"),
   list(name = "Adeno_GSE264573",     dir = file.path(ADENO_ROOT, "GSE264573"),     species = "human", group = "Adeno"),
   list(name = "Adeno_GSE181294",     dir = file.path(ADENO_ROOT, "GSE181294"),     species = "human", group = "Adeno"),
   list(name = "Adeno_GSE141445",     dir = file.path(ADENO_ROOT, "GSE141445"),     species = "human", group = "Adeno"),
-  list(name = "Adeno_GSE235036",     dir = file.path(ADENO_ROOT, "GSE235036"),     species = "mouse", group = "Adeno"),
   list(name = "Adeno_GSE292074",     dir = file.path(ADENO_ROOT, "GSE292074"),     species = "human", group = "Adeno"),
   list(name = "Adeno_GSE137829",     dir = file.path(ADENO_ROOT, "GSE137829"),     species = "human", group = "Adeno"),
   list(name = "Adeno_GSE176031",     dir = file.path(ADENO_ROOT, "GSE176031"),     species = "human", group = "Adeno"),
