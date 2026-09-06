@@ -106,16 +106,12 @@ cohorts <- list(
        species = "mouse", group = "NEPC",  target_cluster = "3", target_label = "ASPC"),
 
   # ------------- Adenocarcinoma (target = stroma / fibroblast) -------------
-  list(name = "Adeno_GSE210358",    dir = file.path(ADENO_ROOT, "GSE210358"),
-       species = "human", group = "Adeno", target_cluster = "3", target_label = "stroma"),
   list(name = "Adeno_GSE264573",    dir = file.path(ADENO_ROOT, "GSE264573"),
        species = "human", group = "Adeno", target_cluster = "2", target_label = "stroma"),
   list(name = "Adeno_GSE181294",    dir = file.path(ADENO_ROOT, "GSE181294"),
        species = "human", group = "Adeno", target_cluster = "0", target_label = "stroma"),
   list(name = "Adeno_GSE141445",    dir = file.path(ADENO_ROOT, "GSE141445"),
        species = "human", group = "Adeno", target_cluster = "1", target_label = "stroma"),
-  list(name = "Adeno_GSE235036",    dir = file.path(ADENO_ROOT, "GSE235036"),
-       species = "mouse", group = "Adeno", target_cluster = "5", target_label = "stroma"),
   list(name = "Adeno_GSE292074",    dir = file.path(ADENO_ROOT, "GSE292074"),
        species = "human", group = "Adeno", target_cluster = "0", target_label = "stroma"),
   list(name = "Adeno_GSE137829",    dir = file.path(ADENO_ROOT, "GSE137829"),
