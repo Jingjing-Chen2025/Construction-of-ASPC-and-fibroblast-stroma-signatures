@@ -1,77 +1,135 @@
 # ============================================================================
-# 04_ Multi-task elastic net: NEPC_score + ASPC_fraction — v2
+# 04_ Multi-task elastic net: NEPC_score + ASPC_fraction — v3
 # ============================================================================
-# Consumes the single-cell derived feature sets from 02_ and 03_, and writes
-# the coefficient / stability tables that 06_ integrates.
+# Consumes 02_ and 03_; writes the coefficient / stability tables 06_ reads.
 #
 # ---------------------------------------------------------------------------
-# THE BUG THAT MOTIVATED v2
+# THE ERROR THAT MOTIVATED v3
 # ---------------------------------------------------------------------------
-# v1's "PATCH Fix A" claimed to restrict the model to `aspc_features_bulk`:
+#   Error in ... 'select' for signature 'x = "tbl_df"'
 #
-#     aspc_features_bulk <- intersect(rownames(logCPM), colnames(datExpr))
-#     datExpr <- datExpr[, aspc_features_bulk, drop = FALSE]
+# `select` resolved to AnnotationDbi::select(), not dplyr::select(). edgeR
+# attaches AnnotationDbi transitively, and because it loads AFTER dplyr in the
+# suppressPackageStartupMessages block it wins the search path. AnnotationDbi's
+# select() is an S4 generic with no tbl_df method, hence "unable to find an
+# inherited method".
 #
-# `datExpr` was built as `t(logCPM)`, so `colnames(datExpr)` IS
-# `rownames(logCPM)`. The intersect returns everything and the subset is a
-# NO-OP. The model was still fitted on all ~5,000 top-variance genes, not on
-# the ASPC feature set. Every downstream claim about "ASPC features" was
-# therefore unsupported.
+# This is the same class of bug that hit 06_ v4 (MASS::select via WGCNA). The
+# durable fix is not load order — that breaks again the moment a dependency
+# changes — but namespace qualification. Every dplyr verb in v3 is written
+# dplyr::verb(), and stats::sd / stats::var / stats::median are qualified too.
 #
-# v2 defines aspc_features_bulk from the ACTUAL single-cell evidence:
-#     tau_<group>_all_datasets.csv     (02_)  — cluster specificity
-#     ratio_<group>_all_datasets.csv   (03_)  — target-cluster enrichment
-#     target_markers_<group>_recurrence.csv (03_) — cross-cohort recurrence
-# and intersects that with the genes measured in the bulk cohort.
-#
-# ---------------------------------------------------------------------------
-# OTHER CHANGES IN v2
-# ---------------------------------------------------------------------------
-#   * Paths corrected to /Volumes/Jingjing_Chen (v1 used "Jingjing Chen").
-#   * Stability selection now run for BOTH targets. v1 bootstrapped only
-#     NEPC_score, then wrote a single `stability_freq` column that 06_ would
-#     apply to ASPC genes as though it described them.
-#   * Residualisation vectorised via a single QR solve instead of a per-gene
-#     lm.fit loop (~5,000 iterations).
-#   * alpha is now tuned over a grid rather than fixed at 0.5.
-#   * Feature-set provenance written to aspc_features_bulk.csv so the gene
-#     universe used by the models is auditable.
-#   * Guards added for n_samples < n_features and for degenerate targets.
+# The v2 run reached Step 8 and WROTE ALL THREE CSVs before failing. Only the
+# final console print died. So multi_task_coefficients.csv and
+# stability_selection.csv on disk are valid — v3 changes no numerical result,
+# it just lets the script finish and adds the diagnostics below.
 #
 # ---------------------------------------------------------------------------
+# WHAT THE v2 RUN PRODUCED, AND THE PROBLEM IT REVEALS
+# ---------------------------------------------------------------------------
+#   NEPC_score    alpha 0.3  lambda 0.172  CV err 0.106  80 non-zero of 3402
+#   ASPC_fraction alpha 0.5  lambda 0.203  CV err 0.317  31 non-zero of 3402
+#   213 samples, 3402 features, feature_source = single_cell
+#
+# 06_ v8 then reported e_stab = 0 of 418 and e_mtl = 0 of 418 — both ML
+# channels contributed nothing to every gene. With 80 and 31 non-zero
+# coefficients from disjoint fits, the overlap positive in BOTH is plausibly
+# empty, and bootstrap frequencies rarely clear a cutoff. v3 therefore REPORTS
+# the joint counts and the stability distribution explicitly instead of leaving
+# 06_ to discover the channels are inert.
+#
+# Do not lower cfg$stability_cutoff to manufacture hits. If nothing is stable,
+# that is the finding: with p/n = 16 the coefficients are not reproducible.
+#
+# ---------------------------------------------------------------------------
+# OTHER CHANGES IN v3
+# ---------------------------------------------------------------------------
+#   * `%||%` moved above first use (it worked by luck of evaluation order).
+#   * `feat_tbl$source` set before the fallback branch can reference it.
+#   * stability_freq_min computed with an explicit pmin guard; the previous
+#     pmin(a, b, na.rm = TRUE) returns the non-NA value when one side is NA,
+#     which silently overstates joint stability.
+#   * Correlation between the two targets reported BEFORE fitting. If
+#     NEPC_score and ASPC_fraction are uncorrelated, multi_task_positive is
+#     near-empty by construction and 06_'s channel cannot fire.
+#   * Final summary block wrapped so a printing failure cannot mask a
+#     successful run.
+#
+# ---------------------------------------------------------------------------
+# A LIMIT THAT GOVERNS INTERPRETATION
+# ---------------------------------------------------------------------------
+# NEPC_score is computed from logCPM — the same matrix supplying the
+# predictors. Regressing genes on a score built from other genes in the same
+# samples finds structure regardless of the biology. coef_NEPC_like is a
+# consistency check, not prediction, and 06_ should weight it lowest. If
+# pathology labels exist, use them instead.
+#
 # OUTPUTS (out_dir)
 #   multi_task_coefficients.csv   gene, coef_NEPC_like, coef_ASPC_fraction,
 #                                 multi_task_positive          <- 06_ reads
 #   stability_selection.csv       gene, stability_freq, stability_freq_aspc,
 #                                 stability_selected           <- 06_ reads
-#   aspc_features_bulk.csv        the feature universe + why each gene is in it
-#   model_diagnostics.csv         per-target lambda, alpha, CV error, n_nonzero
-#   nepc_score_per_sample.csv     the computed NEPC score, for inspection
+#   aspc_features_bulk.csv        feature universe + provenance
+#   model_diagnostics.csv         per-target alpha, lambda, CV error, n_nonzero
+#   nepc_score_per_sample.csv     computed scores, for inspection
+#   04_PROVENANCE.txt
 # ============================================================================
 
 suppressPackageStartupMessages({
-  library(readr)
-  library(dplyr)
-  library(tibble)
-  library(tidyr)
-  library(edgeR)
-  library(glmnet)
+  library(readr); library(tibble); library(tidyr)
+  library(edgeR); library(glmnet)
+  library(dplyr)      # LAST, but every verb is namespace-qualified anyway
 })
 
 set.seed(123)
+options(stringsAsFactors = FALSE)
 
 msg      <- function(...) cat("[INFO]", sprintf(...), "\n")
 warn_msg <- function(...) cat("[WARN]", sprintf(...), "\n")
 hdr      <- function(...) cat("\n========================================\n",
                               sprintf(...), "\n========================================\n", sep = "")
 
+# defined before ANY use — v2 relied on evaluation order
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+
+toupper_trim <- function(x) toupper(trimws(as.character(x)))
+num_safely <- function(x) {
+  y <- gsub("^NO-PM\\s*[0-9]+$", NA_character_, as.character(x))
+  suppressWarnings(as.numeric(y))
+}
+
+# ============================================================================
+# STEP 0 — NAMESPACE MASKING REPORT
+# ============================================================================
+hdr("STEP 0 — namespace conflicts")
+
+report_masking <- function(fns = c("select","filter","mutate","arrange","rename",
+                                   "slice","count","first","cor","sd","var","median")) {
+  found <- FALSE
+  for (f in fns) {
+    wh <- utils::getAnywhere(f)
+    pk <- unique(wh$where[grepl("^package:", wh$where)])
+    pk <- sub("^package:", "", pk)
+    if (length(pk) > 1) {
+      found <- TRUE
+      cat(sprintf("  %-8s resolves from '%s'  (also in: %s)\n",
+                  f, pk[1], paste(pk[-1], collapse = ", ")))
+    }
+  }
+  if (found) {
+    msg("  All verbs below are namespace-qualified, so this masking is harmless.")
+    msg("  v2 crashed here: edgeR pulls in AnnotationDbi, whose select() is an")
+    msg("  S4 generic with no tbl_df method.")
+  } else msg("  No masking detected.")
+}
+report_masking()
+
 # ============================================================================
 # PATHS
 # ============================================================================
 NEPC_ROOT  <- "/Volumes/Jingjing_Chen/NEPC scRNA dataset"
 ADENO_ROOT <- "/Volumes/Jingjing_Chen/Adenocarcinoma scRNA dataset"
-
-counts_csv    <- "/Volumes/Jingjing_Chen/Jingjing and Martin/Updated data 2023/RR1384_all_counts.csv"
+counts_csv <- "/Volumes/Jingjing_Chen/Jingjing and Martin/Updated data 2023/RR1384_all_counts.csv"
 
 DECON_DIR     <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/deconvolution_inputs"
 aspc_frac_csv <- file.path(DECON_DIR, "ASPC_fractions.csv")
@@ -86,62 +144,45 @@ out_stability_csv  <- file.path(out_dir, "stability_selection.csv")
 out_features_csv   <- file.path(out_dir, "aspc_features_bulk.csv")
 out_diag_csv       <- file.path(out_dir, "model_diagnostics.csv")
 out_score_csv      <- file.path(out_dir, "nepc_score_per_sample.csv")
+out_prov_txt       <- file.path(out_dir, "04_PROVENANCE.txt")
 
 # ============================================================================
 # CONFIG
 # ============================================================================
 cfg <- list(
-  # ---- feature-set construction (Fix A, done properly) ----
-  # Which single-cell group defines the ASPC feature universe.
-  feature_group      = "NEPC",     # "NEPC" | "Adeno" | "both"
+  feature_group      = "NEPC",
   feature_root       = NEPC_ROOT,
 
-  # A gene enters aspc_features_bulk if it satisfies EITHER criterion:
-  tau_threshold      = 0.80,       # from 02_ pooled tau table
-  ratio_threshold    = 2.0,        # from 03_ pooled ratio table
-  # ...OR appears in the top-200 markers of >= this many cohorts:
+  tau_threshold      = 0.80,
+  ratio_threshold    = 2.0,
   min_marker_cohorts = 3,
 
-  # fall back to top-variance genes if the feature files are missing
   fallback_top_var   = 5000,
-  min_features       = 50,         # abort if the universe is smaller than this
+  min_features       = 50,
 
-  # ---- modelling ----
   alpha_grid         = c(0.1, 0.3, 0.5, 0.7, 0.9),
   nfolds             = 5,
-  lambda_rule        = "lambda.min",   # v1 patch; retained
+  lambda_rule        = "lambda.min",
   stability_boot     = 100,
   stability_cutoff   = 0.20,
   coef_eps           = 1e-8,
 
-  # ---- covariate handling ----
   residualize        = TRUE,
-  # ASPC_fraction is a TARGET, so it is never regressed out (v1 patch; retained)
   resid_covariates   = c("purity", "immune_fraction", "stromal_fraction"),
 
-  # ---- NEPC signature (Beltran et al.) ----
   nepc_up = toupper(c(
     "ASXL3","CAND2","ETV5","GPX2","JAKMIP2","KIAA0408","SOGA3","TRIM9","BRINP1","C7ORF76",
     "GNAO1","KCNB2","KCND2","LRRC16B","MAP10","NRSN1","PCSK1","PROX1","RGS7","SCG3","SEC11C",
-    "SEZ6","ST8SIA3","SVOP","SYT11","AURKA","DNMT1","EZH2","MYCN"
-  )),
+    "SEZ6","ST8SIA3","SVOP","SYT11","AURKA","DNMT1","EZH2","MYCN")),
   nepc_down = toupper(c(
     "AR","CCND1","CIITA","CREBBP","CSDE1","CYLD","DICER1","FHIT","FOXP1","HERPUD1","MMP2",
     "MYH9","NUP93","PAX8","RBBP6","TRIM33","GATA2","MAPKAPK3","SPDEF","ARHGAP8","CATSPERB",
     "EFNA4","EPN3","EVPL","HOXB13","KLK3","KLK4","LMAN1L","NKX3-1","OPHN1","PIEZO1",
-    "PRR5-ARHGAP8","PSCA","RAB27B","RGS10","RIPK2","SLC25A37","SLC44A4","TC2N","UPK2","RB1"
-  ))
+    "PRR5-ARHGAP8","PSCA","RAB27B","RGS10","RIPK2","SLC25A37","SLC44A4","TC2N","UPK2","RB1"))
 )
 
-toupper_trim <- function(x) toupper(trimws(as.character(x)))
-
-num_safely <- function(x) {
-  y <- gsub("^NO-PM\\s*[0-9]+$", NA_character_, as.character(x))
-  suppressWarnings(as.numeric(y))
-}
-
 # ============================================================================
-# STEP 1 — LOAD BULK COUNTS, NORMALISE
+# STEP 1 — BULK COUNTS
 # ============================================================================
 hdr("STEP 1 — bulk counts")
 
@@ -170,22 +211,23 @@ keep <- edgeR::filterByExpr(y)
 y <- y[keep, , keep.lib.sizes = FALSE]
 msg("Genes kept after filterByExpr: %d", nrow(y))
 
-logCPM <- edgeR::cpm(y, log = TRUE, prior.count = 1)   # genes x samples
+logCPM  <- edgeR::cpm(y, log = TRUE, prior.count = 1)
 samples <- colnames(logCPM)
 
 # ============================================================================
-# STEP 2 — BUILD aspc_features_bulk FROM 02_ AND 03_   [REAL Fix A]
+# STEP 2 — FEATURE UNIVERSE FROM 02_ / 03_
 # ============================================================================
 hdr("STEP 2 — ASPC feature universe from single-cell evidence")
 
 read_if_exists <- function(path, label) {
-  if (!file.exists(path)) {
-    warn_msg("  %s not found: %s", label, path)
-    return(NULL)
-  }
+  if (!file.exists(path)) { warn_msg("  %s not found: %s", label, basename(path)); return(NULL) }
   msg("  Reading %s: %s", label, basename(path))
-  readr::read_csv(path, show_col_types = FALSE)
+  suppressMessages(readr::read_csv(path, show_col_types = FALSE))
 }
+
+# 03_ v6 renamed the ratio column; accept either
+RATIO_CANDIDATES <- c("target_specific_ratio", "aspc_specific_ratio",
+                      "ratio_max", "ratio_mean")
 
 build_feature_universe <- function(group_name, root) {
   tau_tbl   <- read_if_exists(file.path(root, sprintf("tau_%s_all_datasets.csv", group_name)),
@@ -194,85 +236,92 @@ build_feature_universe <- function(group_name, root) {
                               "03_ ratio table")
   recur_tbl <- read_if_exists(file.path(root, sprintf("target_markers_%s_recurrence.csv", group_name)),
                               "03_ marker recurrence")
-
   parts <- list()
 
-  if (!is.null(tau_tbl) && all(c("gene", "tau") %in% names(tau_tbl))) {
+  if (!is.null(tau_tbl) && all(c("gene","tau") %in% names(tau_tbl))) {
     hit <- tau_tbl %>%
-      filter(is.finite(tau), tau >= cfg$tau_threshold) %>%
-      transmute(gene = toupper(gene), tau = tau)
+      dplyr::filter(is.finite(tau), tau >= cfg$tau_threshold) %>%
+      dplyr::transmute(gene = toupper(gene), tau = tau)
     msg("  tau >= %.2f : %d genes", cfg$tau_threshold, nrow(hit))
     parts$tau <- hit
   }
 
   if (!is.null(ratio_tbl) && "gene" %in% names(ratio_tbl)) {
-    rcol <- intersect(c("aspc_specific_ratio", "ratio_max", "ratio_mean"), names(ratio_tbl))[1]
+    rcol <- intersect(RATIO_CANDIDATES, names(ratio_tbl))[1]
     if (!is.na(rcol)) {
+      msg("  ratio column in use: %s", rcol)
       hit <- ratio_tbl %>%
-        filter(is.finite(.data[[rcol]]), .data[[rcol]] >= cfg$ratio_threshold) %>%
-        transmute(gene = toupper(gene), ratio = .data[[rcol]])
+        dplyr::filter(is.finite(.data[[rcol]]), .data[[rcol]] >= cfg$ratio_threshold) %>%
+        dplyr::transmute(gene = toupper(gene), ratio = .data[[rcol]])
       msg("  %s >= %.1f : %d genes", rcol, cfg$ratio_threshold, nrow(hit))
       parts$ratio <- hit
-    }
+    } else warn_msg("  No recognised ratio column in %s", group_name)
   }
 
-  if (!is.null(recur_tbl) && all(c("gene", "n_datasets") %in% names(recur_tbl))) {
+  if (!is.null(recur_tbl) && all(c("gene","n_datasets") %in% names(recur_tbl))) {
+    n_coh <- max(recur_tbl$n_datasets, na.rm = TRUE)
+    for (k in seq_len(n_coh)) {
+      msg("    recurrence >= %d of %d : %d genes", k, n_coh,
+          sum(recur_tbl$n_datasets >= k, na.rm = TRUE))
+    }
     hit <- recur_tbl %>%
-      filter(n_datasets >= cfg$min_marker_cohorts) %>%
-      transmute(gene = toupper(gene), n_marker_cohorts = n_datasets)
+      dplyr::filter(n_datasets >= cfg$min_marker_cohorts) %>%
+      dplyr::transmute(gene = toupper(gene), n_marker_cohorts = n_datasets)
     msg("  marker in >= %d cohorts : %d genes", cfg$min_marker_cohorts, nrow(hit))
     parts$marker <- hit
   }
 
   if (!length(parts)) return(NULL)
 
-  uni <- Reduce(function(a, b) full_join(a, b, by = "gene"), parts) %>%
-    mutate(
-      via_tau    = !is.na(tau %||% NA),
-      via_ratio  = !is.na(ratio %||% NA),
-      via_marker = !is.na(n_marker_cohorts %||% NA)
+  Reduce(function(a, b) dplyr::full_join(a, b, by = "gene"), parts) %>%
+    dplyr::mutate(
+      via_tau    = if ("tau" %in% names(.)) !is.na(tau) else FALSE,
+      via_ratio  = if ("ratio" %in% names(.)) !is.na(ratio) else FALSE,
+      via_marker = if ("n_marker_cohorts" %in% names(.)) !is.na(n_marker_cohorts) else FALSE
     )
-  uni
 }
 
-`%||%` <- function(a, b) if (is.null(a)) b else a
-
 feat_tbl <- if (identical(cfg$feature_group, "both")) {
-  a <- build_feature_universe("NEPC",  NEPC_ROOT)
-  b <- build_feature_universe("Adeno", ADENO_ROOT)
-  bind_rows(a, b) %>% distinct(gene, .keep_all = TRUE)
+  dplyr::bind_rows(build_feature_universe("NEPC",  NEPC_ROOT),
+                   build_feature_universe("Adeno", ADENO_ROOT)) %>%
+    dplyr::distinct(gene, .keep_all = TRUE)
 } else {
   build_feature_universe(cfg$feature_group, cfg$feature_root)
 }
 
+feature_source <- "single_cell"
 if (is.null(feat_tbl) || nrow(feat_tbl) < cfg$min_features) {
   warn_msg("Single-cell feature files unavailable or too small.")
-  warn_msg("FALLING BACK to top %d variance genes. Coefficients will NOT be ASPC-restricted.",
+  warn_msg("FALLING BACK to top %d variance genes. Coefficients will NOT be",
            cfg$fallback_top_var)
-  v <- apply(logCPM, 1, var, na.rm = TRUE)
-  fallback <- names(sort(v, decreasing = TRUE))[seq_len(min(cfg$fallback_top_var, length(v)))]
-  feat_tbl <- tibble(gene = fallback, via_tau = NA, via_ratio = NA, via_marker = NA,
-                     source = "fallback_top_variance")
-} else {
-  feat_tbl$source <- "single_cell"
+  warn_msg("  ASPC-restricted, and any claim that they are is unsupported.")
+  v <- apply(logCPM, 1, stats::var, na.rm = TRUE)
+  fb <- names(sort(v, decreasing = TRUE))[seq_len(min(cfg$fallback_top_var, length(v)))]
+  feat_tbl <- tibble::tibble(gene = fb, via_tau = NA, via_ratio = NA, via_marker = NA)
+  feature_source <- "fallback_top_variance"
 }
+feat_tbl$source <- feature_source
 
 aspc_features_bulk <- intersect(feat_tbl$gene, rownames(logCPM))
+msg("Feature universe: %d genes | measured in bulk: %d | dropped: %d",
+    nrow(feat_tbl), length(aspc_features_bulk),
+    nrow(feat_tbl) - length(aspc_features_bulk))
 
-msg("Feature universe: %d genes from single-cell", nrow(feat_tbl))
-msg("Measured in bulk cohort: %d genes", length(aspc_features_bulk))
-msg("Dropped (not in bulk):   %d genes", nrow(feat_tbl) - length(aspc_features_bulk))
-
+if (nrow(feat_tbl) - length(aspc_features_bulk) > 0.3 * nrow(feat_tbl)) {
+  warn_msg("Over 30%% of features are absent from bulk. Uppercase symbol")
+  warn_msg("  joining drops mouse genes whose human ortholog is named differently.")
+}
 if (length(aspc_features_bulk) < cfg$min_features) {
   stop("Only ", length(aspc_features_bulk), " features survive the bulk intersection. ",
-       "Loosen cfg$tau_threshold / cfg$ratio_threshold, or check gene-symbol casing.")
+       "Loosen cfg$tau_threshold / cfg$ratio_threshold, or check symbol casing.")
 }
 
-feat_out <- feat_tbl %>%
-  mutate(in_bulk = gene %in% rownames(logCPM)) %>%
-  arrange(desc(in_bulk), gene)
-readr::write_csv(feat_out, out_features_csv)
-msg("Wrote: %s", out_features_csv)
+readr::write_csv(
+  feat_tbl %>%
+    dplyr::mutate(in_bulk = gene %in% rownames(logCPM)) %>%
+    dplyr::arrange(dplyr::desc(in_bulk), gene),
+  out_features_csv)
+msg("Wrote: %s", basename(out_features_csv))
 
 # ============================================================================
 # STEP 3 — COVARIATES
@@ -281,39 +330,42 @@ hdr("STEP 3 — covariates")
 
 load_cov <- function(path, needed) {
   if (!file.exists(path)) stop("Missing covariate file: ", path)
-  df <- readr::read_csv(path, show_col_types = FALSE) %>% as_tibble()
+  df <- suppressMessages(readr::read_csv(path, show_col_types = FALSE)) %>% tibble::as_tibble()
   miss <- setdiff(needed, names(df))
   if (length(miss)) warn_msg("%s missing columns: %s", basename(path), paste(miss, collapse = ", "))
   df
 }
 
-aspc_frac_tbl <- load_cov(aspc_frac_csv, c("sample", "ASPC_fraction")) %>%
-  transmute(sample = as.character(sample), ASPC_fraction = as.numeric(ASPC_fraction))
+aspc_frac_tbl <- load_cov(aspc_frac_csv, c("sample","ASPC_fraction")) %>%
+  dplyr::transmute(sample = as.character(sample),
+                   ASPC_fraction = as.numeric(ASPC_fraction))
+imm_str_tbl <- load_cov(imm_str_csv, c("sample","immune_fraction","stromal_fraction")) %>%
+  dplyr::transmute(sample = as.character(sample),
+                   immune_fraction  = as.numeric(immune_fraction),
+                   stromal_fraction = as.numeric(stromal_fraction))
+purity_tbl <- load_cov(purity_csv, c("sample","purity")) %>%
+  dplyr::transmute(sample = as.character(sample), purity = as.numeric(purity))
 
-imm_str_tbl <- load_cov(imm_str_csv, c("sample", "immune_fraction", "stromal_fraction")) %>%
-  transmute(sample = as.character(sample),
-            immune_fraction  = as.numeric(immune_fraction),
-            stromal_fraction = as.numeric(stromal_fraction))
-
-purity_tbl <- load_cov(purity_csv, c("sample", "purity")) %>%
-  transmute(sample = as.character(sample), purity = as.numeric(purity))
-
-cov_tbl <- Reduce(function(x, y) full_join(x, y, by = "sample"),
+cov_tbl <- Reduce(function(x, z) dplyr::full_join(x, z, by = "sample"),
                   list(aspc_frac_tbl, imm_str_tbl, purity_tbl)) %>%
-  filter(sample %in% samples)
+  dplyr::filter(sample %in% samples)
 
-if (!nrow(cov_tbl)) stop("No overlap between covariate sample IDs and count matrix columns.")
+if (!nrow(cov_tbl)) {
+  stop("No overlap between covariate sample IDs and count-matrix columns.\n",
+       "  Counts look like: ", paste(utils::head(samples, 3), collapse = ", "), "\n",
+       "  Covariates look like: ", paste(utils::head(aspc_frac_tbl$sample, 3), collapse = ", "))
+}
 
 logCPM <- logCPM[, cov_tbl$sample, drop = FALSE]
 stopifnot(all(colnames(logCPM) == cov_tbl$sample))
-msg("Samples with complete alignment: %d", ncol(logCPM))
+msg("Samples aligned: %d of %d", ncol(logCPM), length(samples))
 
-for (nm in c("ASPC_fraction", "immune_fraction", "stromal_fraction", "purity")) {
+for (nm in c("ASPC_fraction","immune_fraction","stromal_fraction","purity")) {
   if (nm %in% names(cov_tbl)) {
     n_na <- sum(is.na(cov_tbl[[nm]]))
     if (n_na) {
-      warn_msg("  %s: imputing %d NA with median", nm, n_na)
-      cov_tbl[[nm]][is.na(cov_tbl[[nm]])] <- median(cov_tbl[[nm]], na.rm = TRUE)
+      warn_msg("  %s: imputing %d NA with the median", nm, n_na)
+      cov_tbl[[nm]][is.na(cov_tbl[[nm]])] <- stats::median(cov_tbl[[nm]], na.rm = TRUE)
     }
   }
 }
@@ -324,93 +376,115 @@ for (nm in c("ASPC_fraction", "immune_fraction", "stromal_fraction", "purity")) 
 hdr("STEP 4 — targets")
 
 zscale_rows <- function(mat) t(scale(t(mat)))
-
 score_from_genes <- function(gset, mat) {
   gset <- intersect(toupper(gset), rownames(mat))
-  if (!length(gset)) {
-    warn_msg("  No signature genes found in matrix.")
-    return(setNames(rep(NA_real_, ncol(mat)), colnames(mat)))
-  }
-  z <- zscale_rows(mat[gset, , drop = FALSE])
-  setNames(colMeans(z, na.rm = TRUE), colnames(mat))
+  if (!length(gset)) { warn_msg("  No signature genes in matrix."); 
+    return(setNames(rep(NA_real_, ncol(mat)), colnames(mat))) }
+  setNames(colMeans(zscale_rows(mat[gset, , drop = FALSE]), na.rm = TRUE), colnames(mat))
 }
 
 n_up   <- length(intersect(cfg$nepc_up,   rownames(logCPM)))
 n_down <- length(intersect(cfg$nepc_down, rownames(logCPM)))
-msg("NEPC signature genes present: %d/%d up, %d/%d down",
+msg("NEPC signature present: %d/%d up, %d/%d down",
     n_up, length(cfg$nepc_up), n_down, length(cfg$nepc_down))
 
-NEPC_score    <- score_from_genes(cfg$nepc_up, logCPM) - score_from_genes(cfg$nepc_down, logCPM)
-NEPC_score    <- NEPC_score[colnames(logCPM)]
+NEPC_score    <- (score_from_genes(cfg$nepc_up, logCPM) -
+                  score_from_genes(cfg$nepc_down, logCPM))[colnames(logCPM)]
 ASPC_fraction <- setNames(cov_tbl$ASPC_fraction, cov_tbl$sample)[colnames(logCPM)]
 
-msg("NEPC_score    : range [%.2f, %.2f], sd %.3f",
-    min(NEPC_score, na.rm = TRUE), max(NEPC_score, na.rm = TRUE), sd(NEPC_score, na.rm = TRUE))
-msg("ASPC_fraction : range [%.3f, %.3f], sd %.4f",
-    min(ASPC_fraction, na.rm = TRUE), max(ASPC_fraction, na.rm = TRUE), sd(ASPC_fraction, na.rm = TRUE))
+msg("NEPC_score    : [%.2f, %.2f], sd %.3f", min(NEPC_score, na.rm=TRUE),
+    max(NEPC_score, na.rm=TRUE), stats::sd(NEPC_score, na.rm=TRUE))
+msg("ASPC_fraction : [%.3f, %.3f], sd %.4f", min(ASPC_fraction, na.rm=TRUE),
+    max(ASPC_fraction, na.rm=TRUE), stats::sd(ASPC_fraction, na.rm=TRUE))
 
-if (sd(ASPC_fraction, na.rm = TRUE) < 1e-6) {
-  stop("ASPC_fraction is constant across samples — the model cannot be fitted.")
+if (stats::sd(ASPC_fraction, na.rm = TRUE) < 1e-6) {
+  stop("ASPC_fraction is constant — every coefficient would be 0 and 06_'s ",
+       "multi-task channel would be silently inert.")
+}
+
+# ---- v3: is a joint signal even possible? ----
+r12 <- suppressWarnings(stats::cor(NEPC_score, ASPC_fraction,
+                                   use = "pairwise.complete.obs", method = "spearman"))
+msg("cor(NEPC_score, ASPC_fraction) = %.3f (Spearman)", r12)
+if (!is.na(r12) && abs(r12) < 0.15) {
+  warn_msg("The two targets are essentially uncorrelated. Elastic net will")
+  warn_msg("  select largely disjoint gene sets, so multi_task_positive — which")
+  warn_msg("  requires a POSITIVE coefficient in BOTH — will be near-empty, and")
+  warn_msg("  06_'s multi-task channel will fire for no gene.")
+  warn_msg("  That is a result about the data, not a bug to tune away.")
+} else if (!is.na(r12) && r12 < -0.3) {
+  warn_msg("Targets are negatively correlated (%.2f): genes positive for one", r12)
+  warn_msg("  tend to be negative for the other. multi_task_positive cannot fire.")
 }
 
 readr::write_csv(
-  tibble(sample = colnames(logCPM),
-         NEPC_score = as.numeric(NEPC_score),
-         ASPC_fraction = as.numeric(ASPC_fraction),
-         purity = cov_tbl$purity,
-         immune_fraction = cov_tbl$immune_fraction,
-         stromal_fraction = cov_tbl$stromal_fraction),
+  tibble::tibble(sample = colnames(logCPM),
+                 NEPC_score = as.numeric(NEPC_score),
+                 ASPC_fraction = as.numeric(ASPC_fraction),
+                 purity = cov_tbl$purity,
+                 immune_fraction = cov_tbl$immune_fraction,
+                 stromal_fraction = cov_tbl$stromal_fraction),
   out_score_csv)
-msg("Wrote: %s", out_score_csv)
+msg("Wrote: %s", basename(out_score_csv))
 
 # ============================================================================
-# STEP 5 — DESIGN MATRIX (restricted to aspc_features_bulk) + RESIDUALISATION
+# STEP 5 — DESIGN MATRIX + RESIDUALISATION
 # ============================================================================
 hdr("STEP 5 — design matrix")
 
-datExpr <- t(logCPM[aspc_features_bulk, , drop = FALSE])   # samples x features
+datExpr <- t(logCPM[aspc_features_bulk, , drop = FALSE])
 msg("Design matrix: %d samples x %d features", nrow(datExpr), ncol(datExpr))
 
-if (nrow(datExpr) < 20) {
-  warn_msg("Only %d samples for %d features — elastic net will be highly unstable.",
-           nrow(datExpr), ncol(datExpr))
+if (ncol(datExpr) > 10 * nrow(datExpr)) {
+  warn_msg("p/n = %.0f. Individual coefficients are not identifiable; stability",
+           ncol(datExpr) / nrow(datExpr))
+  warn_msg("  selection is the more informative output, and if nothing is stable")
+  warn_msg("  that is the honest conclusion.")
 }
 
 if (isTRUE(cfg$residualize)) {
   msg("Residualising on: %s", paste(cfg$resid_covariates, collapse = ", "))
-  msg("  (ASPC_fraction deliberately excluded — it is a prediction target)")
+  msg("  ASPC_fraction EXCLUDED — it is a prediction target. Residualising on")
+  msg("  it and then predicting it would force those coefficients to ~0.")
 
   cov_use <- cov_tbl %>% dplyr::select(dplyr::any_of(cfg$resid_covariates))
-
-  is_const <- vapply(cov_use, function(v) sd(v, na.rm = TRUE) < 1e-8, logical(1))
+  is_const <- vapply(cov_use, function(v) stats::sd(v, na.rm = TRUE) < 1e-8, logical(1))
   if (any(is_const)) {
     warn_msg("  Dropping near-constant covariates: %s",
              paste(names(cov_use)[is_const], collapse = ", "))
     cov_use <- cov_use[, !is_const, drop = FALSE]
   }
 
-  if (ncol(cov_use) > 0) {
-    Xcov <- model.matrix(~ ., data = cov_use)
-    Y <- as.matrix(datExpr)
+  if ("stromal_fraction" %in% names(cov_use)) {
+    rs <- suppressWarnings(stats::cor(ASPC_fraction, cov_use$stromal_fraction,
+                                      use = "pairwise.complete.obs"))
+    msg("  cor(ASPC_fraction, stromal_fraction) = %.3f", rs)
+    if (!is.na(rs) && abs(rs) > 0.8) {
+      warn_msg("  Near-collinear. Residualising X on stromal_fraction removes most")
+      warn_msg("  of the variance the ASPC task needs; expect few non-zero coefs.")
+    }
+  }
 
-    # Single QR solve for all genes at once (v1 looped lm.fit per gene)
+  if (ncol(cov_use) > 0) {
+    Xcov <- stats::model.matrix(~ ., data = cov_use)
+    Y <- as.matrix(datExpr)
     qrX <- qr(Xcov)
     if (qrX$rank < ncol(Xcov)) {
-      warn_msg("  Covariate matrix is rank-deficient (rank %d of %d); using QR pivoting.",
+      warn_msg("  Covariate matrix rank-deficient (%d of %d); QR pivoting applied.",
                qrX$rank, ncol(Xcov))
     }
     resid_mat <- qr.resid(qrX, Y)
     dimnames(resid_mat) <- dimnames(Y)
     datExpr <- resid_mat
-    msg("  Residualisation complete (%d genes in one solve).", ncol(Y))
-  } else {
-    warn_msg("  No usable covariates; skipping residualisation.")
-  }
+    msg("  Residualised %d genes in one QR solve.", ncol(Y))
+  } else warn_msg("  No usable covariates; skipping residualisation.")
 }
 
 X <- as.matrix(datExpr)
-X <- X[, apply(X, 2, function(v) all(is.finite(v)) && sd(v) > 1e-8), drop = FALSE]
-msg("Features after finite/variance filter: %d", ncol(X))
+ok_cols <- apply(X, 2, function(v) all(is.finite(v)) && stats::sd(v) > 1e-8)
+X <- X[, ok_cols, drop = FALSE]
+msg("Features after finite/variance filter: %d (dropped %d)",
+    ncol(X), sum(!ok_cols))
 
 # ============================================================================
 # STEP 6 — ELASTIC NET WITH ALPHA TUNING
@@ -419,21 +493,19 @@ hdr("STEP 6 — elastic net")
 
 fit_tuned <- function(y_vec, X, label) {
   ok <- is.finite(y_vec) & apply(X, 1, function(r) all(is.finite(r)))
-  X2 <- X[ok, , drop = FALSE]
-  y2 <- as.numeric(y_vec[ok])
+  X2 <- X[ok, , drop = FALSE]; y2 <- as.numeric(y_vec[ok])
   msg("  %s: %d usable samples", label, length(y2))
-
   nf <- min(cfg$nfolds, length(y2))
-  if (nf < 3) stop("Too few samples for cross-validation in ", label)
+  if (nf < 3) stop("Too few samples for CV in ", label)
 
   best <- NULL
   for (a in cfg$alpha_grid) {
-    cv <- tryCatch(
-      cv.glmnet(X2, y2, alpha = a, standardize = TRUE, nfolds = nf),
-      error = function(e) { warn_msg("    alpha=%.1f failed: %s", a, conditionMessage(e)); NULL })
+    cv <- tryCatch(glmnet::cv.glmnet(X2, y2, alpha = a, standardize = TRUE, nfolds = nf),
+                   error = function(e) {
+                     warn_msg("    alpha=%.1f failed: %s", a, conditionMessage(e)); NULL })
     if (is.null(cv)) next
     err <- min(cv$cvm)
-    msg("    alpha=%.1f  cv error=%.4f  lambda.min=%.5f  nonzero=%d",
+    msg("    alpha=%.1f  cv err=%.4f  lambda.min=%.5f  nonzero=%d",
         a, err, cv$lambda.min, cv$nzero[which.min(cv$cvm)])
     if (is.null(best) || err < best$err) best <- list(cv = cv, alpha = a, err = err)
   }
@@ -441,40 +513,62 @@ fit_tuned <- function(y_vec, X, label) {
 
   msg("  %s: selected alpha=%.1f", label, best$alpha)
   b <- as.matrix(coef(best$cv, s = cfg$lambda_rule))
+  nz <- sum(abs(b[-1, 1]) > cfg$coef_eps)
+
+  # null-model reference: how much better than predicting the mean?
+  null_err <- stats::var(y2)
+  msg("  %s: CV err %.4f vs null (variance) %.4f -> R2_cv %.3f",
+      label, best$err, null_err, 1 - best$err / null_err)
+  if (best$err >= null_err) {
+    warn_msg("  %s: CV error is NOT better than the null model. The fitted", label)
+    warn_msg("  coefficients carry no predictive information.")
+  }
+  if (nz == 0) warn_msg("  %s selected NO genes.", label)
 
   list(coef = b, alpha = best$alpha, cv = best$cv,
        lambda = best$cv[[cfg$lambda_rule]], err = best$err,
-       n_nonzero = sum(abs(b[-1, 1]) > cfg$coef_eps))
+       r2_cv = 1 - best$err / null_err, n_nonzero = nz)
 }
 
 msg("Fitting NEPC_score ...")
 fit_nepc <- fit_tuned(NEPC_score, X, "NEPC_score")
-
 msg("Fitting ASPC_fraction ...")
 fit_aspc <- fit_tuned(ASPC_fraction, X, "ASPC_fraction")
 
 msg("Non-zero coefficients: NEPC %d, ASPC %d", fit_nepc$n_nonzero, fit_aspc$n_nonzero)
 
-extract_coef <- function(b) {
-  v <- b[setdiff(rownames(b), "(Intercept)"), 1]
-  v
-}
-coef_NEPC_like     <- extract_coef(fit_nepc$coef)
-coef_ASPC_fraction <- extract_coef(fit_aspc$coef)
+extract_coef <- function(b) b[setdiff(rownames(b), "(Intercept)"), 1]
+cN <- extract_coef(fit_nepc$coef)
+cA <- extract_coef(fit_aspc$coef)
 
-all_genes <- sort(unique(c(names(coef_NEPC_like), names(coef_ASPC_fraction))))
-coef_NEPC_like     <- coef_NEPC_like[all_genes];     coef_NEPC_like[is.na(coef_NEPC_like)] <- 0
-coef_ASPC_fraction <- coef_ASPC_fraction[all_genes]; coef_ASPC_fraction[is.na(coef_ASPC_fraction)] <- 0
+all_genes <- sort(unique(c(names(cN), names(cA))))
+cN <- cN[all_genes]; cN[is.na(cN)] <- 0
+cA <- cA[all_genes]; cA[is.na(cA)] <- 0
 
-multi_task_tbl <- tibble(
+multi_task_tbl <- tibble::tibble(
   gene = all_genes,
-  coef_NEPC_like = as.numeric(coef_NEPC_like),
-  coef_ASPC_fraction = as.numeric(coef_ASPC_fraction),
-  multi_task_positive = (coef_NEPC_like > 0 & coef_ASPC_fraction > 0)
+  coef_NEPC_like = as.numeric(cN),
+  coef_ASPC_fraction = as.numeric(cA)
 ) %>%
-  arrange(desc(multi_task_positive), desc(coef_NEPC_like + coef_ASPC_fraction))
+  dplyr::mutate(
+    multi_task_positive = (coef_NEPC_like > 0) & (coef_ASPC_fraction > 0),
+    multi_task_nonzero  = (abs(coef_NEPC_like) > cfg$coef_eps) &
+                          (abs(coef_ASPC_fraction) > cfg$coef_eps),
+    coef_product = coef_NEPC_like * coef_ASPC_fraction
+  ) %>%
+  dplyr::arrange(dplyr::desc(multi_task_positive), dplyr::desc(coef_product))
 
-msg("Genes positive for BOTH targets: %d", sum(multi_task_tbl$multi_task_positive))
+n_pos <- sum(multi_task_tbl$multi_task_positive)
+n_nz  <- sum(multi_task_tbl$multi_task_nonzero)
+msg("Non-zero in BOTH targets : %d genes", n_nz)
+msg("POSITIVE in both targets : %d genes", n_pos)
+if (n_pos == 0) {
+  warn_msg("multi_task_positive is empty. 06_'s multi-task channel will fire for")
+  warn_msg("  NO gene — this is what produced 'e_mtl 0 of 418' in the last run.")
+  warn_msg("  With cor(targets) = %.3f and %d vs %d non-zero coefficients from",
+           r12, fit_nepc$n_nonzero, fit_aspc$n_nonzero)
+  warn_msg("  disjoint fits, an empty intersection is expected, not anomalous.")
+}
 
 # ============================================================================
 # STEP 7 — STABILITY SELECTION (both targets)
@@ -483,33 +577,24 @@ hdr("STEP 7 — stability selection, %d bootstraps", cfg$stability_boot)
 
 bootstrap_freq <- function(y_vec, X, alpha, label) {
   ok <- is.finite(y_vec) & apply(X, 1, function(r) all(is.finite(r)))
-  X2 <- X[ok, , drop = FALSE]
-  y2 <- as.numeric(y_vec[ok])
-  n  <- length(y2)
-  nf <- min(cfg$nfolds, n)
-
-  counts <- setNames(rep(0L, ncol(X2)), colnames(X2))
-  n_ok <- 0L
+  X2 <- X[ok, , drop = FALSE]; y2 <- as.numeric(y_vec[ok])
+  n <- length(y2); nf <- min(cfg$nfolds, n)
+  counts <- setNames(rep(0L, ncol(X2)), colnames(X2)); n_ok <- 0L
 
   for (b in seq_len(cfg$stability_boot)) {
     idx <- sample(seq_len(n), size = n, replace = TRUE)
-    if (sd(y2[idx]) < 1e-8) next
-
-    cv <- tryCatch(
-      cv.glmnet(X2[idx, , drop = FALSE], y2[idx],
-                alpha = alpha, standardize = TRUE, nfolds = nf),
-      error = function(e) NULL)
+    if (stats::sd(y2[idx]) < 1e-8) next
+    cv <- tryCatch(glmnet::cv.glmnet(X2[idx, , drop = FALSE], y2[idx],
+                                     alpha = alpha, standardize = TRUE, nfolds = nf),
+                   error = function(e) NULL)
     if (is.null(cv)) next
-
     bb <- as.matrix(coef(cv, s = cfg$lambda_rule))
     bb <- bb[setdiff(rownames(bb), "(Intercept)"), 1]
     sel <- abs(bb) > cfg$coef_eps
     counts[names(sel)] <- counts[names(sel)] + as.integer(sel)
     n_ok <- n_ok + 1L
-
     if (b %% 20 == 0) msg("  %s: bootstrap %d / %d", label, b, cfg$stability_boot)
   }
-
   if (n_ok == 0) {
     warn_msg("  %s: no bootstrap succeeded.", label)
     return(setNames(rep(NA_real_, ncol(X2)), colnames(X2)))
@@ -522,60 +607,142 @@ freq_nepc <- bootstrap_freq(as.numeric(NEPC_score),    X, fit_nepc$alpha, "NEPC_
 freq_aspc <- bootstrap_freq(as.numeric(ASPC_fraction), X, fit_aspc$alpha, "ASPC_fraction")
 
 sg <- sort(unique(c(names(freq_nepc), names(freq_aspc))))
+fn <- as.numeric(freq_nepc[sg]); fa <- as.numeric(freq_aspc[sg])
 
-stability_tbl <- tibble(
-  gene                = sg,
-  stability_freq      = as.numeric(freq_nepc[sg]),   # NEPC — the column 06_ reads
-  stability_freq_aspc = as.numeric(freq_aspc[sg]),
-  stability_freq_min  = pmin(as.numeric(freq_nepc[sg]),
-                             as.numeric(freq_aspc[sg]), na.rm = TRUE)
+# v3: explicit joint minimum. pmin(..., na.rm = TRUE) returns the non-NA side
+# when one is NA, which overstates joint stability.
+fmin <- ifelse(is.na(fn) | is.na(fa), NA_real_, pmin(fn, fa))
+
+stability_tbl <- tibble::tibble(
+  gene = sg,
+  stability_freq      = fn,     # NEPC — the column 06_ reads
+  stability_freq_aspc = fa,
+  stability_freq_min  = fmin
 ) %>%
-  mutate(
+  dplyr::mutate(
     stability_selected      = !is.na(stability_freq) & stability_freq >= cfg$stability_cutoff,
     stability_selected_both = !is.na(stability_freq_min) & stability_freq_min >= cfg$stability_cutoff
   ) %>%
-  arrange(desc(stability_freq_min), desc(stability_freq))
+  dplyr::arrange(dplyr::desc(stability_freq_min), dplyr::desc(stability_freq))
 
-msg("Stable for NEPC (>= %.2f)      : %d genes", cfg$stability_cutoff,
+msg("Stable for NEPC (>= %.2f) : %d genes", cfg$stability_cutoff,
     sum(stability_tbl$stability_selected, na.rm = TRUE))
-msg("Stable for BOTH targets        : %d genes",
+msg("Stable for BOTH targets   : %d genes",
     sum(stability_tbl$stability_selected_both, na.rm = TRUE))
 
+cat("\n  stability_freq distribution (NEPC / ASPC / joint):\n")
+for (th in c(0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.80)) {
+  cat(sprintf("    >= %.2f : %5d / %5d / %5d\n", th,
+              sum(fn >= th, na.rm = TRUE), sum(fa >= th, na.rm = TRUE),
+              sum(fmin >= th, na.rm = TRUE)))
+}
+if (sum(stability_tbl$stability_selected, na.rm = TRUE) == 0) {
+  warn_msg("Nothing clears the cutoff. Do NOT lower cfg$stability_cutoff to")
+  warn_msg("  manufacture hits — with p/n = %.0f, non-reproducible selection is",
+           ncol(X) / nrow(X))
+  warn_msg("  the finding. Record it and let 06_ drop the channel.")
+}
+
 # ============================================================================
-# STEP 8 — WRITE OUTPUTS
+# STEP 8 — OUTPUTS
 # ============================================================================
 hdr("STEP 8 — outputs")
 
 readr::write_csv(multi_task_tbl, out_multi_task_csv)
 readr::write_csv(stability_tbl,  out_stability_csv)
 
-diag_tbl <- tibble(
+diag_tbl <- tibble::tibble(
   target      = c("NEPC_score", "ASPC_fraction"),
   alpha       = c(fit_nepc$alpha, fit_aspc$alpha),
   lambda      = c(fit_nepc$lambda, fit_aspc$lambda),
   lambda_rule = cfg$lambda_rule,
   cv_error    = c(fit_nepc$err, fit_aspc$err),
+  r2_cv       = round(c(fit_nepc$r2_cv, fit_aspc$r2_cv), 4),
   n_nonzero   = c(fit_nepc$n_nonzero, fit_aspc$n_nonzero),
   n_features  = ncol(X),
   n_samples   = nrow(X),
-  feature_source = feat_tbl$source[1],
-  tau_threshold  = cfg$tau_threshold,
+  cor_targets = round(r12, 3),
+  n_multi_task_positive = n_pos,
+  n_stability_selected  = sum(stability_tbl$stability_selected, na.rm = TRUE),
+  feature_source  = feature_source,
+  tau_threshold   = cfg$tau_threshold,
   ratio_threshold = cfg$ratio_threshold
 )
 readr::write_csv(diag_tbl, out_diag_csv)
 
-msg("Wrote: %s  (%d rows)", out_multi_task_csv, nrow(multi_task_tbl))
-msg("Wrote: %s  (%d rows)", out_stability_csv,  nrow(stability_tbl))
-msg("Wrote: %s", out_diag_csv)
+writeLines(c(
+  paste0("date: ", Sys.time()),
+  "script: 04_multitask_elasticnet.R v3",
+  paste0("feature source: ", feature_source),
+  paste0("feature universe: ", nrow(feat_tbl), " | in bulk: ", length(aspc_features_bulk),
+         " | modelled: ", ncol(X)),
+  paste0("samples: ", nrow(X), " | p/n = ", round(ncol(X)/nrow(X), 1)),
+  paste0("cor(NEPC_score, ASPC_fraction) = ", round(r12, 3)),
+  paste0("NEPC : alpha ", fit_nepc$alpha, " lambda ", signif(fit_nepc$lambda, 4),
+         " nonzero ", fit_nepc$n_nonzero, " R2_cv ", round(fit_nepc$r2_cv, 3)),
+  paste0("ASPC : alpha ", fit_aspc$alpha, " lambda ", signif(fit_aspc$lambda, 4),
+         " nonzero ", fit_aspc$n_nonzero, " R2_cv ", round(fit_aspc$r2_cv, 3)),
+  paste0("multi_task_positive: ", n_pos),
+  paste0("stability_selected : ", sum(stability_tbl$stability_selected, na.rm = TRUE),
+         " (cutoff ", cfg$stability_cutoff, ")"),
+  "",
+  "HOW 06_ SHOULD WEIGHT THIS:",
+  "NEPC_score is computed from the same logCPM matrix that supplies the",
+  "predictors. Regressing genes on a score built from other genes in the same",
+  "samples finds structure regardless of the biology, so coef_NEPC_like is a",
+  "consistency check rather than prediction and should be the lowest-weighted",
+  "evidence channel. If pathology labels exist, use them instead.",
+  "",
+  if (n_pos == 0) paste0(
+    "NOTE: multi_task_positive is empty, so 06_'s multi-task channel fires for ",
+    "no gene. Given cor(targets) = ", round(r12, 3), " and disjoint selected ",
+    "sets, this is expected rather than a defect.") else "",
+  if (sum(stability_tbl$stability_selected, na.rm = TRUE) == 0) paste0(
+    "NOTE: no gene clears the stability cutoff. With p/n = ",
+    round(ncol(X)/nrow(X), 1), " the coefficients are not reproducible across ",
+    "resamples. Report this rather than lowering the cutoff.") else ""
+), out_prov_txt)
 
-cat("\n--- Model summary ---\n")
-print(as.data.frame(diag_tbl))
+msg("Wrote: %s (%d rows)", basename(out_multi_task_csv), nrow(multi_task_tbl))
+msg("Wrote: %s (%d rows)", basename(out_stability_csv),  nrow(stability_tbl))
+msg("Wrote: %s", basename(out_diag_csv))
+msg("Wrote: %s", basename(out_prov_txt))
 
-cat("\n--- Top 20 multi-task positive genes ---\n")
-print(multi_task_tbl %>%
-        filter(multi_task_positive) %>%
-        left_join(stability_tbl %>% select(gene, stability_freq, stability_freq_aspc), by = "gene") %>%
-        head(20) %>%
-        as.data.frame())
+# ---- summary printing, guarded so it cannot mask a successful run ----
+tryCatch({
+  cat("\n--- Model summary ---\n")
+  print(as.data.frame(diag_tbl))
 
-hdr("04_ COMPLETE")
+  top_tbl <- multi_task_tbl %>%
+    dplyr::filter(multi_task_positive) %>%
+    dplyr::left_join(
+      stability_tbl %>% dplyr::select(gene, stability_freq, stability_freq_aspc),
+      by = "gene") %>%
+    utils::head(20)
+
+  if (nrow(top_tbl)) {
+    cat("\n--- Top 20 multi-task positive genes ---\n")
+    print(as.data.frame(top_tbl))
+  } else {
+    cat("\n--- No multi-task positive genes ---\n")
+    cat("Showing the top 20 by |coefficient| in each task instead:\n\n")
+    cat("NEPC task:\n")
+    print(as.data.frame(multi_task_tbl %>%
+      dplyr::filter(abs(coef_NEPC_like) > cfg$coef_eps) %>%
+      dplyr::arrange(dplyr::desc(abs(coef_NEPC_like))) %>%
+      dplyr::select(gene, coef_NEPC_like, coef_ASPC_fraction) %>%
+      utils::head(20)))
+    cat("\nASPC task:\n")
+    print(as.data.frame(multi_task_tbl %>%
+      dplyr::filter(abs(coef_ASPC_fraction) > cfg$coef_eps) %>%
+      dplyr::arrange(dplyr::desc(abs(coef_ASPC_fraction))) %>%
+      dplyr::select(gene, coef_NEPC_like, coef_ASPC_fraction) %>%
+      utils::head(20)))
+  }
+}, error = function(e) {
+  warn_msg("Summary printing failed: %s", conditionMessage(e))
+  warn_msg("  All CSV outputs were written before this point and are valid.")
+})
+
+hdr("04_ COMPLETE — %d features, %d multi-task positive, %d stable",
+    ncol(X), n_pos, sum(stability_tbl$stability_selected, na.rm = TRUE))
