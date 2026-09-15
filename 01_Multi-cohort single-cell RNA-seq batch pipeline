@@ -129,8 +129,7 @@ cohorts <- list(
   list(name = "NEPC_GSE264573",      dir = file.path(NEPC_ROOT, "GSE264573"),      species = "human", group = "NEPC"),
   list(name = "NEPC_GSE292074",      dir = file.path(NEPC_ROOT, "GSE292074"),      species = "human", group = "NEPC"),
   list(name = "NEPC_GSE137829",      dir = file.path(NEPC_ROOT, "GSE137829"),      species = "human", group = "NEPC"),
-  list(name = "NEPC_GSE221755",      dir = file.path(NEPC_ROOT, "GSE221755"),      species = "mouse", group = "NEPC"),
-  list(name = "NEPC_GSE296986",      dir = file.path(NEPC_ROOT, "GSE296986"),      species = "mouse", group = "NEPC"),
+  list(name = "NEPC_GSE296986_TKO",      dir = file.path(NEPC_ROOT, "GSE296986_TKO"),      species = "mouse", group = "NEPC"),
   list(name = "NEPC_GSE210358_TKO",  dir = file.path(NEPC_ROOT, "GSE210358_TKO"),  species = "mouse", group = "NEPC"),
   list(name = "NEPC_GSE235036_TKO",  dir = file.path(NEPC_ROOT, "GSE235036_TKO"),  species = "mouse", group = "NEPC"),
 
