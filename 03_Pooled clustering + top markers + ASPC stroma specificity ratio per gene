@@ -96,14 +96,12 @@ cohorts <- list(
        species = "human", group = "NEPC",  target_cluster = "2", target_label = "ASPC"),
   list(name = "NEPC_GSE137829",     dir = file.path(NEPC_ROOT, "GSE137829"),
        species = "human", group = "NEPC",  target_cluster = "1", target_label = "ASPC"),
-  list(name = "NEPC_GSE221755",     dir = file.path(NEPC_ROOT, "GSE221755"),
-       species = "mouse", group = "NEPC",  target_cluster = "3", target_label = "ASPC"),
-  list(name = "NEPC_GSE296986",     dir = file.path(NEPC_ROOT, "GSE296986"),
+  list(name = "NEPC_GSE296986_TKO",     dir = file.path(NEPC_ROOT, "GSE296986_TKO"),
        species = "mouse", group = "NEPC",  target_cluster = "3", target_label = "ASPC"),
   list(name = "NEPC_GSE210358_TKO", dir = file.path(NEPC_ROOT, "GSE210358_TKO"),
-       species = "mouse", group = "NEPC",  target_cluster = "1", target_label = "ASPC"),
+       species = "mouse", group = "NEPC",  target_cluster = "0", target_label = "ASPC"),
   list(name = "NEPC_GSE235036_TKO", dir = file.path(NEPC_ROOT, "GSE235036_TKO"),
-       species = "mouse", group = "NEPC",  target_cluster = "3", target_label = "ASPC"),
+       species = "mouse", group = "NEPC",  target_cluster = "4", target_label = "ASPC"),
 
   # ------------- Adenocarcinoma (target = stroma / fibroblast) -------------
   list(name = "Adeno_GSE264573",    dir = file.path(ADENO_ROOT, "GSE264573"),
