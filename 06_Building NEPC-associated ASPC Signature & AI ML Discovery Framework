@@ -265,6 +265,13 @@ cfg <- list(
 
   # ---------- candidates ----------
   min_marker_cohorts = 1,
+  aspc_rescue_genes  = toupper(c("AR")),
+  rescue_tau_min     = 0.80,
+  rescue_ratio_min   = 1.00,
+  rescue_allow_missing_ratio = TRUE,
+  rescue_marker_cohorts_min = 1,
+  rescue_allow_missing_marker_recurrence = TRUE,
+  rescue_not_fib_ratio_max = 1.50,
 
   # ---------- TARGET-SIZE SELECTION ----------
   target_size        = 200,
@@ -850,8 +857,20 @@ get_candidates <- function(df, label) {
   g
 }
 
+read_recur_column <- function(df, out_name) {
+  if (is.null(df) || !all(c("gene","n_datasets") %in% names(df))) return(NULL)
+  out <- tibble::tibble(
+    gene = toupper(as.character(df$gene)),
+    v    = suppressWarnings(as.numeric(df$n_datasets))
+  )
+  names(out)[2] <- out_name
+  collapse_to_unique_gene(out)
+}
+
 aspc_candidates      <- get_candidates(recur_nepc,  "ASPC-up (NEPC)")
 aspc_down_candidates <- get_candidates(recur_adeno, "ASPC-down (Adeno stroma)")
+recur_nepc_tbl  <- read_recur_column(recur_nepc,  "marker_recurrence_nepc")
+recur_adeno_tbl <- read_recur_column(recur_adeno, "marker_recurrence_adeno")
 
 if (!length(aspc_candidates)) stop("No ASPC-up candidates. Check 03_ wrote:\n  ", cfg$recur_nepc_csv)
 if (length(aspc_candidates) < cfg$target_size) {
@@ -1168,7 +1187,11 @@ cor_tbl <- tibble::tibble(
 # ============================================================================
 # STEP 10 — ATLAS SUPPORT
 # ============================================================================
-sc_tbl <- dplyr::full_join(tau_tbl, ratio_tbl, by = "gene") %>% collapse_to_unique_gene()
+sc_tbl <- tibble::tibble(gene = character())
+for (t in list(tau_tbl, ratio_tbl, recur_nepc_tbl, recur_adeno_tbl)) {
+  if (!is.null(t)) sc_tbl <- dplyr::full_join(sc_tbl, t, by = "gene")
+}
+sc_tbl <- collapse_to_unique_gene(sc_tbl)
 for (cn in c("tau_nepc","tau_adeno","ratio_nepc_mean","ratio_adeno_mean")) {
   if (!cn %in% names(sc_tbl)) sc_tbl[[cn]] <- NA_real_
 }
@@ -1193,6 +1216,7 @@ hdr("STEP 11 — evidence matrices")
 
 sc_cols <- intersect(
   c("gene","tau_nepc","tau_adeno",
+    "marker_recurrence_nepc","marker_recurrence_adeno",
     "ratio_nepc_mean","ratio_nepc_median","ratio_nepc_max",
     "ratio_nepc_present_frac","ratio_nepc_n_datasets",
     "ratio_adeno_mean","ratio_adeno_median","ratio_adeno_max",
@@ -1201,6 +1225,22 @@ sc_cols <- intersect(
   names(sc_tbl))
 
 LIGAND_OVERRIDE <- c("TNFSF12", "MDK")
+rescue_named_genes <- sort(unique(toupper(cfg$aspc_rescue_genes)))
+rescue_in_bulk <- intersect(rescue_named_genes, rownames(expr_mat))
+missing_rescue_genes <- setdiff(rescue_named_genes, rownames(expr_mat))
+aspc_candidates_for_evidence <- sort(unique(c(aspc_candidates, rescue_in_bulk)))
+
+if (length(rescue_in_bulk)) {
+  msg("Named ASPC rescue genes measured in bulk: %s", paste(rescue_in_bulk, collapse = ", "))
+}
+if (length(missing_rescue_genes)) {
+  warn_msg("Named ASPC rescue genes absent from bulk and unavailable to 06_: %s",
+           paste(missing_rescue_genes, collapse = ", "))
+}
+if (length(setdiff(aspc_candidates_for_evidence, aspc_candidates))) {
+  msg("Added %d named rescue gene(s) to the ASPC-up evidence pool.",
+      length(setdiff(aspc_candidates_for_evidence, aspc_candidates)))
+}
 
 build_evidence <- function(cand_genes, atlas_tbl, tau_col) {
   tibble::tibble(gene = intersect(cand_genes, rownames(expr_mat))) %>%
@@ -1261,7 +1301,7 @@ build_evidence <- function(cand_genes, atlas_tbl, tau_col) {
     )
 }
 
-evidence_df      <- build_evidence(aspc_candidates,      atlas_up_tbl,   "tau_nepc")
+evidence_df      <- build_evidence(aspc_candidates_for_evidence, atlas_up_tbl,   "tau_nepc")
 evidence_down_df <- build_evidence(aspc_down_candidates, atlas_down_tbl, "tau_adeno")
 
 msg("ASPC-up   evidence rows: %d", nrow(evidence_df))
@@ -1440,14 +1480,104 @@ select_signature <- function(df, label, tau_col, ratio_col, direction,
   list(genes = unique(out$gene), tier = chosen_tier, trace = trace_df, table = out)
 }
 
+add_named_rescue_diagnostics <- function(df, fib_exclude = character()) {
+  if (!nrow(df)) {
+    return(df %>%
+             dplyr::mutate(
+               in_recurrence_candidate_pool = logical(),
+               named_rescue_requested = logical(),
+               named_rescue_added_to_pool = logical(),
+               rescue_tau_ok = logical(),
+               rescue_ratio_ok = logical(),
+               rescue_recurrence_ok = logical(),
+               rescue_not_fib_signature = logical(),
+               rescue_not_fib_ratio = logical(),
+               rescue_eligible = logical(),
+               selected_via_rescue = logical()
+             ))
+  }
+
+  ratio_ok <- function(v) {
+    if (isTRUE(cfg$rescue_allow_missing_ratio)) is.na(v) | v >= cfg$rescue_ratio_min
+    else !is.na(v) & v >= cfg$rescue_ratio_min
+  }
+  recur_ok <- function(v) {
+    if (isTRUE(cfg$rescue_allow_missing_marker_recurrence)) {
+      is.na(v) | v >= cfg$rescue_marker_cohorts_min
+    } else !is.na(v) & v >= cfg$rescue_marker_cohorts_min
+  }
+
+  df %>%
+    dplyr::mutate(
+      in_recurrence_candidate_pool = gene %in% aspc_candidates,
+      named_rescue_requested = gene %in% rescue_named_genes,
+      named_rescue_added_to_pool = named_rescue_requested & !(gene %in% aspc_candidates),
+      rescue_tau_ok = named_rescue_requested &
+        !is.na(tau_nepc) & tau_nepc >= cfg$rescue_tau_min,
+      rescue_ratio_ok = named_rescue_requested & ratio_ok(ratio_nepc_mean),
+      rescue_recurrence_ok = named_rescue_requested & recur_ok(marker_recurrence_nepc),
+      rescue_not_fib_signature = named_rescue_requested & !(gene %in% fib_exclude),
+      rescue_not_fib_ratio = named_rescue_requested &
+        (is.na(ratio_adeno_mean) | ratio_adeno_mean < cfg$rescue_not_fib_ratio_max),
+      rescue_eligible = named_rescue_requested & rescue_tau_ok & rescue_ratio_ok &
+        rescue_recurrence_ok & rescue_not_fib_signature & rescue_not_fib_ratio,
+      selected_via_rescue = FALSE
+    )
+}
+
+apply_named_rescue <- function(sel, df, label) {
+  tbl <- sel$table
+  if (is.null(tbl)) tbl <- df[0, , drop = FALSE]
+  if (!"selected_via_rescue" %in% names(tbl)) tbl$selected_via_rescue <- FALSE
+
+  rescue_rows <- df %>% dplyr::filter(rescue_eligible)
+  if (!nrow(rescue_rows)) {
+    sel$table <- tbl
+    sel$genes <- unique(tbl$gene)
+    sel$rescued_genes <- character(0)
+    return(sel)
+  }
+
+  add <- rescue_rows %>%
+    dplyr::filter(!(gene %in% tbl$gene)) %>%
+    dplyr::mutate(selected_via_rescue = TRUE)
+
+  if (nrow(add)) {
+    msg("%s named rescue added: %s", label, paste(add$gene, collapse = ", "))
+  } else {
+    msg("%s named rescue requested, but all eligible genes were already selected.", label)
+  }
+
+  combined <- dplyr::bind_rows(add, tbl) %>%
+    dplyr::distinct(gene, .keep_all = TRUE)
+
+  n_rescue <- sum(combined$selected_via_rescue, na.rm = TRUE)
+  if (nrow(combined) > cfg$target_size) {
+    keep_non_rescue <- max(cfg$target_size - n_rescue, 0)
+    idx_keep <- c(which(combined$selected_via_rescue),
+                  utils::head(which(!combined$selected_via_rescue), keep_non_rescue))
+    combined <- combined[sort(idx_keep), , drop = FALSE]
+  }
+
+  sel$table <- combined
+  sel$genes <- unique(combined$gene)
+  sel$rescued_genes <- add$gene
+  sel
+}
+
 cat("\n--- ASPC-down (fibroblast / stroma) ---\n")
 fib_sel <- select_signature(evidence_down_df, "FIBROBLAST_STROMA",
                             "tau_adeno", "ratio_adeno_mean", "down")
 FIBROBLAST_STROMA_SIGNATURE <- fib_sel$genes
 
+evidence_df <- add_named_rescue_diagnostics(evidence_df, FIBROBLAST_STROMA_SIGNATURE)
+
 cat("\n--- ASPC-up ---\n")
 aspc_sel <- select_signature(evidence_df, "ASPC", "tau_nepc", "ratio_nepc_mean", "up",
                              exclude = FIBROBLAST_STROMA_SIGNATURE)
+aspc_sel <- apply_named_rescue(aspc_sel, evidence_df, "ASPC")
+evidence_df <- evidence_df %>%
+  dplyr::mutate(selected_via_rescue = gene %in% (aspc_sel$rescued_genes %||% character(0)))
 ASPC_SIGNATURE <- aspc_sel$genes
 
 selection_trace <- dplyr::bind_rows(fib_sel$trace, aspc_sel$trace)
@@ -1480,6 +1610,19 @@ writeLines(ASPC_SIGNATURE,              file.path(cfg$results_dir, "ASPC_SIGNATU
 writeLines(FIBROBLAST_STROMA_SIGNATURE, file.path(cfg$results_dir, "FIBROBLAST_STROMA_SIGNATURE.txt"))
 readr::write_csv(evidence_df,      file.path(cfg$results_dir, "evidence_matrix_ASPC_UP.csv"))
 readr::write_csv(evidence_down_df, file.path(cfg$results_dir, "evidence_matrix_ASPC_DOWN.csv"))
+readr::write_csv(
+  evidence_df %>%
+    dplyr::filter(named_rescue_requested) %>%
+    dplyr::select(
+      gene, named_rescue_added_to_pool, in_recurrence_candidate_pool,
+      tau_nepc, ratio_nepc_mean, marker_recurrence_nepc, ratio_adeno_mean,
+      rescue_tau_ok, rescue_ratio_ok, rescue_recurrence_ok,
+      rescue_not_fib_signature, rescue_not_fib_ratio, rescue_eligible,
+      selected_via_rescue, cor_NEPC, cor_AR, coef_NEPC_like, coef_ASPC_fraction,
+      multi_task_positive, stability_selected
+    ),
+  file.path(cfg$results_dir, "ASPC_named_gene_rescue_diagnostics.csv")
+)
 
 if (!is.null(aspc_sel$table) && nrow(aspc_sel$table)) {
   readr::write_csv(aspc_sel$table, file.path(cfg$results_dir, "ASPC_SIGNATURE_ranked.csv"))
@@ -1526,10 +1669,25 @@ prov <- c(
   paste0("min_marker_cohorts: ", cfg$min_marker_cohorts),
   paste0("floors: tau >= ", cfg$tau_floor, " | ratio >= ", cfg$ratio_floor,
          " | score >= ", cfg$score_floor),
+  paste0("named ASPC rescue genes: ", ifelse(length(rescue_named_genes),
+         paste(rescue_named_genes, collapse = ", "), "NONE")),
+  paste0("named ASPC rescue thresholds: tau >= ", cfg$rescue_tau_min,
+         " | ratio >= ", cfg$rescue_ratio_min,
+         " | marker recurrence >= ", cfg$rescue_marker_cohorts_min,
+         " | adeno ratio < ", cfg$rescue_not_fib_ratio_max),
+  paste0("named ASPC rescue allows missing ratio: ", cfg$rescue_allow_missing_ratio),
+  paste0("named ASPC rescue allows missing marker recurrence: ",
+         cfg$rescue_allow_missing_marker_recurrence),
   paste0("ASPC achieved: ", tier_line(aspc_sel)),
   paste0("FIB  achieved: ", tier_line(fib_sel)),
   paste0("ASPC candidate pool: ", length(aspc_candidates)),
+  paste0("ASPC rescue genes measured in bulk: ", length(rescue_in_bulk)),
+  paste0("ASPC rescue genes added to evidence pool: ",
+         length(setdiff(aspc_candidates_for_evidence, aspc_candidates))),
   paste0("FIB  candidate pool: ", length(aspc_down_candidates)),
+  paste0("ASPC rescue genes selected: ",
+         ifelse(length(aspc_sel$rescued_genes),
+                paste(aspc_sel$rescued_genes, collapse = ", "), "NONE")),
   "",
   "WEIGHTS",
   paste0("  measured evidence total: ", w_evid),
