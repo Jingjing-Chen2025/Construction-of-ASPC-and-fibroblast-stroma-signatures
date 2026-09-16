@@ -1,0 +1,8 @@
+steps:
+  - name: Limit CPU thread fan-out for numeric runtimes
+    run: |
+      echo "OMP_NUM_THREADS=2" >> "$GITHUB_ENV"
+      echo "OPENBLAS_NUM_THREADS=2" >> "$GITHUB_ENV"
+      echo "MKL_NUM_THREADS=2" >> "$GITHUB_ENV"
+      echo "NUMEXPR_NUM_THREADS=2" >> "$GITHUB_ENV"
+      echo "VECLIB_MAXIMUM_THREADS=2" >> "$GITHUB_ENV"
