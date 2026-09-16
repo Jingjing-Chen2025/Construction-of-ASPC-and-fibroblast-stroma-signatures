@@ -1682,19 +1682,19 @@ rank_by_score <- function(df, score_column = "evidence_score") {
 
 # Apply one tier of the ladder. Returns a logical keep vector over df rows.
 # tau_used / ratio_used are the branch-specific columns set in build_evidence.
-tier_filter <- function(df, tier, direction) {
-  tau_thr <- max(tier$tau, cfg$tau_floor)
-  ratio_thr <- max(tier$ratio, cfg$ratio_floor)
+tier_filter <- function(df, tr, direction) {
+  tau_thr <- max(tr$tau, cfg$tau_floor)
+  ratio_thr <- max(tr$ratio, cfg$ratio_floor)
 
   keep <-
     is.finite(df$tau_used) & df$tau_used >= tau_thr &
     is.finite(df$ratio_used) & df$ratio_used >= ratio_thr
 
-  if (isTRUE(tier$require_cor)) {
+  if (isTRUE(tr$require_cor)) {
     keep <- keep & is.finite(df$cor_NEPC) & is.finite(df$cor_AR)
   }
 
-  if (isTRUE(tier$cor_gates)) {
+  if (isTRUE(tr$cor_gates)) {
     if (identical(direction, "up")) {
       keep <- keep &
         is.finite(df$cor_NEPC) & df$cor_NEPC >= cfg$cor_NEPC_min &
@@ -1709,19 +1709,29 @@ tier_filter <- function(df, tier, direction) {
   keep
 }
 
-tier_table_row <- function(tier, label, direction, n_pool, n_eligible) {
+tier_table_row <- function(tr, label, direction, n_pool, n_eligible) {
+  # Pull tier fields into plain scalars first: inside tibble() the column
+  # named `tier` would otherwise shadow the tier list in later arguments.
+  tier_id <- tr$id
+  tier_lab <- tr$label
+  tau_thr <- max(tr$tau, cfg$tau_floor)
+  ratio_thr <- max(tr$ratio, cfg$ratio_floor)
+  gates <- isTRUE(tr$cor_gates)
+  finite_cor <- isTRUE(tr$require_cor)
+  target_met <- n_eligible >= cfg$target_size
+
   tibble::tibble(
     branch = label,
     direction = direction,
-    tier = tier$id,
-    tier_label = tier$label,
-    tau_threshold = max(tier$tau, cfg$tau_floor),
-    ratio_threshold = max(tier$ratio, cfg$ratio_floor),
-    correlation_gates = isTRUE(tier$cor_gates),
-    require_finite_correlations = isTRUE(tier$require_cor),
+    tier = tier_id,
+    tier_label = tier_lab,
+    tau_threshold = tau_thr,
+    ratio_threshold = ratio_thr,
+    correlation_gates = gates,
+    require_finite_correlations = finite_cor,
     n_pool_after_exclusion = n_pool,
     n_eligible = n_eligible,
-    meets_target = n_eligible >= cfg$target_size
+    meets_target = target_met
   )
 }
 
@@ -1756,33 +1766,34 @@ select_signature <- function(
   chosen_tier <- NULL
   best_n <- -1L
 
-  for (tier in tiers) {
-    keep <- tier_filter(pool, tier, direction)
+  for (tr in tiers) {
+    keep <- tier_filter(pool, tr, direction)
     n_keep <- sum(keep)
 
     trace[[length(trace) + 1L]] <- tier_table_row(
-      tier, label, direction, nrow(pool), n_keep
+      tr, label, direction, nrow(pool), n_keep
     )
 
     cat(sprintf(
       "  tier %d  %-46s eligible = %5d\n",
-      tier$id, tier$label, n_keep
+      tr$id, tr$label, n_keep
     ))
 
     if (n_keep > best_n) {
       chosen_keep <- keep
-      chosen_tier <- tier
+      chosen_tier <- tr
       best_n <- n_keep
     }
     if (n_keep >= cfg$target_size) {
       chosen_keep <- keep
-      chosen_tier <- tier
+      chosen_tier <- tr
       break
     }
   }
 
-  trace_df <- dplyr::bind_rows(trace) %>%
-    dplyr::mutate(tier_used = tier == chosen_tier$id)
+  chosen_tier_id <- chosen_tier$id
+  trace_df <- dplyr::bind_rows(trace)
+  trace_df$tier_used <- trace_df$tier == chosen_tier_id
 
   eligible_ranked <- pool[chosen_keep, , drop = FALSE] %>%
     dplyr::mutate(eligible_rank = dplyr::row_number())
