@@ -1,46 +1,29 @@
 # ============================================================================
-# 06_ Build ASPC and fibroblast-stroma signatures — v8 SCORE RANKING
+# 06_ Build ASPC and fibroblast-stroma signatures — v9 ADAPTIVE HIERARCHY
 # ============================================================================
 #
-# SELECTION RULE
-#   1. Build branch-specific candidate pools from 03_ marker recurrence.
-#   2. Keep candidate genes measured in the supplied bulk expression matrix.
-#   3. Calculate the existing weighted evidence_score for each candidate.
-#   4. Sort by evidence_score DESCENDING, then gene symbol ASCENDING for ties.
-#   5. Select up to cfg$target_size genes per branch.
+# SELECTION HIERARCHY
+#   DOWN/FIBROBLAST:
+#     full evidence matrix -> adaptive tier gates -> evidence_score ranking ->
+#     top up to cfg$target_size.
 #
-# IMPORTANT CHANGES FROM v7
-#   - No adaptive threshold ladder.
-#   - No hard tau, target-ratio, NEPC/AR-correlation, or score gates.
-#   - No named-gene rescue or forced inclusion.
-#   - AR may enter the ASPC candidate pool but competes on evidence_score.
-#   - Fibroblast-first exclusion is retained as an explicit configurable policy.
-#   - Ranked files include explicit rank and selection information.
+#   UP/ASPC:
+#     full evidence matrix -> exclude selected fibroblast genes -> adaptive tier
+#     gates -> augmented pool with optional mandatory AR rescue ->
+#     evidence_score ranking -> AR + best N-1 non-AR when rescue is needed.
+#
+# ADAPTIVE GATES
+#   - Tiered thresholds over branch-specific tau, target ratio, and score.
+#   - Directional correlation gates are tier-controlled.
+#   - Finite tau/ratio/score are always required.
+#   - AR rescue never fabricates scores and never overrides fibroblast-first
+#     exclusion conflicts.
 #
 # WHAT IS RETAINED
-#   - Existing evidence and annotation weights.
-#   - Branch-specific tau and atlas support.
-#   - Imported elastic-net, stability, and WGCNA flags.
-#   - CSPA surface annotations, cache, and explicit fallback.
-#   - TNFSF12 and MDK ligand annotation overrides.
-#   - Unweighted mean gene-wise z-score for bulk signature scoring.
-#
-# INTERPRETATION
-#   - evidence_score is a manually weighted prioritization score.
-#   - Annotation membership is not proof of ASPC identity.
-#   - Selection does not require cross-cohort replication beyond the configured
-#     candidate-pool recurrence requirement.
-#   - Selection does not guarantee NEPC-positive or AR-negative correlation.
-#   - Missing evidence contributes zero points, not proof of biological absence.
-#   - Zero-score genes may be selected if needed to fill the requested size.
-#   - The input bulk values are used as supplied. No library-size normalization
-#     or log transformation is introduced by this script.
-#
-# IMPLEMENTATION NOTE
-#   Partial correlations are calculated using base-R QR residualization of BOTH
-#   gene expression and ASPC_fraction against the same usable covariates.
-#   They are unavailable if the fraction/covariates or residual variation are
-#   insufficient. They are not converted into hard selection gates.
+#   - Existing evidence/annotation channels and weights.
+#   - Existing candidate-pool construction and recurrence logic.
+#   - Existing bulk correlation calculations and output resources.
+#   - Existing unweighted mean z-score bulk signature scoring.
 # ============================================================================
 
 suppressPackageStartupMessages({
@@ -53,7 +36,7 @@ suppressPackageStartupMessages({
 set.seed(123)
 options(stringsAsFactors = FALSE)
 
-SCRIPT_VERSION <- "06_v8_evidence_score_ranking"
+SCRIPT_VERSION <- "06_v9_adaptive_hierarchy"
 
 msg <- function(...) {
   cat("[INFO]", sprintf(...), "\n")
@@ -197,7 +180,25 @@ cfg <- list(
   # FALSE: independently select each branch; overlap is allowed.
   exclude_fibroblast_from_aspc = TRUE,
 
-  # Thresholds used ONLY to construct score channels, NOT as hard gates.
+  # Mandatory ASPC rescue candidate.
+  force_ar_in_aspc_signature = TRUE,
+  ar_gene = "AR",
+
+  # Adaptive selection tiers (tier, tau, ratio, min_score, directional, finite_cor)
+  adaptive_tiers = tibble::tribble(
+    ~tier, ~tau_threshold, ~ratio_threshold, ~min_score,
+    ~directional_gates, ~require_finite_cor,
+    0L, 0.95, 1.5, 1.0, TRUE, TRUE,
+    1L, 0.90, 1.5, 1.0, TRUE, TRUE,
+    2L, 0.85, 1.3, 1.0, TRUE, TRUE,
+    3L, 0.80, 1.2, 1.0, TRUE, TRUE,
+    4L, 0.75, 1.1, 0.5, TRUE, TRUE,
+    5L, 0.70, 1.0, 0.5, TRUE, TRUE,
+    6L, 0.60, 1.0, 0.5, FALSE, TRUE,
+    7L, 0.50, 1.0, 0.0, FALSE, FALSE
+  ),
+
+  # Thresholds used for score channels.
   tau_threshold = 0.95,
   partial_corr_threshold = 0.05,
   ratio_nepc_mean_threshold = 1.50,
@@ -212,6 +213,13 @@ cfg <- list(
 
   results_dir = file.path(RES_04, "signatures")
 )
+
+if (identical(
+  tolower(Sys.getenv("RUN_SIGNATURE_SELECTION_SYNTHETIC_TESTS", "false")),
+  "true"
+)) {
+  cfg$results_dir <- file.path(tempdir(), "signature_synthetic_tests")
+}
 
 w <- c(
   high_tau = 2,
@@ -308,6 +316,43 @@ stopifnot(
   all(is.finite(w)),
   all(w >= 0)
 )
+
+required_tier_cols <- c(
+  "tier", "tau_threshold", "ratio_threshold", "min_score",
+  "directional_gates", "require_finite_cor"
+)
+if (!all(required_tier_cols %in% names(cfg$adaptive_tiers))) {
+  stop("cfg$adaptive_tiers must include: ", paste(required_tier_cols, collapse = ", "))
+}
+
+if (any(!is.finite(cfg$adaptive_tiers$tau_threshold)) ||
+    any(!is.finite(cfg$adaptive_tiers$ratio_threshold)) ||
+    any(!is.finite(cfg$adaptive_tiers$min_score))) {
+  stop("Adaptive tiers require finite tau/ratio/min_score thresholds.")
+}
+
+if (any(cfg$adaptive_tiers$tau_threshold < 0.50) ||
+    any(cfg$adaptive_tiers$ratio_threshold < 1.00) ||
+    any(cfg$adaptive_tiers$min_score < 0.00)) {
+  stop("Adaptive tier floors violated (tau>=0.50, ratio>=1, score>=0).")
+}
+
+if (isTRUE(cfg$force_ar_in_aspc_signature)) {
+  ar_gene_cfg <- toupper(trimws(as.character(cfg$ar_gene)))
+  ar_gene_cfg <- sort(unique(ar_gene_cfg[
+    !is.na(ar_gene_cfg) & nzchar(ar_gene_cfg) & !(ar_gene_cfg %in% c("NA", "-"))
+  ]))
+  aspc_extra_cfg <- toupper(trimws(as.character(cfg$aspc_extra_candidates)))
+  aspc_extra_cfg <- sort(unique(aspc_extra_cfg[
+    !is.na(aspc_extra_cfg) & nzchar(aspc_extra_cfg) & !(aspc_extra_cfg %in% c("NA", "-"))
+  ]))
+  if (length(ar_gene_cfg) != 1L) {
+    stop("cfg$ar_gene must contain exactly one valid symbol.")
+  }
+  if (!(ar_gene_cfg %in% aspc_extra_cfg)) {
+    stop("Mandatory AR rescue requires cfg$aspc_extra_candidates to include AR.")
+  }
+}
 
 dir.create(
   cfg$results_dir,
@@ -641,6 +686,589 @@ write_result <- function(df, filename) {
     file.path(cfg$results_dir, filename),
     na = "NA"
   )
+}
+
+rank_by_score <- function(df, score_column = "evidence_score") {
+  df %>%
+    dplyr::arrange(
+      dplyr::desc(.data[[score_column]]),
+      gene
+    )
+}
+
+branch_gate_pass <- function(df,
+                             tau_col,
+                             ratio_col,
+                             tau_threshold,
+                             ratio_threshold,
+                             min_score,
+                             directional_gates,
+                             require_finite_cor,
+                             cor_nepc_sign,
+                             cor_ar_sign,
+                             cor_ar_limit) {
+  tau_used <- df[[tau_col]]
+  ratio_used <- df[[ratio_col]]
+
+  tau_ok <- is.finite(tau_used) & tau_used >= tau_threshold
+  ratio_ok <- is.finite(ratio_used) & ratio_used >= ratio_threshold
+  score_ok <- is.finite(df$evidence_score) & df$evidence_score >= min_score
+
+  finite_cor_ok <- if (require_finite_cor) {
+    is.finite(df$cor_NEPC) & is.finite(df$cor_AR)
+  } else {
+    rep(TRUE, nrow(df))
+  }
+
+  directional_ok <- if (directional_gates) {
+    if (cor_nepc_sign == ">=" && cor_ar_sign == "<=") {
+      df$cor_NEPC >= 0 & df$cor_AR <= cor_ar_limit
+    } else if (cor_nepc_sign == "<=" && cor_ar_sign == ">=") {
+      df$cor_NEPC <= 0 & df$cor_AR >= cor_ar_limit
+    } else {
+      stop("Unsupported correlation direction configuration.")
+    }
+  } else {
+    rep(TRUE, nrow(df))
+  }
+
+  tau_ok & ratio_ok & score_ok & finite_cor_ok & directional_ok
+}
+
+first_true_index <- function(x) {
+  hit <- which(x)
+  if (!length(hit)) return(NA_integer_)
+  as.integer(hit[1])
+}
+
+select_signature_hierarchical <- function(
+    df,
+    label,
+    tau_col,
+    ratio_col,
+    tiers,
+    target_size,
+    exclude = character(0),
+    force_named_gene = FALSE,
+    named_gene = "AR",
+    cor_nepc_sign = ">=",
+    cor_ar_sign = "<=",
+    cor_ar_limit = 0.3222) {
+
+  named_gene <- clean_genes(named_gene)
+  if (length(named_gene) != 1L) {
+    stop(label, ": named_gene must resolve to exactly one symbol.")
+  }
+
+  all_ranked <- rank_by_score(df) %>%
+    dplyr::mutate(
+      candidate_rank = dplyr::row_number(),
+      excluded_by_fibroblast = gene %in% exclude
+    )
+
+  if (any(!is.finite(all_ranked$evidence_score))) {
+    stop(label, ": non-finite evidence_score in ranked matrix.")
+  }
+
+  gate_pass_by_tier <- lapply(
+    seq_len(nrow(tiers)),
+    function(i) {
+      branch_gate_pass(
+        all_ranked,
+        tau_col = tau_col,
+        ratio_col = ratio_col,
+        tau_threshold = tiers$tau_threshold[i],
+        ratio_threshold = tiers$ratio_threshold[i],
+        min_score = tiers$min_score[i],
+        directional_gates = tiers$directional_gates[i],
+        require_finite_cor = tiers$require_finite_cor[i],
+        cor_nepc_sign = cor_nepc_sign,
+        cor_ar_sign = cor_ar_sign,
+        cor_ar_limit = cor_ar_limit
+      )
+    }
+  )
+
+  gate_only_first_tier_idx <- vapply(
+    seq_len(nrow(all_ranked)),
+    function(i) {
+      first_true_index(vapply(gate_pass_by_tier, function(v) v[i], logical(1)))
+    },
+    integer(1)
+  )
+
+  gate_only_first_tier <- ifelse(
+    is.na(gate_only_first_tier_idx),
+    NA_integer_,
+    tiers$tier[gate_only_first_tier_idx]
+  )
+
+  n_eligible_by_tier <- vapply(
+    gate_pass_by_tier,
+    function(pass_gate) {
+      sum(pass_gate & !all_ranked$excluded_by_fibroblast)
+    },
+    integer(1)
+  )
+
+  sufficient <- which(n_eligible_by_tier >= target_size)
+  chosen_idx <- if (length(sufficient)) {
+    sufficient[1]
+  } else {
+    which(n_eligible_by_tier == max(n_eligible_by_tier))[1]
+  }
+
+  chosen_tier <- tiers$tier[chosen_idx]
+  passes_chosen_tier <- gate_pass_by_tier[[chosen_idx]]
+
+  all_ranked <- all_ranked %>%
+    dplyr::mutate(
+      first_eligible_tier = gate_only_first_tier,
+      chosen_tier = chosen_tier,
+      passes_chosen_tier = passes_chosen_tier,
+      eligible_at_chosen_tier =
+        passes_chosen_tier & !excluded_by_fibroblast,
+      forced_AR_requested = force_named_gene,
+      mandatory_member = force_named_gene & gene == named_gene,
+      added_to_pool_by_rescue = FALSE,
+      selected_via_rescue = FALSE,
+      eligible_rank = NA_integer_,
+      selection_pool_rank = NA_integer_,
+      final_signature_rank = NA_integer_,
+      signature_rank = NA_integer_,
+      selected = FALSE
+    )
+
+  ordinary_eligible <- all_ranked %>%
+    dplyr::filter(eligible_at_chosen_tier) %>%
+    dplyr::mutate(eligible_rank = dplyr::row_number())
+
+  all_ranked$eligible_rank <- match(
+    all_ranked$gene,
+    ordinary_eligible$gene
+  )
+
+  n_take_ordinary <- min(target_size, nrow(ordinary_eligible))
+  ordinary_selected <- ordinary_eligible %>%
+    dplyr::slice_head(n = n_take_ordinary)
+
+  displaced_genes <- character(0)
+  ar_gate_bypass <- FALSE
+  ar_rank_cutoff_rescue <- FALSE
+  ar_selected <- FALSE
+
+  selection_pool_genes <- ordinary_eligible$gene
+
+  if (force_named_gene) {
+    ar_row <- all_ranked %>% dplyr::filter(gene == named_gene)
+    if (!nrow(ar_row)) {
+      stop(label, ": mandatory gene ", named_gene, " missing from candidate matrix.")
+    }
+    if (!is.finite(ar_row$evidence_score[1])) {
+      stop(label, ": mandatory gene ", named_gene, " has non-finite evidence_score.")
+    }
+    if (ar_row$excluded_by_fibroblast[1]) {
+      stop(
+        label,
+        ": mandatory gene ", named_gene,
+        " is already selected for fibroblast; overlap is forbidden."
+      )
+    }
+
+    if (!(named_gene %in% selection_pool_genes)) {
+      selection_pool_genes <- c(selection_pool_genes, named_gene)
+      ar_gate_bypass <- TRUE
+      all_ranked$added_to_pool_by_rescue <- all_ranked$gene == named_gene
+    }
+
+    if (!(named_gene %in% ordinary_selected$gene)) {
+      ar_rank_cutoff_rescue <- !ar_gate_bypass
+      keep_non_ar <- ordinary_selected %>%
+        dplyr::filter(gene != named_gene)
+      keep_non_ar <- keep_non_ar %>%
+        dplyr::slice_head(n = max(target_size - 1L, 0L))
+      final_genes <- c(keep_non_ar$gene, named_gene)
+      displaced_genes <- setdiff(ordinary_selected$gene, final_genes)
+    } else {
+      final_genes <- ordinary_selected$gene
+    }
+  } else {
+    final_genes <- ordinary_selected$gene
+  }
+
+  selection_pool_ranked <- all_ranked %>%
+    dplyr::filter(gene %in% selection_pool_genes) %>%
+    dplyr::mutate(selection_pool_rank = dplyr::row_number())
+
+  all_ranked$selection_pool_rank <- match(
+    all_ranked$gene,
+    selection_pool_ranked$gene
+  )
+
+  selected <- all_ranked %>%
+    dplyr::filter(gene %in% final_genes) %>%
+    dplyr::slice_head(n = target_size) %>%
+    dplyr::mutate(
+      final_signature_rank = dplyr::row_number(),
+      signature_rank = final_signature_rank,
+      selected = TRUE
+    )
+
+  if (force_named_gene) {
+    ar_selected <- named_gene %in% selected$gene
+    if (!ar_selected) {
+      stop(label, ": mandatory gene ", named_gene, " failed to enter final signature.")
+    }
+    ar_is_ordinary_top <- named_gene %in% ordinary_selected$gene
+    selected$selected_via_rescue <- selected$gene == named_gene & !ar_is_ordinary_top
+  }
+
+  all_ranked$final_signature_rank <- match(all_ranked$gene, selected$gene)
+  all_ranked$signature_rank <- all_ranked$final_signature_rank
+  all_ranked$selected <- !is.na(all_ranked$final_signature_rank)
+  all_ranked$selected_via_rescue <- all_ranked$gene %in% selected$gene[selected$selected_via_rescue]
+
+  all_ranked <- all_ranked %>%
+    dplyr::mutate(
+      selection_status = dplyr::case_when(
+        selected & selected_via_rescue & added_to_pool_by_rescue ~
+          "selected_via_rescue_gate_bypass",
+        selected & selected_via_rescue ~
+          "selected_via_rescue_rank_cutoff",
+        selected ~ "selected",
+        excluded_by_fibroblast ~ "excluded_by_fibroblast",
+        !passes_chosen_tier ~ "fails_chosen_tier",
+        !is.na(selection_pool_rank) ~ "in_selection_pool_not_selected",
+        TRUE ~ "below_rank_cutoff"
+      )
+    )
+
+  selected <- all_ranked %>%
+    dplyr::filter(selected) %>%
+    dplyr::arrange(final_signature_rank)
+
+  diagnostics <- tibble::tibble(
+    branch = label,
+    target_size = target_size,
+    chosen_tier = chosen_tier,
+    n_candidates_measured_in_bulk = nrow(all_ranked),
+    n_excluded_by_fibroblast = sum(all_ranked$excluded_by_fibroblast),
+    n_gate_pass_chosen_tier = sum(all_ranked$passes_chosen_tier),
+    n_eligible_at_chosen_tier = sum(all_ranked$eligible_at_chosen_tier),
+    n_selected = nrow(selected),
+    target_shortfall = target_size - nrow(selected),
+    chosen_tau_threshold = tiers$tau_threshold[chosen_idx],
+    chosen_ratio_threshold = tiers$ratio_threshold[chosen_idx],
+    chosen_min_score = tiers$min_score[chosen_idx],
+    chosen_directional_gates = tiers$directional_gates[chosen_idx],
+    chosen_require_finite_cor = tiers$require_finite_cor[chosen_idx],
+    mandatory_member_requested = force_named_gene,
+    mandatory_member = if (force_named_gene) named_gene else NA_character_,
+    mandatory_member_selected = if (force_named_gene) ar_selected else NA,
+    mandatory_member_gate_bypass = if (force_named_gene) ar_gate_bypass else NA,
+    mandatory_member_rank_cutoff_rescue = if (force_named_gene) ar_rank_cutoff_rescue else NA,
+    displaced_genes = paste(sort(displaced_genes), collapse = ";")
+  )
+
+  tier_trace <- tiers %>%
+    dplyr::mutate(
+      branch = label,
+      n_eligible_after_exclusion = n_eligible_by_tier,
+      chosen_tier = tier == tiers$tier[chosen_idx]
+    )
+
+  stopifnot(
+    !anyDuplicated(selected$gene),
+    nrow(selected) <= target_size,
+    all(diff(selected$evidence_score) <= 0)
+  )
+
+  list(
+    genes = selected$gene,
+    table = selected,
+    all_ranked = all_ranked,
+    ordinary_eligible_ranked = ordinary_eligible,
+    selection_pool_ranked = selection_pool_ranked,
+    diagnostics = diagnostics,
+    tier_trace = tier_trace,
+    displaced_genes = displaced_genes
+  )
+}
+
+run_selection_synthetic_tests <- function() {
+  tiers <- cfg$adaptive_tiers
+  mdk_up <- 13.5
+  mdk_down <- 13.5
+  pdgfra_up <- 9.5
+  pdgfra_down <- 5.5
+
+  base <- tibble::tibble(
+    gene = c("G1", "G2", "PDGFRA", "MDK", "AR", "TIEA", "TIEB"),
+    evidence_score = c(12, 11, pdgfra_up, mdk_up, 0.1, 5, 5),
+    tau_nepc = c(0.97, 0.93, 0.98376937, 0.82003581, 0.52, 0.80, 0.80),
+    ratio_nepc_mean = c(1.7, 1.6, 15.0556864, 0.59540665, 1.0, 1.2, 1.2),
+    tau_adeno = c(0.96, 0.90, 0.98232895, 0.7045454, 0.80, 0.80, 0.80),
+    ratio_adeno_mean = c(1.8, 1.6, 0.20124987, 0.72567971, 1.0, 1.2, 1.2),
+    cor_NEPC = c(0.4, 0.3, 0.06429762, 0.4, 0.10, 0.2, 0.2),
+    cor_AR = c(0.2, 0.1, 0.10986979, 0.5, 0.10, 0.2, 0.2)
+  )
+
+  # Branch-specific gate behavior and tier relaxation.
+  aspc <- select_signature_hierarchical(
+    base,
+    label = "ASPC",
+    tau_col = "tau_nepc",
+    ratio_col = "ratio_nepc_mean",
+    tiers = tiers,
+    target_size = 3,
+    force_named_gene = TRUE,
+    named_gene = "AR"
+  )
+  fib <- select_signature_hierarchical(
+    base %>% dplyr::mutate(cor_NEPC = -cor_NEPC, cor_AR = abs(cor_AR)),
+    label = "FIBRO",
+    tau_col = "tau_adeno",
+    ratio_col = "ratio_adeno_mean",
+    tiers = tiers,
+    target_size = 2,
+    cor_nepc_sign = "<=",
+    cor_ar_sign = ">=",
+    cor_ar_limit = 0
+  )
+  stopifnot(aspc$diagnostics$chosen_tier == 1L)
+  stopifnot(fib$diagnostics$chosen_tier == 1L)
+  stopifnot(aspc$all_ranked$first_eligible_tier[aspc$all_ranked$gene == "PDGFRA"] == 0L)
+  stopifnot(is.na(aspc$all_ranked$first_eligible_tier[aspc$all_ranked$gene == "MDK"]))
+  stopifnot(is.na(fib$all_ranked$first_eligible_tier[fib$all_ranked$gene == "PDGFRA"]))
+  stopifnot(is.na(fib$all_ranked$first_eligible_tier[fib$all_ranked$gene == "MDK"]))
+
+  up_fixture <- tibble::tibble(
+    gene = c("PDGFRA", "MDK", "AR"),
+    evidence_score = c(pdgfra_up, mdk_up, 1),
+    tau_nepc = c(0.98376937, 0.82003581, 0.60),
+    ratio_nepc_mean = c(15.0556864, 0.59540665, 1.0),
+    tau_adeno = c(0.7, 0.7, 0.7),
+    ratio_adeno_mean = c(1, 1, 1),
+    cor_NEPC = c(0.06429762, 0.2, 0.1),
+    cor_AR = c(0.10986979, 0.4, 0.1)
+  )
+  up_fix_sel <- select_signature_hierarchical(
+    up_fixture,
+    label = "ASPC",
+    tau_col = "tau_nepc",
+    ratio_col = "ratio_nepc_mean",
+    tiers = tiers,
+    target_size = 1,
+    force_named_gene = FALSE,
+    named_gene = "AR"
+  )
+  stopifnot(up_fix_sel$all_ranked$first_eligible_tier[up_fix_sel$all_ranked$gene == "PDGFRA"] == 0L)
+  stopifnot(is.na(up_fix_sel$all_ranked$first_eligible_tier[up_fix_sel$all_ranked$gene == "MDK"]))
+
+  down_fixture <- tibble::tibble(
+    gene = c("PDGFRA", "MDK"),
+    evidence_score = c(pdgfra_down, mdk_down),
+    tau_nepc = c(0.6, 0.6),
+    ratio_nepc_mean = c(1, 1),
+    tau_adeno = c(0.98232895, 0.7045454),
+    ratio_adeno_mean = c(0.20124987, 0.72567971),
+    cor_NEPC = c(-0.1, -0.1),
+    cor_AR = c(0.1, 0.1)
+  )
+  down_fix_sel <- select_signature_hierarchical(
+    down_fixture,
+    label = "FIBRO",
+    tau_col = "tau_adeno",
+    ratio_col = "ratio_adeno_mean",
+    tiers = tiers,
+    target_size = 1,
+    force_named_gene = FALSE,
+    cor_nepc_sign = "<=",
+    cor_ar_sign = ">=",
+    cor_ar_limit = 0
+  )
+  stopifnot(is.na(down_fix_sel$all_ranked$first_eligible_tier[down_fix_sel$all_ranked$gene == "PDGFRA"]))
+  stopifnot(is.na(down_fix_sel$all_ranked$first_eligible_tier[down_fix_sel$all_ranked$gene == "MDK"]))
+
+  # NA correlations are admitted only in tier7.
+  na_cor <- select_signature_hierarchical(
+    base %>% dplyr::mutate(cor_NEPC = NA_real_, cor_AR = NA_real_),
+    label = "ASPC",
+    tau_col = "tau_nepc",
+    ratio_col = "ratio_nepc_mean",
+    tiers = tiers,
+    target_size = 2,
+    force_named_gene = TRUE,
+    named_gene = "AR"
+  )
+  stopifnot(na_cor$diagnostics$chosen_tier == 7L)
+
+  # ratio < 1 never passes any tier.
+  ratio_fail <- select_signature_hierarchical(
+    base %>% dplyr::mutate(ratio_nepc_mean = 0.99),
+    label = "ASPC",
+    tau_col = "tau_nepc",
+    ratio_col = "ratio_nepc_mean",
+    tiers = tiers,
+    target_size = 2,
+    force_named_gene = TRUE,
+    named_gene = "AR"
+  )
+  stopifnot(all(!ratio_fail$all_ranked$passes_chosen_tier))
+  stopifnot(identical(ratio_fail$genes, "AR"))
+
+  # Shortage case can return fewer than target.
+  shortage <- select_signature_hierarchical(
+    base %>% dplyr::filter(gene %in% c("G1", "G2")),
+    label = "FIBRO",
+    tau_col = "tau_adeno",
+    ratio_col = "ratio_adeno_mean",
+    tiers = tiers,
+    target_size = 5,
+    force_named_gene = FALSE,
+    cor_nepc_sign = "<=",
+    cor_ar_sign = ">=",
+    cor_ar_limit = 0
+  )
+  stopifnot(length(shortage$genes) < 5)
+
+  # Exclusion applies only to selected fibroblast genes.
+  aspc_ex <- select_signature_hierarchical(
+    base,
+    label = "ASPC",
+    tau_col = "tau_nepc",
+    ratio_col = "ratio_nepc_mean",
+    tiers = tiers,
+    target_size = 3,
+    exclude = c("G1"),
+    force_named_gene = TRUE,
+    named_gene = "AR"
+  )
+  stopifnot(!("G1" %in% aspc_ex$genes))
+  stopifnot("G2" %in% aspc_ex$genes)
+
+  # Mandatory low-score AR rescue displaces one ordinary top-N gene.
+  rescued_ar <- aspc$all_ranked %>% dplyr::filter(gene == "AR")
+  stopifnot(rescued_ar$added_to_pool_by_rescue)
+  stopifnot(rescued_ar$selected_via_rescue)
+  stopifnot("selected_via_rescue_gate_bypass" %in% aspc$all_ranked$selection_status)
+  stopifnot(length(aspc$displaced_genes) == 1L)
+
+  # AR already selected naturally -> no duplicate/displacement.
+  ar_natural <- select_signature_hierarchical(
+    base %>% dplyr::mutate(
+      evidence_score = dplyr::if_else(gene == "AR", 20, evidence_score),
+      tau_nepc = dplyr::if_else(gene == "AR", 0.97, tau_nepc),
+      ratio_nepc_mean = dplyr::if_else(gene == "AR", 1.8, ratio_nepc_mean),
+      cor_NEPC = dplyr::if_else(gene == "AR", 0.20, cor_NEPC),
+      cor_AR = dplyr::if_else(gene == "AR", 0.10, cor_AR)
+    ),
+    label = "ASPC",
+    tau_col = "tau_nepc",
+    ratio_col = "ratio_nepc_mean",
+    tiers = tiers,
+    target_size = 3,
+    force_named_gene = TRUE,
+    named_gene = "AR"
+  )
+  stopifnot(!ar_natural$all_ranked$selected_via_rescue[ar_natural$all_ranked$gene == "AR"])
+  stopifnot(length(ar_natural$displaced_genes) == 0L)
+
+  # target_size = 1 returns AR-only when forced.
+  ar_only <- select_signature_hierarchical(
+    base,
+    label = "ASPC",
+    tau_col = "tau_nepc",
+    ratio_col = "ratio_nepc_mean",
+    tiers = tiers,
+    target_size = 1,
+    force_named_gene = TRUE,
+    named_gene = "AR"
+  )
+  stopifnot(identical(ar_only$genes, "AR"))
+
+  # Missing/non-finite AR are explicit errors.
+  err_missing <- tryCatch(
+    select_signature_hierarchical(
+      base %>% dplyr::filter(gene != "AR"),
+      label = "ASPC",
+      tau_col = "tau_nepc",
+      ratio_col = "ratio_nepc_mean",
+      tiers = tiers,
+      target_size = 2,
+      force_named_gene = TRUE,
+      named_gene = "AR"
+    ),
+    error = function(e) e
+  )
+  stopifnot(inherits(err_missing, "error"))
+
+  err_nonfinite <- tryCatch(
+    select_signature_hierarchical(
+      base %>% dplyr::mutate(evidence_score = dplyr::if_else(gene == "AR", NA_real_, evidence_score)),
+      label = "ASPC",
+      tau_col = "tau_nepc",
+      ratio_col = "ratio_nepc_mean",
+      tiers = tiers,
+      target_size = 2,
+      force_named_gene = TRUE,
+      named_gene = "AR"
+    ),
+    error = function(e) e
+  )
+  stopifnot(inherits(err_nonfinite, "error"))
+
+  # Fibroblast conflict on AR is explicit.
+  err_conflict <- tryCatch(
+    select_signature_hierarchical(
+      base,
+      label = "ASPC",
+      tau_col = "tau_nepc",
+      ratio_col = "ratio_nepc_mean",
+      tiers = tiers,
+      target_size = 2,
+      exclude = "AR",
+      force_named_gene = TRUE,
+      named_gene = "AR"
+    ),
+    error = function(e) e
+  )
+  stopifnot(inherits(err_conflict, "error"))
+
+  # Tie ordering is alphabetic.
+  tie_df <- base %>% dplyr::mutate(
+    evidence_score = dplyr::if_else(gene %in% c("TIEA", "TIEB"), 5, evidence_score)
+  )
+  tie_sel <- select_signature_hierarchical(
+    tie_df %>% dplyr::mutate(cor_NEPC = -abs(cor_NEPC), cor_AR = abs(cor_AR)),
+    label = "FIBRO",
+    tau_col = "tau_adeno",
+    ratio_col = "ratio_adeno_mean",
+    tiers = tiers,
+    target_size = 7,
+    cor_nepc_sign = "<=",
+    cor_ar_sign = ">=",
+    cor_ar_limit = -1
+  )
+  tie_genes <- tie_sel$all_ranked$gene[tie_sel$all_ranked$evidence_score == 5]
+  stopifnot(identical(tie_genes, sort(tie_genes)))
+
+  # Size, uniqueness, score preservation, and ranked output consistency.
+  stopifnot(length(unique(aspc$genes)) == length(aspc$genes))
+  stopifnot(length(aspc$genes) <= 3)
+  ar_score_out <- aspc$table$evidence_score[aspc$table$gene == "AR"]
+  stopifnot(identical(ar_score_out, base$evidence_score[base$gene == "AR"]))
+  selected_from_matrix <- aspc$all_ranked %>%
+    dplyr::filter(selected) %>%
+    dplyr::arrange(final_signature_rank) %>%
+    dplyr::pull(gene)
+  stopifnot(identical(selected_from_matrix, aspc$genes))
+}
+
+if (identical(tolower(Sys.getenv("RUN_SIGNATURE_SELECTION_SYNTHETIC_TESTS", "false")), "true")) {
+  run_selection_synthetic_tests()
+  msg("Synthetic selection tests passed.")
+  quit(save = "no", status = 0L)
 }
 
 # ============================================================================
@@ -1568,154 +2196,23 @@ channel_audit <- dplyr::bind_rows(
 write_result(channel_audit, "signature_evidence_channel_activity.csv")
 
 # ============================================================================
-# STEP 9 — RANK BY evidence_score AND SELECT TOP N
+# STEP 9 — ADAPTIVE TIER RANKING AND SIGNATURE CONSTRUCTION
 # ============================================================================
 
-hdr("STEP 9 — score-based ranking and signature construction")
+hdr("STEP 9 — adaptive tier ranking and signature construction")
 
-rank_by_score <- function(df, score_column = "evidence_score") {
-  # No secondary biological criteria:
-  # gene symbol only resolves exact score ties deterministically.
-  df %>%
-    dplyr::arrange(
-      dplyr::desc(.data[[score_column]]),
-      gene
-    )
-}
-
-select_signature <- function(df, label, exclude = character(0)) {
-  all_ranked <- rank_by_score(df) %>%
-    dplyr::mutate(
-      candidate_rank = dplyr::row_number(),
-      excluded_by_other_signature = gene %in% exclude
-    )
-
-  eligible_ranked <- all_ranked %>%
-    dplyr::filter(!excluded_by_other_signature) %>%
-    dplyr::mutate(
-      eligible_rank = dplyr::row_number()
-    )
-
-  n_take <- min(cfg$target_size, nrow(eligible_ranked))
-
-  selected <- eligible_ranked %>%
-    dplyr::slice_head(n = n_take) %>%
-    dplyr::mutate(
-      signature_rank = dplyr::row_number(),
-      selected = TRUE
-    )
-
-  # Attach eligible/selected ranks to the complete candidate ranking.
-  all_ranked$eligible_rank <- match(
-    all_ranked$gene,
-    eligible_ranked$gene
-  )
-  all_ranked$signature_rank <- match(
-    all_ranked$gene,
-    selected$gene
-  )
-  all_ranked$selected <- !is.na(all_ranked$signature_rank)
-
-  all_ranked <- all_ranked %>%
-    dplyr::mutate(
-      selection_status = dplyr::case_when(
-        excluded_by_other_signature ~ "excluded_by_other_signature",
-        selected ~ "selected",
-        TRUE ~ "below_top_n"
-      )
-    )
-
-  cutoff <- if (n_take > 0L) {
-    selected$evidence_score[n_take]
-  } else {
-    NA_real_
-  }
-
-  diagnostics <- tibble::tibble(
-    branch = label,
-    selection_method = "evidence_score_desc_gene_asc",
-    target_size = cfg$target_size,
-    n_candidates_measured_in_bulk = nrow(df),
-    n_excluded_by_other_signature =
-      sum(all_ranked$excluded_by_other_signature),
-    n_eligible = nrow(eligible_ranked),
-    n_selected = n_take,
-    target_shortfall = cfg$target_size - n_take,
-    cutoff_evidence_score = cutoff,
-    n_eligible_tied_at_cutoff = if (is.finite(cutoff)) {
-      sum(eligible_ranked$evidence_score == cutoff)
-    } else {
-      0L
-    },
-    n_selected_zero_total_score =
-      sum(selected$evidence_score == 0),
-    n_selected_zero_measured_evidence =
-      sum(selected$evidence_only_score == 0),
-    n_selected_missing_tau =
-      sum(!is.finite(selected$tau_used)),
-    n_selected_missing_ratio =
-      sum(!is.finite(selected$ratio_used)),
-    n_selected_missing_partial_corr =
-      sum(!is.finite(selected$partial_corr)),
-    n_selected_surface = sum(selected$is_surface)
-  )
-
-  if (n_take < cfg$target_size) {
-    warn_msg(
-      "%s: selected %d/%d; candidate pool after exclusion is too small.",
-      label, n_take, cfg$target_size
-    )
-  }
-
-  if (any(selected$evidence_only_score == 0)) {
-    warn_msg(
-      "%s: %d selected genes have zero measured-evidence points.",
-      label,
-      sum(selected$evidence_only_score == 0)
-    )
-  }
-
-  if (any(selected$evidence_score == 0)) {
-    warn_msg(
-      "%s: %d zero-total-score genes selected to fill the target.",
-      label,
-      sum(selected$evidence_score == 0)
-    )
-  }
-
-  # Internal ordering and membership checks.
-  stopifnot(
-    nrow(selected) <= cfg$target_size,
-    !anyDuplicated(selected$gene),
-    !any(selected$gene %in% exclude),
-    all(diff(selected$evidence_score) <= 0),
-    identical(
-      selected$gene,
-      head(eligible_ranked$gene, cfg$target_size)
-    )
-  )
-
-  msg(
-    "%s: %d candidates; %d excluded; top %d selected.",
-    label,
-    nrow(df),
-    sum(all_ranked$excluded_by_other_signature),
-    n_take
-  )
-
-  list(
-    genes = selected$gene,
-    table = selected,
-    all_ranked = all_ranked,
-    eligible_ranked = eligible_ranked,
-    diagnostics = diagnostics
-  )
-}
-
-# Select fibroblast first to retain the original disjointness policy.
-fib_sel <- select_signature(
+fib_sel <- select_signature_hierarchical(
   evidence_down_df,
-  "FIBROBLAST_STROMA"
+  label = "FIBROBLAST_STROMA",
+  tau_col = "tau_adeno",
+  ratio_col = "ratio_adeno_mean",
+  tiers = cfg$adaptive_tiers,
+  target_size = cfg$target_size,
+  exclude = character(0),
+  force_named_gene = FALSE,
+  cor_nepc_sign = "<=",
+  cor_ar_sign = ">=",
+  cor_ar_limit = 0
 )
 
 FIBROBLAST_STROMA_SIGNATURE <- fib_sel$genes
@@ -1726,10 +2223,19 @@ fib_exclusion <- if (cfg$exclude_fibroblast_from_aspc) {
   character(0)
 }
 
-aspc_sel <- select_signature(
+aspc_sel <- select_signature_hierarchical(
   evidence_df,
-  "ASPC",
-  exclude = fib_exclusion
+  label = "ASPC",
+  tau_col = "tau_nepc",
+  ratio_col = "ratio_nepc_mean",
+  tiers = cfg$adaptive_tiers,
+  target_size = cfg$target_size,
+  exclude = fib_exclusion,
+  force_named_gene = isTRUE(cfg$force_ar_in_aspc_signature),
+  named_gene = clean_genes(cfg$ar_gene),
+  cor_nepc_sign = ">=",
+  cor_ar_sign = "<=",
+  cor_ar_limit = 0.3222
 )
 
 ASPC_SIGNATURE <- aspc_sel$genes
@@ -1743,6 +2249,36 @@ if (cfg$exclude_fibroblast_from_aspc) {
   stopifnot(length(overlap) == 0L)
 }
 
+if (isTRUE(cfg$force_ar_in_aspc_signature)) {
+  ar_gene <- clean_genes(cfg$ar_gene)
+  if (length(ar_gene) != 1L) {
+    stop("cfg$ar_gene must contain exactly one symbol.")
+  }
+  if (ar_gene %in% FIBROBLAST_STROMA_SIGNATURE) {
+    stop(
+      "Mandatory ASPC AR conflicts with fibroblast-first exclusion: ",
+      ar_gene,
+      " selected for fibroblast signature."
+    )
+  }
+}
+
+stopifnot(
+  identical(
+    aspc_sel$genes,
+    aspc_sel$all_ranked %>%
+      dplyr::filter(selected) %>%
+      dplyr::arrange(final_signature_rank) %>%
+      dplyr::pull(gene)
+  ),
+  identical(
+    fib_sel$genes,
+    fib_sel$all_ranked %>%
+      dplyr::filter(selected) %>%
+      dplyr::arrange(final_signature_rank) %>%
+      dplyr::pull(gene)
+  )
+)
 # ============================================================================
 # STEP 10 — SURFACE RANKING AUDIT
 # ============================================================================
@@ -1753,7 +2289,7 @@ surface_audit_one <- function(sel, label) {
   n_take <- nrow(sel$table)
 
   evidence_only_top <- rank_by_score(
-    sel$eligible_ranked,
+    sel$ordinary_eligible_ranked,
     "evidence_only_score"
   ) %>%
     dplyr::slice_head(n = n_take)
@@ -1814,7 +2350,7 @@ write_result(
 )
 
 # Compatibility filenames now include complete score-ranked evidence,
-# candidate rank, eligible rank, selected status, and signature rank.
+# candidate rank, ordinary eligible rank, augmented pool rank, and final rank.
 write_result(
   aspc_sel$all_ranked,
   "evidence_matrix_ASPC_UP.csv"
@@ -1833,19 +2369,28 @@ write_result(
   "signature_selection_diagnostics.csv"
 )
 
+selection_tier_trace <- dplyr::bind_rows(
+  aspc_sel$tier_trace,
+  fib_sel$tier_trace
+)
+write_result(
+  selection_tier_trace,
+  "signature_selection_tier_trace.csv"
+)
+
 write_result(
   tibble::tibble(gene = overlap),
   "signature_overlap.csv"
 )
 
-# Named-gene audit replaces the previous forced-rescue behavior.
-# AR, if configured, is an ordinary candidate and can remain unselected.
+# Named-gene audit captures mandatory rescue diagnostics when configured.
 aspc_extra_audit <- tibble::tibble(
   gene = clean_genes(cfg$aspc_extra_candidates)
 ) %>%
   dplyr::mutate(
     measured_in_bulk = gene %in% rownames(expr_mat),
-    forced_inclusion = FALSE
+    forced_inclusion = isTRUE(cfg$force_ar_in_aspc_signature) &
+      gene == clean_genes(cfg$ar_gene)
   ) %>%
   dplyr::left_join(
     aspc_sel$all_ranked %>%
@@ -1857,7 +2402,13 @@ aspc_extra_audit <- tibble::tibble(
         annotation_score,
         candidate_rank,
         eligible_rank,
+        selection_pool_rank,
+        final_signature_rank,
         signature_rank,
+        mandatory_member,
+        forced_AR_requested,
+        added_to_pool_by_rescue,
+        selected_via_rescue,
         selected,
         selection_status
       ),
@@ -2019,14 +2570,18 @@ write_result(input_manifest, "signature_input_manifest.csv")
 provenance <- c(
   paste0("run_time: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")),
   paste0("script_version: ", SCRIPT_VERSION),
-  "selection_method: descending evidence_score",
+  "selection_method: adaptive_tier_gates_then_descending_evidence_score",
   "tie_breaker: ascending gene symbol",
-  "hard_tau_gate: none",
-  "hard_ratio_gate: none",
-  "hard_NEPC_AR_correlation_gates: none",
-  "hard_score_gate: none",
-  "adaptive_tiers: disabled",
-  "forced_named_gene_rescue: disabled",
+  "hard_tau_gate: adaptive_tiered",
+  "hard_ratio_gate: adaptive_tiered",
+  "hard_NEPC_AR_correlation_gates: adaptive_tiered",
+  "hard_score_gate: adaptive_tiered",
+  paste0("adaptive_tiers_enabled: ", nrow(cfg$adaptive_tiers)),
+  paste0("forced_named_gene_rescue: ", isTRUE(cfg$force_ar_in_aspc_signature)),
+  paste0("mandatory_aspc_gene: ", paste(clean_genes(cfg$ar_gene), collapse = ",")),
+  "AR_rescue_policy: no_score_bonus_no_forced_first_position",
+  "AR_rescue_conflict_policy: fibroblast-first exclusion is fatal",
+  "AR_rescue_rank_policy: AR plus best N-1 non-AR when rescue needed",
   paste0("target_size_per_signature: ", cfg$target_size),
   paste0("min_marker_cohorts: ", cfg$min_marker_cohorts),
   paste0(
@@ -2074,10 +2629,11 @@ provenance <- c(
   paste0("signature_overlap: ", length(overlap)),
   "",
   "INTERPRETATION:",
-  "The outputs are score-ranked candidate signatures, not independently",
-  "validated cell-identity signatures or guaranteed NEPC-directional signatures.",
+  "The outputs are adaptive-tier-gated, score-ranked candidate signatures.",
+  "They are not independently validated cell-identity signatures.",
   "Annotation channels may dominate the score.",
-  "Zero-score candidates may fill the target when the pool is otherwise small.",
+  "Lower tiers may relax directional/finite-correlation gates to avoid empty sets.",
+  "If forced, AR can be rescued into ASPC without score alteration.",
   "Cross-branch exclusion, when enabled, gives fibroblast membership priority.",
   "The ratio_nepc_mean and ratio_adeno_mean names are retained for compatibility;",
   "their source columns are recorded and may contain pooled medians.",
@@ -2104,7 +2660,7 @@ saveRDS(
     input_manifest = input_manifest,
     session_info = utils::sessionInfo()
   ),
-  file.path(cfg$results_dir, "signature_build_v8.rds")
+  file.path(cfg$results_dir, "signature_build_v9.rds")
 )
 
 writeLines(
