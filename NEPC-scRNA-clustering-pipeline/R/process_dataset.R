@@ -26,7 +26,7 @@ process_dataset <- function(ds) {
   for (s in samples) {
     err <- NA_character_
     res <- tryCatch(load_sample(s, ds), error = function(e) {
-      err <<- conditionMessage(e); warn_msg("  FAILED %s: %s", s$sample_id, err); NULL })
+      err <<- clean_msg(conditionMessage(e)); warn_msg("  FAILED %s: %s", s$sample_id, err); NULL })
     load_log[[length(load_log) + 1]] <- data.frame(
       dataset = ds$name, sample_id = s$sample_id, type = s$type,
       file = basename(s$path %||% s$matrix), status = if (is.null(res)) "failed" else "ok", error = err,

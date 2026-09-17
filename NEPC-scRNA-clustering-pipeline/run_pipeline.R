@@ -88,9 +88,9 @@ if (isTRUE(cfg$run_part1)) {
   for (ds in datasets) {
     t0 <- Sys.time()
     res <- tryCatch(process_dataset(ds), error = function(e) {
-      warn_msg("DATASET FAILED [%s]: %s", ds$name, conditionMessage(e))
+      warn_msg("DATASET FAILED [%s]: %s", ds$name, clean_msg(conditionMessage(e)))
       data.frame(dataset = ds$name, species = ds$species, dir = ds$dir,
-                 status = paste("failed:", conditionMessage(e)),
+                 status = paste("failed:", clean_msg(conditionMessage(e))),
                  n_samples = NA_integer_, n_cells = NA_integer_, n_clusters = NA_integer_)
     })
     res$minutes <- round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 2)

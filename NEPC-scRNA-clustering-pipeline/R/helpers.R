@@ -1,7 +1,7 @@
 # ============================================================================
 # helpers.R — logging, small utilities, Seurat v4/v5 compatibility
 # ============================================================================
-SCRIPT_VERSION <- "nepc_scrna_pipeline_v1.1"
+SCRIPT_VERSION <- "nepc_scrna_pipeline_v1.2"
 
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
 
@@ -112,19 +112,28 @@ df_to_sparse_by_chunks <- function(df, chunk = cfg$chunk_cols, label = "") {
 }
 
 # Seurat v4 / v5 compatibility -------------------------------------------------
+# Seurat v5 keeps one counts/data layer per merged sample; join them so that
+# FindAllMarkers, GetAssayData(layer=) and SingleR see one matrix. No-op on v4.
 join_layers_safe <- function(obj) {
-  if (exists("JoinLayers", envir = asNamespace("Seurat"), inherits = FALSE)) {
-    tryCatch(JoinLayers(obj), error = function(e) obj)
-  } else obj
+  if ("JoinLayers" %in% getNamespaceExports("SeuratObject")) {
+    obj <- tryCatch(SeuratObject::JoinLayers(obj), error = function(e) {
+      warn_msg("JoinLayers failed: %s", conditionMessage(e)); obj })
+  }
+  obj
 }
 
+seurat_v5 <- function() utils::packageVersion("SeuratObject") >= "5.0.0"
+
 get_data_layer <- function(obj, assay = "RNA") {
-  tryCatch(GetAssayData(obj, assay = assay, layer = "data"),
-           error = function(e) GetAssayData(obj, assay = assay, slot = "data"))
+  if (seurat_v5()) GetAssayData(obj, assay = assay, layer = "data")
+  else GetAssayData(obj, assay = assay, slot = "data")
 }
 
 get_counts_layer <- function(obj, assay = "RNA") {
-  tryCatch(GetAssayData(obj, assay = assay, layer = "counts"),
-           error = function(e) GetAssayData(obj, assay = assay, slot = "counts"))
+  if (seurat_v5()) GetAssayData(obj, assay = assay, layer = "counts")
+  else GetAssayData(obj, assay = assay, slot = "counts")
 }
+
+# strip ANSI colour codes from rlang/cli error messages before logging
+clean_msg <- function(x) gsub("\033\\[[0-9;]*m", "", x)
 

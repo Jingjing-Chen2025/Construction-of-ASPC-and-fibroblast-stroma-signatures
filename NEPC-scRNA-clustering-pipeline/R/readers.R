@@ -94,11 +94,11 @@ read_text_matrix <- function(path, sample_name) {
   # (a) Gene_ID + Symbol + one column per cell
   if (all(c("Gene_ID", "Symbol") %in% nms)) {
     genes <- sanitize_gene_names(dt[["Symbol"]])
-    keep  <- setdiff(nms, c("Gene_ID", "Symbol"))
-    sp <- df_to_sparse_by_chunks(dt[, keep, drop = FALSE], label = sample_name)
+    idx   <- which(!nms %in% c("Gene_ID", "Symbol"))     # by index: names may be duplicated
+    sp <- df_to_sparse_by_chunks(dt[, idx, drop = FALSE], label = sample_name)
     rm(dt); gc(verbose = FALSE)
     rownames(sp) <- genes
-    colnames(sp) <- make.unique(sanitize_cell_names(keep))
+    colnames(sp) <- make.unique(sanitize_cell_names(nms[idx]))
     msg("  %s: Gene_ID/Symbol table, %d genes x %d cells", sample_name, nrow(sp), ncol(sp))
     return(finalize_matrix(sp))
   }
@@ -116,12 +116,13 @@ read_text_matrix <- function(path, sample_name) {
     msg("  %s: dropping %d annotation column(s): %s", sample_name, length(drop),
         paste(head(drop, 6), collapse = ", "))
   }
-  keep <- names(is_num)[is_num & !is_ann]
-  if (length(keep) < 2) stop("No numeric expression columns in ", basename(path))
-  sp <- df_to_sparse_by_chunks(dt[, keep, drop = FALSE], label = sample_name)
+  # select by column index, never by name: gene symbols are often duplicated
+  idx <- which(is_num & !is_ann) + 1L
+  if (length(idx) < 2) stop("No numeric expression columns in ", basename(path))
+  sp <- df_to_sparse_by_chunks(dt[, idx, drop = FALSE], label = sample_name)
   rm(dt); gc(verbose = FALSE)
   rownames(sp) <- rowid
-  colnames(sp) <- sanitize_gene_names(keep)
+  colnames(sp) <- sanitize_gene_names(nms[idx])
 
   # orientation -> genes x cells
   row_bc <- looks_like_barcodes(rownames(sp)); col_bc <- looks_like_barcodes(colnames(sp))

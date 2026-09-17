@@ -78,7 +78,7 @@ suppressPackageStartupMessages({
 set.seed(123)
 options(stringsAsFactors = FALSE, future.globals.maxSize = 8 * 1024^3)
 
-SCRIPT_VERSION <- "07_v1.1"
+SCRIPT_VERSION <- "07_v1.2"
 cat("\n[INFO] Pipeline version", SCRIPT_VERSION, "| Seurat", as.character(packageVersion("Seurat")), "\n\n")
 
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
@@ -331,21 +331,30 @@ df_to_sparse_by_chunks <- function(df, chunk = cfg$chunk_cols, label = "") {
 }
 
 # Seurat v4 / v5 compatibility -------------------------------------------------
+# Seurat v5 keeps one counts/data layer per merged sample; join them so that
+# FindAllMarkers, GetAssayData(layer=) and SingleR see one matrix. No-op on v4.
 join_layers_safe <- function(obj) {
-  if (exists("JoinLayers", envir = asNamespace("Seurat"), inherits = FALSE)) {
-    tryCatch(JoinLayers(obj), error = function(e) obj)
-  } else obj
+  if ("JoinLayers" %in% getNamespaceExports("SeuratObject")) {
+    obj <- tryCatch(SeuratObject::JoinLayers(obj), error = function(e) {
+      warn_msg("JoinLayers failed: %s", conditionMessage(e)); obj })
+  }
+  obj
 }
 
+seurat_v5 <- function() utils::packageVersion("SeuratObject") >= "5.0.0"
+
 get_data_layer <- function(obj, assay = "RNA") {
-  tryCatch(GetAssayData(obj, assay = assay, layer = "data"),
-           error = function(e) GetAssayData(obj, assay = assay, slot = "data"))
+  if (seurat_v5()) GetAssayData(obj, assay = assay, layer = "data")
+  else GetAssayData(obj, assay = assay, slot = "data")
 }
 
 get_counts_layer <- function(obj, assay = "RNA") {
-  tryCatch(GetAssayData(obj, assay = assay, layer = "counts"),
-           error = function(e) GetAssayData(obj, assay = assay, slot = "counts"))
+  if (seurat_v5()) GetAssayData(obj, assay = assay, layer = "counts")
+  else GetAssayData(obj, assay = assay, slot = "counts")
 }
+
+# strip ANSI colour codes from rlang/cli error messages before logging
+clean_msg <- function(x) gsub("\033\\[[0-9;]*m", "", x)
 
 # ============================================================================
 # READERS — each returns a dgCMatrix (genes x cells)
@@ -442,11 +451,11 @@ read_text_matrix <- function(path, sample_name) {
   # (a) Gene_ID + Symbol + one column per cell
   if (all(c("Gene_ID", "Symbol") %in% nms)) {
     genes <- sanitize_gene_names(dt[["Symbol"]])
-    keep  <- setdiff(nms, c("Gene_ID", "Symbol"))
-    sp <- df_to_sparse_by_chunks(dt[, keep, drop = FALSE], label = sample_name)
+    idx   <- which(!nms %in% c("Gene_ID", "Symbol"))     # by index: names may be duplicated
+    sp <- df_to_sparse_by_chunks(dt[, idx, drop = FALSE], label = sample_name)
     rm(dt); gc(verbose = FALSE)
     rownames(sp) <- genes
-    colnames(sp) <- make.unique(sanitize_cell_names(keep))
+    colnames(sp) <- make.unique(sanitize_cell_names(nms[idx]))
     msg("  %s: Gene_ID/Symbol table, %d genes x %d cells", sample_name, nrow(sp), ncol(sp))
     return(finalize_matrix(sp))
   }
@@ -464,12 +473,13 @@ read_text_matrix <- function(path, sample_name) {
     msg("  %s: dropping %d annotation column(s): %s", sample_name, length(drop),
         paste(head(drop, 6), collapse = ", "))
   }
-  keep <- names(is_num)[is_num & !is_ann]
-  if (length(keep) < 2) stop("No numeric expression columns in ", basename(path))
-  sp <- df_to_sparse_by_chunks(dt[, keep, drop = FALSE], label = sample_name)
+  # select by column index, never by name: gene symbols are often duplicated
+  idx <- which(is_num & !is_ann) + 1L
+  if (length(idx) < 2) stop("No numeric expression columns in ", basename(path))
+  sp <- df_to_sparse_by_chunks(dt[, idx, drop = FALSE], label = sample_name)
   rm(dt); gc(verbose = FALSE)
   rownames(sp) <- rowid
-  colnames(sp) <- sanitize_gene_names(keep)
+  colnames(sp) <- sanitize_gene_names(nms[idx])
 
   # orientation -> genes x cells
   row_bc <- looks_like_barcodes(rownames(sp)); col_bc <- looks_like_barcodes(colnames(sp))
@@ -744,7 +754,7 @@ process_dataset <- function(ds) {
   for (s in samples) {
     err <- NA_character_
     res <- tryCatch(load_sample(s, ds), error = function(e) {
-      err <<- conditionMessage(e); warn_msg("  FAILED %s: %s", s$sample_id, err); NULL })
+      err <<- clean_msg(conditionMessage(e)); warn_msg("  FAILED %s: %s", s$sample_id, err); NULL })
     load_log[[length(load_log) + 1]] <- data.frame(
       dataset = ds$name, sample_id = s$sample_id, type = s$type,
       file = basename(s$path %||% s$matrix), status = if (is.null(res)) "failed" else "ok", error = err,
@@ -896,9 +906,9 @@ if (isTRUE(cfg$run_part1)) {
   for (ds in datasets) {
     t0 <- Sys.time()
     res <- tryCatch(process_dataset(ds), error = function(e) {
-      warn_msg("DATASET FAILED [%s]: %s", ds$name, conditionMessage(e))
+      warn_msg("DATASET FAILED [%s]: %s", ds$name, clean_msg(conditionMessage(e)))
       data.frame(dataset = ds$name, species = ds$species, dir = ds$dir,
-                 status = paste("failed:", conditionMessage(e)),
+                 status = paste("failed:", clean_msg(conditionMessage(e))),
                  n_samples = NA_integer_, n_cells = NA_integer_, n_clusters = NA_integer_)
     })
     res$minutes <- round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 2)
