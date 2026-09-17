@@ -1,0 +1,11 @@
+# R session artefacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+# pipeline outputs are written next to the data, never into the repo
+nepc_clustering/
+nepc_cross_dataset/
+cbioportal_cache/
+*.rds
+*.pdf
