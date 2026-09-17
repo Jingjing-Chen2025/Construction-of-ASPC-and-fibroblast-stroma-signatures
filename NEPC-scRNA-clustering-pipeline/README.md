@@ -20,7 +20,14 @@ One folder = one dataset. The default configuration (`config.R`) expects:
 | GSE292074 | human | `<NEPC_ROOT>/GSE292074` |
 | GSE296986_TKO | mouse | `<NEPC_ROOT>/GSE296986_TKO` |
 
-`NEPC_ROOT` defaults to `/Volumes/Jingjing_Chen/NEPC scRNA dataset`. Dataset folders often also contain analysis outputs (annotation tables, marker lists, tau/ratio tables). These are ignored: a single-file sample must match `cfg$sample_name_regex` (default `^GS[ME][0-9]+`, i.e. a GEO accession prefix; set to `NULL` to accept any name), known output names are excluded, and a text file is only read as a matrix when it has at least `cfg$min_fields_expression` columns. Supported sample formats inside a folder: 10x triplets (`*_barcodes.tsv.gz`, `*_features.tsv.gz`, `*_matrix.mtx.gz`), 10x sub-directories, `.h5`, custom triplets (`.barcode.csv`/`.genes.csv`/`.counts.mtx`), dense cells x genes CSV, `Gene_ID + Symbol` tables, flat genes x cells matrices, and `.tar.gz` / `.zip` archives wrapping a 10x directory.
+`NEPC_ROOT` defaults to `/Volumes/Jingjing_Chen/NEPC scRNA dataset`.
+
+**Sample formats.** Inside a dataset folder, one sample is either
+
+* a 10x triplet: `<sample>_barcodes.tsv.gz` + `<sample>_features.tsv.gz` (or `_genes.tsv.gz`) + `<sample>_matrix.mtx.gz`, or
+* one file: `<sample>.txt.gz`, `<sample>.csv.gz`, `<sample>.zip` / `<sample>.matrix.zip`, or `<sample>.tar.gz`.
+
+A `.txt.gz` / `.csv.gz` file holds one delimited matrix, either genes x cells (first column = gene), cells x genes (first column = barcode; annotation columns such as `CLUSTER` are dropped) or a `Gene_ID` + `Symbol` + one-column-per-cell table; the orientation is detected automatically. An archive wraps either a 10x directory or one such text matrix. Every other file in the folder is ignored: uncompressed `.csv` / `.txt` files, `.rds`, `.pdf`, sub-directories and the outputs of the companion analysis scripts. A compressed text file is skipped when it has fewer than `cfg$min_fields_expression` columns or matches a known annotation-table name; `cfg$sample_name_regex` (default `NULL`) can additionally restrict single-file samples by name, e.g. `"^GS[ME][0-9]+"`.
 
 ## Requirements
 

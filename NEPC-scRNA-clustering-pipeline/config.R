@@ -26,7 +26,7 @@ cfg <- list(
   chunk_cols           = 2000,    # dense -> sparse conversion chunk size
   min_cells_dataset    = 100,     # abort a dataset with fewer cells after QC
   min_fields_expression = 10,     # a text matrix needs at least this many columns
-  sample_name_regex    = "^GS[ME][0-9]+",  # single-file samples must match (NULL = any name)
+  sample_name_regex    = NULL,    # e.g. "^GS[ME][0-9]+" to accept only GEO-named files
 
   # ---- Part 1: markers ----
   marker_min_pct   = 0.25,

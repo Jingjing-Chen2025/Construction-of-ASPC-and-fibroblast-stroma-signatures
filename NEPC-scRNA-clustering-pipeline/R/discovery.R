@@ -1,14 +1,10 @@
 # ============================================================================
 # discovery.R — sample discovery inside a dataset folder + per-sample loading/QC
 # ============================================================================
+# Files that are never expression matrices even when they are compressed.
 ANNOTATION_ONLY_PATTERNS <- paste(
-  "rename_cluster", "TCRresult", "TCR_result", "tcr", "cell_annotation", "cellannotation",
-  "_metadata", "metadata_", "clonotype", "barcode_annotation",
-  # outputs of the companion analysis scripts (02_-06_) that live in the same folders
-  "^cluster_annotation", "cluster_sample_entropy", "clustering_qc", "target_cluster_gate",
-  "_aspc_specific_ratio", "_cluster_ratio", "_target_markers_top", "_target_specific_ratio",
-  "_tau\\.csv", "^NEPC_", "^Adeno_",
-  sep = "|")
+  "rename_cluster", "TCRresult", "TCR_result", "clonotype", "cell_annotation", "cellannotation",
+  "_metadata", "metadata_", "barcode_annotation", sep = "|")
 
 # A text file is only treated as an expression matrix when it has enough columns.
 plausible_matrix_file <- function(path) {
@@ -18,100 +14,77 @@ plausible_matrix_file <- function(path) {
   max(lengths(strsplit(lines, sep, fixed = TRUE))) >= cfg$min_fields_expression
 }
 
-PIPELINE_OUTPUT_PATTERNS <- paste0(
-  "^(metadata_merged|sample_summary|cluster_counts|sample_manifest|batch_run_log|",
-  "matrix_file_comparison|cluster\\.markers|seurat_merged|umap_|nepc_|07_|tau_|ratio_|target_markers)")
+# Strip the format suffix to obtain the sample id.
+sample_id_from_file <- function(f) {
+  sid <- f
+  sid <- sub("\\.matrix\\.zip$|\\.zip$|\\.tar\\.gz$|\\.tgz$", "", sid)
+  sid <- sub("\\.(txt|csv|tsv)\\.gz$", "", sid)
+  sid <- sub("_filtered_feature_bc_matrix$|_raw_feature_bc_matrix$", "", sid)
+  sid <- sub("_gene_cell_exprs_table$|_dense$|_dge$|\\.counts?$|_counts?$|_matrix$|_expression_matrix$", "", sid)
+  sid
+}
 
+# ---- sample discovery --------------------------------------------------------
+# One sample is EITHER
+#   (i)  a 10x triplet  <sample>_barcodes.tsv.gz + <sample>_features.tsv.gz (or _genes.tsv.gz)
+#                       + <sample>_matrix.mtx.gz, OR
+#   (ii) one file       <sample>.txt.gz | <sample>.csv.gz | <sample>.zip | <sample>.matrix.zip
+#                       | <sample>.tar.gz
+# Every other file in the folder (uncompressed .csv/.txt, .rds, .pdf, analysis
+# outputs of the companion scripts, sub-directories) is ignored.
 scan_dataset <- function(dir_path) {
   files <- list.files(dir_path, full.names = FALSE, recursive = FALSE)
   files <- files[!grepl("^\\.", files)]
+  files <- files[!dir.exists(file.path(dir_path, files))]
   samples <- list(); claimed <- character(0)
   add <- function(s) samples[[length(samples) + 1]] <<- s
 
-  # --- 10x triplets: <pfx>_barcodes.tsv(.gz) + _features/_genes + _matrix.mtx ---
-  bc10x <- grep("_barcodes\\.tsv(\\.gz)?$", files, value = TRUE)
-  for (b in bc10x) {
-    pfx <- sub("_barcodes\\.tsv(\\.gz)?$", "", b)
-    f <- grep(paste0("^", pfx, "_(features|genes)\\.tsv(\\.gz)?$"), files, value = TRUE)
-    m <- grep(paste0("^", pfx, "_matrix\\.mtx(\\.gz)?$"), files, value = TRUE)
+  # (i) 10x triplets
+  for (b in grep("_barcodes\\.tsv\\.gz$", files, value = TRUE)) {
+    pfx <- sub("_barcodes\\.tsv\\.gz$", "", b)
+    f <- files[files %in% paste0(pfx, c("_features.tsv.gz", "_genes.tsv.gz"))]
+    m <- files[files %in% paste0(pfx, "_matrix.mtx.gz")]
     if (length(f) && length(m)) {
-      add(list(sample_id = pfx, type = "triplet_10x", barcodes = file.path(dir_path, b),
-               features = file.path(dir_path, f[1]), matrix = file.path(dir_path, m[1])))
+      add(list(sample_id = sample_id_from_file(pfx), type = "triplet_10x",
+               barcodes = file.path(dir_path, b), features = file.path(dir_path, f[1]),
+               matrix = file.path(dir_path, m[1])))
       claimed <- c(claimed, b, f[1], m[1])
+    } else {
+      warn_msg("  %s has no matching _features.tsv.gz / _matrix.mtx.gz; triplet ignored", b)
+      claimed <- c(claimed, b)
     }
   }
-  # --- custom triplets: .barcode.csv / .genes.csv / .counts.mtx ---
-  bccus <- grep("\\.barcode\\.csv(\\.gz)?$", files, value = TRUE)
-  for (b in bccus) {
-    pfx <- sub("\\.barcode\\.csv(\\.gz)?$", "", b)
-    g <- grep(paste0("^", pfx, "\\.genes\\.csv(\\.gz)?$"), files, value = TRUE)
-    m <- grep(paste0("^", pfx, "\\.counts\\.mtx(\\.gz)?$"), files, value = TRUE)
-    if (length(g) && length(m)) {
-      add(list(sample_id = pfx, type = "triplet_custom", barcodes = file.path(dir_path, b),
-               features = file.path(dir_path, g[1]), matrix = file.path(dir_path, m[1])))
-      claimed <- c(claimed, b, g[1], m[1])
-    }
-  }
-  # --- single files, archives and 10x sub-directories ---
+  triplet_parts <- "_(barcodes|features|genes)\\.tsv\\.gz$|_matrix\\.mtx\\.gz$"
+
+  # (ii) single-file samples
   for (f in setdiff(files, claimed)) {
+    if (grepl(triplet_parts, f)) next                       # stray part of an incomplete triplet
+    ty <- if (grepl("\\.tar\\.gz$|\\.tgz$", f))             "archive_tar"
+      else if (grepl("\\.zip$", f))                         "archive_zip"
+      else if (grepl("\\.(txt|csv|tsv)\\.gz$", f))          "text_gz"
+      else NA_character_
+    if (is.na(ty)) next                                     # not an accepted sample format
     fp <- file.path(dir_path, f)
-    if (grepl(PIPELINE_OUTPUT_PATTERNS, f)) next
-    if (grepl(ANNOTATION_ONLY_PATTERNS, f, ignore.case = TRUE)) next
+    if (grepl(ANNOTATION_ONLY_PATTERNS, f, ignore.case = TRUE)) {
+      msg("  Skipping %s (annotation table, not expression)", f); next
+    }
     if (!is.null(cfg$sample_name_regex) && !grepl(cfg$sample_name_regex, f)) {
-      msg("  Skipping %s (name does not match cfg$sample_name_regex '%s')", f, cfg$sample_name_regex)
-      next
+      msg("  Skipping %s (name does not match cfg$sample_name_regex '%s')", f, cfg$sample_name_regex); next
     }
-    if (dir.exists(fp)) {
-      has_mtx <- length(list.files(fp, pattern = "matrix\\.mtx(\\.gz)?$", recursive = TRUE)) > 0
-      if (has_mtx) add(list(sample_id = f, type = "dir_10x", path = fp))
-      next
+    if (ty == "text_gz" && !plausible_matrix_file(fp)) {
+      msg("  Skipping %s (fewer than %d columns; not an expression matrix)", f, cfg$min_fields_expression); next
     }
-    if (grepl("\\.(rds|rda|RData)(\\.gz)?$", f, ignore.case = TRUE)) next
-    if (grepl("\\.(pdf|log|md|json|png|jpg|xlsx|xls|html|R|r|py)$", f)) next
-
-    ty <- if (grepl("\\.h5$", f))                                         "h5_10x"
-    else if (grepl("_dense\\.csv\\.gz$", f))                              "dense_csv"
-    else if (grepl("_gene_cell_exprs_table\\.txt\\.gz$", f))              "gene_cell_table"
-    else if (grepl("(_dge|data\\.raw\\.matrix|data\\.matrix|counts?|matrix|expr)\\.(txt|tsv)(\\.gz)?$", f, ignore.case = TRUE)) "matrix_txt"
-    else if (grepl("\\.count(s)?\\.csv(\\.gz)?$", f))                     "matrix_csv"
-    else if (grepl("\\.tar\\.gz$|\\.tgz$", f))                            "archive_tar"
-    else if (grepl("\\.zip$", f))                                         "archive_zip"
-    else if (grepl("\\.csv(\\.gz)?$", f))                                 "labelled_csv"
-    else NA_character_
-    if (is.na(ty)) next
-    if (ty %in% c("dense_csv", "gene_cell_table", "matrix_txt", "matrix_csv", "labelled_csv") &&
-        !plausible_matrix_file(fp)) {
-      msg("  Skipping %s (fewer than %d columns; not an expression matrix)", f, cfg$min_fields_expression)
-      next
-    }
-
-    sid <- f
-    sid <- sub("_dense\\.csv\\.gz$", "", sid)
-    sid <- sub("_gene_cell_exprs_table\\.txt\\.gz$", "", sid)
-    sid <- sub("_filtered_feature_bc_matrix", "", sid)
-    sid <- sub("_raw_feature_bc_matrix", "", sid)
-    sid <- sub("\\.count(s)?\\.csv(\\.gz)?$", "", sid)
-    sid <- sub("(_dge)?\\.(txt|tsv)(\\.gz)?$", "", sid)
-    sid <- sub("\\.csv(\\.gz)?$", "", sid)
-    sid <- sub("\\.tar\\.gz$|\\.tgz$|\\.zip$|\\.h5$", "", sid)
-    add(list(sample_id = sid, type = ty, path = fp))
+    add(list(sample_id = sample_id_from_file(f), type = ty, path = fp))
   }
   samples
 }
 
 load_sample <- function(s, ds) {
   m <- switch(s$type,
-    triplet_10x     = read_triplet_10x(s$barcodes, s$features, s$matrix, s$sample_id),
-    triplet_custom  = read_triplet_custom(s$barcodes, s$features, s$matrix, s$sample_id),
-    dir_10x         = read_dir_10x(s$path, s$sample_id),
-    h5_10x          = read_h5_10x(s$path, s$sample_id),
-    dense_csv       = read_dense_csv(s$path, s$sample_id),
-    gene_cell_table = read_gene_cell_table(s$path, s$sample_id),
-    matrix_txt      = read_matrix_flat(s$path, s$sample_id),
-    matrix_csv      = read_matrix_flat(s$path, s$sample_id),
-    labelled_csv    = read_labelled_csv(s$path, s$sample_id),
-    archive_tar     = read_archive(s$path, s$sample_id, "tar"),
-    archive_zip     = read_archive(s$path, s$sample_id, "zip"),
+    triplet_10x = read_triplet_10x(s$barcodes, s$features, s$matrix, s$sample_id),
+    text_gz     = read_text_matrix(s$path, s$sample_id),
+    archive_zip = read_archive(s$path, s$sample_id, "zip"),
+    archive_tar = read_archive(s$path, s$sample_id, "tar"),
     stop("Unknown sample type: ", s$type)
   )
   if (is.finite(cfg$max_cells_per_sample) && ncol(m) > cfg$max_cells_per_sample) {

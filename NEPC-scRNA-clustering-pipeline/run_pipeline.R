@@ -47,15 +47,37 @@ set.seed(123)
 options(stringsAsFactors = FALSE, future.globals.maxSize = 8 * 1024^3)
 
 # ---- load configuration and modules ----------------------------------------
+# The folder that holds THIS file is used for config.R and R/, whether the
+# script is run with Rscript, source()d, or executed from the RStudio editor.
 PIPELINE_DIR <- local({
   a <- commandArgs(trailingOnly = FALSE)
   f <- sub("^--file=", "", a[grepl("^--file=", a)])
-  if (length(f)) dirname(normalizePath(f[1])) else getwd()
+  if (length(f)) return(dirname(normalizePath(f[1])))
+  for (fr in sys.frames()) {                       # source("…/run_pipeline.R")
+    of <- fr$ofile
+    if (!is.null(of) && nzchar(of)) return(dirname(normalizePath(of)))
+  }
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    p <- tryCatch(rstudioapi::getActiveDocumentContext()$path, error = function(e) "")
+    if (nzchar(p)) return(dirname(normalizePath(p)))   # "Run" / "Source" button in RStudio
+  }
+  getwd()
 })
+if (!file.exists(file.path(PIPELINE_DIR, "config.R")) || !dir.exists(file.path(PIPELINE_DIR, "R"))) {
+  stop("Cannot find config.R and R/ next to run_pipeline.R (looked in ", PIPELINE_DIR,
+       "). Run with Rscript run_pipeline.R from the pipeline folder, or setwd() to it first.")
+}
 source(file.path(PIPELINE_DIR, "config.R"))
 for (mod in c("helpers", "readers", "discovery", "annotation", "process_dataset",
               "recurrence", "signatures_cbioportal")) {
   source(file.path(PIPELINE_DIR, "R", paste0(mod, ".R")))
+}
+cat("\n[INFO] Pipeline version", SCRIPT_VERSION, "loaded from", PIPELINE_DIR, "\n")
+cat("[INFO] Seurat", as.character(packageVersion("Seurat")), "| R", R.version$major, R.version$minor, "\n\n")
+# guard against a stale copy of the modules (e.g. an older unzipped folder)
+if (!exists("plausible_matrix_file") || is.null(cfg$min_cells_dataset)) {
+  stop("The files under ", PIPELINE_DIR, " are an older version of the pipeline. ",
+       "Replace the whole folder (config.R, R/, run_pipeline.R) with the current one and re-run.")
 }
 
 dir.create(OUT_CROSS, showWarnings = FALSE, recursive = TRUE)
