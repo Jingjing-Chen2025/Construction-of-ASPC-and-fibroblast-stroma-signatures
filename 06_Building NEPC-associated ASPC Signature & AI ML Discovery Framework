@@ -15,7 +15,6 @@
 #
 #   ASPC signature
 #     Full UP candidate matrix
-#       | Exclude genes selected in the fibroblast-stroma signature
 #       | Apply adaptive filters using NEPC tau, ratio, and correlation
 #       |   requirements (tier ladder relaxes until the target can be met)
 #     Eligible ASPC candidates
@@ -225,17 +224,15 @@ cfg <- list(
 
   # Forced inclusion (ASPC only by default). Forced genes bypass the adaptive
   # filters and, when the signature is full, displace the lowest-ranked
-  # ordinary selected gene. They still must be measured in bulk and must not
-  # already belong to the fibroblast-stroma signature.
+  # ordinary selected gene. They still must be measured in bulk.
   aspc_forced_genes = c("AR"),
   fibroblast_forced_genes = character(0),
 
-  # Final signature construction
+  # Final signature construction. The two branches are selected independently;
+  # ASPCs are a subpopulation of the mesenchymal stroma, so overlap between the
+  # ASPC and fibroblast-stroma signatures is expected and is recorded in
+  # signature_overlap.csv rather than prevented.
   target_size = 200L,
-
-  # TRUE: select fibroblast first; exclude those genes from ASPC selection.
-  # FALSE: independently select each branch; overlap is allowed.
-  exclude_fibroblast_from_aspc = TRUE,
 
   # Adaptive filter ladder.
   #   "adaptive": walk the tiers from strict to loose until target_size is met.
@@ -1729,7 +1726,7 @@ tier_table_row <- function(tr, label, direction, n_pool, n_eligible) {
     ratio_threshold = ratio_thr,
     correlation_gates = gates,
     require_finite_correlations = finite_cor,
-    n_pool_after_exclusion = n_pool,
+    n_pool = n_pool,
     n_eligible = n_eligible,
     meets_target = target_met
   )
@@ -1739,22 +1736,18 @@ select_signature <- function(
     df,
     label,
     direction,
-    exclude = character(0),
     forced_genes = character(0)) {
 
-  exclude <- clean_genes(exclude)
   forced_genes <- clean_genes(forced_genes)
 
   # ---- 1. full candidate matrix, ranked ------------------------------------
   all_ranked <- rank_by_score(df) %>%
-    dplyr::mutate(
-      candidate_rank = dplyr::row_number(),
-      excluded_by_other_signature = gene %in% exclude
-    )
+    dplyr::mutate(candidate_rank = dplyr::row_number())
 
-  # ---- 2. exclusion by the other signature ---------------------------------
-  pool <- all_ranked %>%
-    dplyr::filter(!excluded_by_other_signature)
+  # ---- 2. candidate pool ----------------------------------------------------
+  # Each branch is selected independently from its own full candidate matrix;
+  # there is no cross-signature exclusion.
+  pool <- all_ranked
 
   # ---- 3. adaptive filters --------------------------------------------------
   tiers <- build_tiers()
@@ -1799,7 +1792,7 @@ select_signature <- function(
     dplyr::mutate(eligible_rank = dplyr::row_number())
 
   msg(
-    "%s: tier %d ('%s') -> %d eligible of %d after exclusion.",
+    "%s: tier %d ('%s') -> %d eligible of %d candidates.",
     label, chosen_tier$id, chosen_tier$label,
     nrow(eligible_ranked), nrow(pool)
   )
@@ -1820,16 +1813,14 @@ select_signature <- function(
 
   # ---- 5. forced inclusion ---------------------------------------------------
   # A forced gene bypasses the adaptive filters. It still has to be in the
-  # branch candidate matrix (measured in bulk) and must not be claimed by the
-  # other signature. When the signature is full, the lowest-ranked ordinary
-  # (non-forced) selected gene is displaced.
+  # branch candidate matrix (measured in bulk). When the signature is full,
+  # the lowest-ranked ordinary (non-forced) selected gene is displaced.
   forced_added <- character(0)
   displaced <- character(0)
   forced_rows <- list()
 
   for (g in forced_genes) {
     in_matrix <- g %in% all_ranked$gene
-    excluded <- g %in% exclude
     passes_filter <- g %in% eligible_ranked$gene
     already_selected <- g %in% selected$gene
     added <- FALSE
@@ -1840,12 +1831,6 @@ select_signature <- function(
       outcome <- "not_in_candidate_matrix"
       warn_msg(
         "%s: forced gene %s is not in the candidate matrix (not measured in bulk?).",
-        label, g
-      )
-    } else if (excluded) {
-      outcome <- "blocked_by_other_signature"
-      warn_msg(
-        "%s: forced gene %s belongs to the other signature; not forced.",
         label, g
       )
     } else if (already_selected) {
@@ -1903,7 +1888,6 @@ select_signature <- function(
       branch = label,
       gene = g,
       in_candidate_matrix = in_matrix,
-      excluded_by_other_signature = excluded,
       passes_adaptive_filter = passes_filter,
       selected_ordinarily = already_selected,
       forced_added = added,
@@ -1919,7 +1903,6 @@ select_signature <- function(
       branch = character(),
       gene = character(),
       in_candidate_matrix = logical(),
-      excluded_by_other_signature = logical(),
       passes_adaptive_filter = logical(),
       selected_ordinarily = logical(),
       forced_added = logical(),
@@ -1950,7 +1933,6 @@ select_signature <- function(
   all_ranked <- all_ranked %>%
     dplyr::mutate(
       selection_status = dplyr::case_when(
-        excluded_by_other_signature ~ "excluded_by_other_signature",
         forced_inclusion ~ "selected_forced",
         selected ~ "selected",
         displaced_by_forced_gene ~ "displaced_by_forced_gene",
@@ -1980,9 +1962,6 @@ select_signature <- function(
     ratio_threshold_used = max(chosen_tier$ratio, cfg$ratio_floor),
     correlation_gates_used = isTRUE(chosen_tier$cor_gates),
     n_candidates_measured_in_bulk = nrow(df),
-    n_excluded_by_other_signature =
-      sum(all_ranked$excluded_by_other_signature),
-    n_pool_after_exclusion = nrow(pool),
     n_failed_adaptive_filter = nrow(pool) - nrow(eligible_ranked),
     n_eligible = nrow(eligible_ranked),
     n_selected = nrow(selected),
@@ -2053,7 +2032,6 @@ select_signature <- function(
   stopifnot(
     nrow(selected) <= cfg$target_size,
     !anyDuplicated(selected$gene),
-    !any(selected$gene %in% exclude),
     all(diff(selected$evidence_score) <= 0),
     all(ordinary_selected$gene %in% eligible_ranked$gene),
     all(forced_added %in% forced_genes),
@@ -2065,10 +2043,9 @@ select_signature <- function(
   )
 
   msg(
-    "%s: %d candidates; %d excluded; %d failed filters; %d eligible; %d selected (%d forced).",
+    "%s: %d candidates; %d failed filters; %d eligible; %d selected (%d forced).",
     label,
     nrow(df),
-    sum(all_ranked$excluded_by_other_signature),
     nrow(pool) - nrow(eligible_ranked),
     nrow(eligible_ranked),
     nrow(selected),
@@ -2089,7 +2066,7 @@ select_signature <- function(
   )
 }
 
-# ---- Fibroblast-stroma signature (DOWN branch) first ------------------------
+# ---- Fibroblast-stroma signature (DOWN branch) ------------------------------
 cat("\n--- FIBROBLAST_STROMA (DOWN): adaptive filters on Adeno tau / ratio / correlations ---\n")
 fib_sel <- select_signature(
   evidence_down_df,
@@ -2100,32 +2077,24 @@ fib_sel <- select_signature(
 
 FIBROBLAST_STROMA_SIGNATURE <- fib_sel$genes
 
-fib_exclusion <- if (cfg$exclude_fibroblast_from_aspc) {
-  FIBROBLAST_STROMA_SIGNATURE
-} else {
-  character(0)
-}
-
 # ---- ASPC signature (UP branch) ---------------------------------------------
-cat("\n--- ASPC (UP): exclude fibroblast genes, adaptive filters on NEPC tau / ratio / correlations ---\n")
+# Selected independently of the fibroblast-stroma branch: ASPCs are a
+# subpopulation of the mesenchymal stroma, so shared genes are expected.
+cat("\n--- ASPC (UP): adaptive filters on NEPC tau / ratio / correlations ---\n")
 aspc_sel <- select_signature(
   evidence_df,
   "ASPC",
   direction = "up",
-  exclude = fib_exclusion,
   forced_genes = cfg$aspc_forced_genes
 )
 
 ASPC_SIGNATURE <- aspc_sel$genes
 
+# Genes shared by both signatures; reported, not prevented.
 overlap <- intersect(
   ASPC_SIGNATURE,
   FIBROBLAST_STROMA_SIGNATURE
 )
-
-if (cfg$exclude_fibroblast_from_aspc) {
-  stopifnot(length(overlap) == 0L)
-}
 
 adaptive_filter_trace <- dplyr::bind_rows(fib_sel$trace, aspc_sel$trace)
 forced_gene_diagnostics <- dplyr::bind_rows(fib_sel$forced, aspc_sel$forced)
@@ -2157,7 +2126,7 @@ surface_audit_one <- function(sel, label) {
       sum(evidence_only_top$is_surface),
     n_genes_shared_between_rankings =
       length(intersect(sel$table$gene, evidence_only_top$gene)),
-    audit_scope = "same_branch_pool_same_exclusion_no_reselection"
+    audit_scope = "same_branch_pool_no_reselection"
   )
 }
 
@@ -2460,11 +2429,7 @@ provenance <- c(
   ),
   paste0("target_size_per_signature: ", cfg$target_size),
   paste0("min_marker_cohorts: ", cfg$min_marker_cohorts),
-  paste0(
-    "exclude_fibroblast_from_aspc: ",
-    cfg$exclude_fibroblast_from_aspc
-  ),
-  "selection_order: fibroblast first, then ASPC",
+  "selection: independent branches, no cross-signature exclusion (overlap allowed)",
   paste0(
     "ASPC_extra_candidates: ",
     paste(clean_genes(cfg$aspc_extra_candidates), collapse = ",")
@@ -2512,7 +2477,8 @@ provenance <- c(
   "Forced genes bypass the adaptive filters and are flagged forced_inclusion.",
   "Annotation channels may dominate the score.",
   "Zero-score candidates may fill the target when the pool is otherwise small.",
-  "Cross-branch exclusion, when enabled, gives fibroblast membership priority.",
+  "Branches are selected independently; ASPC/fibroblast overlap is expected",
+  "(ASPCs are a stromal subpopulation) and is listed in signature_overlap.csv.",
   "The ratio_nepc_mean and ratio_adeno_mean names are retained for compatibility;",
   "their source columns are recorded and may contain pooled medians.",
   "See candidate rankings, channel points, selection diagnostics, and audits."
