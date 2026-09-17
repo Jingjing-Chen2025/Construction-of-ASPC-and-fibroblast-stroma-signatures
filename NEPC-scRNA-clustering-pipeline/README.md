@@ -20,7 +20,7 @@ One folder = one dataset. The default configuration (`config.R`) expects:
 | GSE292074 | human | `<NEPC_ROOT>/GSE292074` |
 | GSE296986_TKO | mouse | `<NEPC_ROOT>/GSE296986_TKO` |
 
-`NEPC_ROOT` defaults to `/Volumes/Jingjing_Chen/NEPC scRNA dataset`. Supported sample formats inside a folder: 10x triplets (`*_barcodes.tsv.gz`, `*_features.tsv.gz`, `*_matrix.mtx.gz`), 10x sub-directories, `.h5`, custom triplets (`.barcode.csv`/`.genes.csv`/`.counts.mtx`), dense cells x genes CSV, `Gene_ID + Symbol` tables, flat genes x cells matrices, and `.tar.gz` / `.zip` archives wrapping a 10x directory.
+`NEPC_ROOT` defaults to `/Volumes/Jingjing_Chen/NEPC scRNA dataset`. Dataset folders often also contain analysis outputs (annotation tables, marker lists, tau/ratio tables). These are ignored: a single-file sample must match `cfg$sample_name_regex` (default `^GS[ME][0-9]+`, i.e. a GEO accession prefix; set to `NULL` to accept any name), known output names are excluded, and a text file is only read as a matrix when it has at least `cfg$min_fields_expression` columns. Supported sample formats inside a folder: 10x triplets (`*_barcodes.tsv.gz`, `*_features.tsv.gz`, `*_matrix.mtx.gz`), 10x sub-directories, `.h5`, custom triplets (`.barcode.csv`/`.genes.csv`/`.counts.mtx`), dense cells x genes CSV, `Gene_ID + Symbol` tables, flat genes x cells matrices, and `.tar.gz` / `.zip` archives wrapping a 10x directory.
 
 ## Requirements
 

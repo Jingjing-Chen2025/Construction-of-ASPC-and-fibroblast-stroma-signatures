@@ -24,6 +24,9 @@ cfg <- list(
   umap_min_dist        = 0.3,
   max_cells_per_sample = Inf,     # e.g. 10000 to subsample huge samples
   chunk_cols           = 2000,    # dense -> sparse conversion chunk size
+  min_cells_dataset    = 100,     # abort a dataset with fewer cells after QC
+  min_fields_expression = 10,     # a text matrix needs at least this many columns
+  sample_name_regex    = "^GS[ME][0-9]+",  # single-file samples must match (NULL = any name)
 
   # ---- Part 1: markers ----
   marker_min_pct   = 0.25,

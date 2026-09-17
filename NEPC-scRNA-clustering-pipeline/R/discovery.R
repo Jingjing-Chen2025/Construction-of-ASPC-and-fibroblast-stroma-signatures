@@ -3,7 +3,20 @@
 # ============================================================================
 ANNOTATION_ONLY_PATTERNS <- paste(
   "rename_cluster", "TCRresult", "TCR_result", "tcr", "cell_annotation", "cellannotation",
-  "_metadata", "metadata_", "clonotype", "barcode_annotation", sep = "|")
+  "_metadata", "metadata_", "clonotype", "barcode_annotation",
+  # outputs of the companion analysis scripts (02_-06_) that live in the same folders
+  "^cluster_annotation", "cluster_sample_entropy", "clustering_qc", "target_cluster_gate",
+  "_aspc_specific_ratio", "_cluster_ratio", "_target_markers_top", "_target_specific_ratio",
+  "_tau\\.csv", "^NEPC_", "^Adeno_",
+  sep = "|")
+
+# A text file is only treated as an expression matrix when it has enough columns.
+plausible_matrix_file <- function(path) {
+  lines <- tryCatch(peek_lines(path, n = 2), error = function(e) character(0))
+  if (length(lines) < 2) return(FALSE)
+  sep <- detect_sep(lines)
+  max(lengths(strsplit(lines, sep, fixed = TRUE))) >= cfg$min_fields_expression
+}
 
 PIPELINE_OUTPUT_PATTERNS <- paste0(
   "^(metadata_merged|sample_summary|cluster_counts|sample_manifest|batch_run_log|",
@@ -43,6 +56,11 @@ scan_dataset <- function(dir_path) {
   for (f in setdiff(files, claimed)) {
     fp <- file.path(dir_path, f)
     if (grepl(PIPELINE_OUTPUT_PATTERNS, f)) next
+    if (grepl(ANNOTATION_ONLY_PATTERNS, f, ignore.case = TRUE)) next
+    if (!is.null(cfg$sample_name_regex) && !grepl(cfg$sample_name_regex, f)) {
+      msg("  Skipping %s (name does not match cfg$sample_name_regex '%s')", f, cfg$sample_name_regex)
+      next
+    }
     if (dir.exists(fp)) {
       has_mtx <- length(list.files(fp, pattern = "matrix\\.mtx(\\.gz)?$", recursive = TRUE)) > 0
       if (has_mtx) add(list(sample_id = f, type = "dir_10x", path = fp))
@@ -50,7 +68,6 @@ scan_dataset <- function(dir_path) {
     }
     if (grepl("\\.(rds|rda|RData)(\\.gz)?$", f, ignore.case = TRUE)) next
     if (grepl("\\.(pdf|log|md|json|png|jpg|xlsx|xls|html|R|r|py)$", f)) next
-    if (grepl(ANNOTATION_ONLY_PATTERNS, f, ignore.case = TRUE)) next
 
     ty <- if (grepl("\\.h5$", f))                                         "h5_10x"
     else if (grepl("_dense\\.csv\\.gz$", f))                              "dense_csv"
@@ -62,6 +79,11 @@ scan_dataset <- function(dir_path) {
     else if (grepl("\\.csv(\\.gz)?$", f))                                 "labelled_csv"
     else NA_character_
     if (is.na(ty)) next
+    if (ty %in% c("dense_csv", "gene_cell_table", "matrix_txt", "matrix_csv", "labelled_csv") &&
+        !plausible_matrix_file(fp)) {
+      msg("  Skipping %s (fewer than %d columns; not an expression matrix)", f, cfg$min_fields_expression)
+      next
+    }
 
     sid <- f
     sid <- sub("_dense\\.csv\\.gz$", "", sid)
@@ -103,9 +125,15 @@ load_sample <- function(s, ds) {
   rm(m); gc(verbose = FALSE)
 
   # ---- per-cell QC ----
-  mt_pattern <- if (identical(ds$species, "mouse")) "^mt-" else "^MT-"
-  n_mt <- sum(grepl(mt_pattern, rownames(seu)))
-  seu$percent.mt <- if (n_mt > 0) PercentageFeatureSet(seu, pattern = mt_pattern)[, 1] else rep(0, ncol(seu))
+  # case-insensitive so "MT-CO1", "mt-Co1" and "Mt-co1" are all recognised
+  mt_genes <- grep("^MT-", rownames(seu), ignore.case = TRUE, value = TRUE)
+  n_mt <- length(mt_genes)
+  if (n_mt > 0) {
+    # col.name= works in Seurat v4 and v5 (v5 returns a bare vector otherwise)
+    seu <- PercentageFeatureSet(seu, features = mt_genes, col.name = "percent.mt")
+  } else {
+    seu$percent.mt <- rep(0, ncol(seu))
+  }
   n_before <- ncol(seu)
   keep <- seu$percent.mt <= cfg$max_mito_pct & seu$nFeature_RNA <= cfg$max_features_cell
   if (any(!keep)) seu <- subset(seu, cells = colnames(seu)[keep])

@@ -44,10 +44,22 @@ process_dataset <- function(ds) {
   rm(seurat_list); gc(verbose = FALSE)
   msg("Merged: %d genes x %d cells from %d sample(s)", nrow(seu), ncol(seu), length(unique(seu$sample)))
 
+  if (ncol(seu) < cfg$min_cells_dataset) {
+    stop(sprintf("only %d cells after QC (< cfg$min_cells_dataset = %d); check nepc_sample_manifest.csv",
+                 ncol(seu), cfg$min_cells_dataset))
+  }
+  seu <- join_layers_safe(seu)   # one counts layer (Seurat v5) before normalisation
   seu <- NormalizeData(seu, verbose = FALSE)
   seu <- FindVariableFeatures(seu, nfeatures = cfg$nfeatures, verbose = FALSE)
-  seu <- ScaleData(seu, features = VariableFeatures(seu), verbose = FALSE)
-  npcs <- min(cfg$npcs, ncol(seu) - 1, length(VariableFeatures(seu)) - 1)
+  vf <- VariableFeatures(seu)
+  if (!length(vf)) {
+    warn_msg("vst found no variable features; retrying with selection.method = 'dispersion'")
+    seu <- FindVariableFeatures(seu, selection.method = "dispersion", nfeatures = cfg$nfeatures, verbose = FALSE)
+    vf <- VariableFeatures(seu)
+  }
+  if (!length(vf)) stop("No variable features could be determined")
+  seu <- ScaleData(seu, features = vf, verbose = FALSE)
+  npcs <- min(cfg$npcs, ncol(seu) - 1, length(vf) - 1)
   seu <- RunPCA(seu, npcs = npcs, verbose = FALSE)
   seu <- FindNeighbors(seu, dims = 1:npcs, verbose = FALSE)
   seu <- FindClusters(seu, resolution = cfg$resolution, verbose = FALSE)
