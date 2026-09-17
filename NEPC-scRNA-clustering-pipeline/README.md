@@ -53,12 +53,14 @@ Parts can be toggled with `cfg$run_part1`, `cfg$run_part2`, `cfg$run_part3`. Par
 
 ### Part 1 — clustering and annotation (per dataset)
 
-* Per-cell QC: minimum detected genes, maximum mitochondrial percentage (`^MT-` / `^mt-`), optional maximum genes per cell.
-* All samples of the dataset are merged (sample of origin is kept in the metadata), then `NormalizeData` → `FindVariableFeatures` → `ScaleData` → `RunPCA` → `FindNeighbors` → `FindClusters` (Louvain) → `RunUMAP`.
+The clustering and annotation settings follow the multi-cohort batch pipeline (`01_`): 1000 variable genes, 20 PCs, Louvain resolution 0.05, no mitochondrial filter, markers with `min.pct = 0.25`, `logfc.threshold = 0.25`, BH-adjusted p < 0.05, and SingleR with the species-matched celldex reference on counts.
+
+* Per-cell QC: minimum detected genes (`cfg$min_features_cell`); mitochondrial percentage is computed but not filtered unless `cfg$max_mito_pct` is set.
+* All samples of the dataset are merged (sample of origin is kept in the metadata), layers are joined, then `NormalizeData` → `FindVariableFeatures(nfeatures = 1000)` → `ScaleData` → `RunPCA(npcs = 20)` → `FindNeighbors` → `FindClusters(resolution = 0.05)` → `RunUMAP`. Clusters are named `Cluster_<id>`.
 * `FindAllMarkers` (positive markers, BH-adjusted p < 0.05).
-* Cluster annotation uses two independent layers:
-  * **Primary** — canonical marker panels (`POPULATION_MARKERS` in `config.R`: luminal, basal, club/hillock, neuroendocrine, cycling, fibroblast, ASPC-like adipose progenitor, smooth muscle/myofibroblast, pericyte, endothelial, lymphatic, T, NK, B, plasma, macrophage/myeloid, dendritic, mast, neutrophil, Schwann, erythroid, adipocyte). For each cluster the mean log-normalised expression of every panel gene is z-scored across clusters and averaged per panel; the best panel names the cluster unless its score or its margin over the runner-up falls below `cfg$ann_min_score` / `cfg$ann_min_margin` (then `Unassigned`). Mouse symbols are matched after `toupper()`.
-  * **Secondary** — SingleR per-cell labels (celldex `HumanPrimaryCellAtlasData` or `MouseRNAseqData`) summarised as the majority label per cluster.
+* Cluster annotation (`cfg$annotation_method`):
+  * **`singler` (default)** — SingleR labels every cell with celldex `HumanPrimaryCellAtlasData` (human) or `MouseRNAseqData` (mouse), `label.main`, tested on counts, at most `cfg$singler_max_cells` cells. Labels of both references are mapped onto one shared vocabulary (`SINGLER_LABEL_MAP` in `config.R`, e.g. `T_cells`/`T cells` → `T_cell`, `Fibroblasts` → `Fibroblast`) so that populations can be compared across human and mouse datasets, and each cluster is named by the majority label of its cells (`singler_fraction` gives the majority share).
+  * **`panel`** — canonical marker panels (`POPULATION_MARKERS`): the mean log-normalised expression of every panel gene is z-scored across clusters and averaged per panel; the best panel names the cluster unless its score or its margin over the runner-up is too low (`Unassigned`). With `singler` this label is still reported as `population_panel`.
 
 ### Part 2 — recurrent populations
 
@@ -66,7 +68,7 @@ Every non-`Unassigned` population is counted across datasets. A population is *r
 
 ### Part 3 — correlation with the NEPC signature
 
-* Two signatures per recurrent population: the **canonical** marker panel and a **consensus-marker** signature (positive cluster markers of that population found in at least `cfg$consensus_min_datasets` datasets, top `cfg$consensus_top_n` by recurrence and mean log2FC; mitochondrial/ribosomal/haemoglobin genes excluded). Genes that overlap the NEPC signature are excluded from population signatures by default (`cfg$exclude_nepc_genes_from_signatures`) to avoid circular correlations.
+* Two signatures per recurrent population: the **canonical** marker panel (for SingleR-derived populations via `SINGLER_TO_PANEL`, e.g. `Neuron` → neuroendocrine panel, `Tissue_stem_cell` → ASPC-like progenitor panel) and a **consensus-marker** signature (positive cluster markers of that population found in at least `cfg$consensus_min_datasets` datasets, top `cfg$consensus_top_n` by recurrence and mean log2FC; mitochondrial/ribosomal/haemoglobin genes excluded). Genes that overlap the NEPC signature are excluded from population signatures by default (`cfg$exclude_nepc_genes_from_signatures`) to avoid circular correlations.
 * Bulk mRNA expression for `prad_tcga` and `prad_su2c_2019` is fetched from the cBioPortal REST API. The mRNA profile is chosen at run time from the study's non-z-score `MRNA_EXPRESSION` profiles using the preference patterns in `cfg$cbio_studies`, and the choice is logged and written to `nepc_cbioportal_profiles_used.csv`. A profile can be pinned with `profile_id`. Without API access, point `cfg$cbio_local_files` at downloaded cBioPortal datahub expression files.
 * Scoring: linear values are log2(x + 1) transformed, every gene is z-scored across samples, a signature score is the mean z over its genes. The NEPC score uses `NEPC_BELTRAN_CUSTOM_UP` (29 genes).
 * Correlation: Pearson and Spearman correlation of every population score with the NEPC score across samples (BH-adjusted within study and method), plus Spearman correlation of every signature gene with the NEPC score.
@@ -78,12 +80,12 @@ Per dataset, in `<dataset folder>/nepc_clustering/`:
 | File | Content |
 | --- | --- |
 | `nepc_sample_manifest.csv` | detected samples, format, load status, cell/gene counts |
-| `nepc_cluster_annotation.csv` | one row per cluster: size, population, panel score and margin, runner-up, SingleR majority, top markers |
+| `nepc_cluster_annotation.csv` | one row per cluster: size, population (SingleR majority by default), majority share, panel label and score, top markers |
 | `nepc_panel_scores_by_cluster.csv` | full cluster x panel score matrix |
 | `nepc_cluster_markers_sig.csv`, `nepc_cluster_markers_top.csv` | FindAllMarkers results (all significant / top N per cluster) |
 | `nepc_population_counts.csv` | cells per population |
 | `nepc_cell_metadata.csv` | per-cell metadata incl. cluster, population, SingleR label |
-| `nepc_umap_*.pdf` | UMAPs by cluster, population, sample, SingleR |
+| `nepc_umap_*.pdf` | UMAPs: named clusters, populations, sample, SingleR cell types, clusters + cell types |
 | `nepc_seurat_annotated.rds` | annotated Seurat object |
 
 Cross-dataset, in `<NEPC_ROOT>/nepc_cross_dataset/`:
@@ -106,5 +108,5 @@ Cross-dataset, in `<NEPC_ROOT>/nepc_cross_dataset/`:
 
 ## Notes
 
-* Clustering resolution (`cfg$resolution`, default 0.3) and PCs (`cfg$npcs`, default 30) control how finely subpopulations separate; lower the resolution for coarser compartments.
+* Clustering resolution (`cfg$resolution`, default 0.05) and PCs (`cfg$npcs`, default 20) follow the batch pipeline and give coarse compartments; raise the resolution (e.g. 0.3) to separate subpopulations.
 * Mouse datasets are annotated with the same human panels via uppercase symbol matching; consensus signatures pool human and mouse markers the same way.

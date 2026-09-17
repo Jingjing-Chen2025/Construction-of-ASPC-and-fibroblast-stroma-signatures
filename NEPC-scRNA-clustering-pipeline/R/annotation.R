@@ -61,6 +61,20 @@ assign_population <- function(scores) {
   bind_rows(rows)
 }
 
+# Map SingleR labels of either reference onto the shared vocabulary.
+harmonize_singler_label <- function(x) {
+  x <- as.character(x)
+  out <- unname(SINGLER_LABEL_MAP[x])
+  miss <- is.na(out) & !is.na(x)
+  if (any(miss)) {
+    y <- gsub("[ .-]+", "_", trimws(x[miss]))
+    y <- sub("_?[Cc]ells$", "_cell", y)
+    y <- sub("^(.*[^s])s$", "\\1", y)         # simple plural -> singular
+    out[miss] <- y
+  }
+  out
+}
+
 get_singler_ref <- function(species) {
   if (identical(species, "mouse")) celldex::MouseRNAseqData() else celldex::HumanPrimaryCellAtlasData()
 }
@@ -80,7 +94,9 @@ run_singler <- function(seu, species) {
     sce <- suppressWarnings(Seurat::as.SingleCellExperiment(obj))
     ref <- get_singler_ref(species)
     msg("  SingleR reference: %s", if (species == "mouse") "MouseRNAseqData" else "HumanPrimaryCellAtlasData")
-    sr  <- SingleR::SingleR(test = sce, ref = ref, labels = ref$label.main, assay.type.test = "logcounts")
+    sr  <- SingleR::SingleR(test = sce, ref = ref,
+                            labels = SummarizedExperiment::colData(ref)[[cfg$singler_labels %||% "label.main"]],
+                            assay.type.test = cfg$singler_assay %||% "counts")
     out <- setNames(sr$labels, colnames(obj))
     rm(sce, obj, sr); gc(verbose = FALSE)
     out

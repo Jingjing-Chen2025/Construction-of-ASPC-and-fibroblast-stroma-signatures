@@ -63,7 +63,7 @@ process_dataset <- function(ds) {
   seu <- RunPCA(seu, npcs = npcs, verbose = FALSE)
   seu <- FindNeighbors(seu, dims = 1:npcs, verbose = FALSE)
   seu <- FindClusters(seu, resolution = cfg$resolution, verbose = FALSE)
-  seu <- RunUMAP(seu, dims = 1:npcs, min.dist = cfg$umap_min_dist, verbose = FALSE)
+  seu <- RunUMAP(seu, dims = 1:npcs, verbose = FALSE)
   seu <- join_layers_safe(seu)
   Idents(seu) <- seu$seurat_clusters
   msg("Clusters found: %d (resolution %g, %d PCs)", length(levels(seu$seurat_clusters)), cfg$resolution, npcs)
@@ -99,14 +99,15 @@ process_dataset <- function(ds) {
     sr <- run_singler(seu, ds$species)
     if (!is.null(sr)) lab[names(sr)] <- sr
   }
-  seu$singler_label <- lab
+  seu$singler_label <- lab                                   # reference label as returned
+  seu$singler_population <- harmonize_singler_label(lab)     # shared human/mouse vocabulary
   sr_major <- seu@meta.data %>%
     mutate(cluster = as.character(seurat_clusters)) %>%
-    filter(!is.na(singler_label)) %>%
-    count(cluster, singler_label, name = "n_lab") %>%
+    filter(!is.na(singler_population)) %>%
+    count(cluster, singler_population, name = "n_lab") %>%
     group_by(cluster) %>% mutate(frac = n_lab / sum(n_lab)) %>%
     slice_max(order_by = n_lab, n = 1, with_ties = FALSE) %>% ungroup() %>%
-    transmute(cluster, singler_majority = singler_label, singler_fraction = round(frac, 3))
+    transmute(cluster, singler_majority = singler_population, singler_fraction = round(frac, 3))
 
   # ---- STEP 5: assemble the cluster annotation table ----
   sizes <- seu@meta.data %>% mutate(cluster = as.character(seurat_clusters)) %>%
@@ -116,20 +117,29 @@ process_dataset <- function(ds) {
       slice_head(n = 10) %>% summarise(top_markers = paste(gene, collapse = ";"), .groups = "drop")
   } else data.frame(cluster = character(0), top_markers = character(0))
 
-  ann <- ann %>% left_join(sizes, by = "cluster") %>% left_join(sr_major, by = "cluster") %>%
+  use_singler <- identical(cfg$annotation_method, "singler")
+  ann <- ann %>% rename(population_panel = population) %>%
+    left_join(sizes, by = "cluster") %>% left_join(sr_major, by = "cluster") %>%
     left_join(top_mk, by = "cluster") %>%
     mutate(dataset = ds$name, species = ds$species,
-           population_label = ifelse(population == "Unassigned" & !is.na(singler_majority),
-                                     paste0("Unassigned/", singler_majority), population)) %>%
-    select(dataset, species, cluster, n_cells, pct_cells, population, population_label,
-           best_panel, panel_score, runner_up, runner_up_score, margin,
-           singler_majority, singler_fraction, top_markers) %>%
+           cluster_name = paste0("Cluster_", cluster),
+           annotation_method = if (use_singler) "singler_majority" else "marker_panel",
+           population = if (use_singler) ifelse(is.na(singler_majority), "Unassigned", singler_majority)
+                        else population_panel) %>%
+    select(dataset, species, cluster, cluster_name, n_cells, pct_cells, population, annotation_method,
+           singler_majority, singler_fraction, population_panel,
+           best_panel, panel_score, runner_up, runner_up_score, margin, top_markers) %>%
     arrange(suppressWarnings(as.numeric(cluster)))
+  if (use_singler && all(is.na(ann$singler_majority))) {
+    warn_msg("SingleR produced no labels; clusters are Unassigned (set cfg$annotation_method = 'panel' to use marker panels)")
+  }
   write.csv(ann, file.path(out_dir, "nepc_cluster_annotation.csv"), row.names = FALSE)
 
   pop_map <- setNames(ann$population, ann$cluster)
   seu$population <- unname(pop_map[as.character(seu$seurat_clusters)])
+  seu$cluster_name <- paste0("Cluster_", seu$seurat_clusters)
   seu$cluster_population <- paste0("C", seu$seurat_clusters, ":", seu$population)
+  seu$celltype <- seu$singler_label                       # batch-pipeline column name
 
   if (!is.null(markers) && nrow(markers)) {
     markers$population <- unname(pop_map[markers$cluster])
@@ -145,23 +155,25 @@ process_dataset <- function(ds) {
   write.csv(seu@meta.data, file.path(out_dir, "nepc_cell_metadata.csv"), row.names = TRUE)
 
   # ---- STEP 6: plots ----
-  p1 <- DimPlot(seu, group.by = "seurat_clusters", label = TRUE, repel = TRUE) + ggtitle(paste0(ds$name, " - clusters"))
+  p1 <- DimPlot(seu, group.by = "cluster_name", label = TRUE, repel = TRUE, label.size = 4) +
+    ggtitle(paste0(ds$name, " - Named Clusters")) + labs(color = "Cluster")
   p2 <- DimPlot(seu, group.by = "cluster_population", label = TRUE, repel = TRUE, label.size = 3) +
     ggtitle(paste0(ds$name, " - annotated populations")) + theme(legend.text = element_text(size = 7))
-  p3 <- DimPlot(seu, group.by = "sample") + ggtitle(paste0(ds$name, " - sample"))
-  pdf(file.path(out_dir, "nepc_umap_clusters.pdf"), width = 8, height = 6); print(p1); dev.off()
+  p3 <- DimPlot(seu, group.by = "sample") + ggtitle(paste0(ds$name, " - Sample")) + labs(color = "Sample")
+  pdf(file.path(out_dir, "nepc_umap_clusters_named.pdf"), width = 8, height = 6); print(p1); dev.off()
   pdf(file.path(out_dir, "nepc_umap_populations.pdf"), width = 11, height = 6); print(p2); dev.off()
   pdf(file.path(out_dir, "nepc_umap_sample.pdf"), width = 9, height = 6); print(p3); dev.off()
-  if (any(!is.na(seu$singler_label))) {
-    p4 <- DimPlot(seu, group.by = "singler_label", label = TRUE, repel = TRUE, label.size = 3) +
-      ggtitle(paste0(ds$name, " - SingleR"))
-    pdf(file.path(out_dir, "nepc_umap_singler.pdf"), width = 10, height = 6); print(p4); dev.off()
+  if (any(!is.na(seu$celltype))) {
+    p4 <- DimPlot(seu, group.by = "celltype", label = TRUE, repel = TRUE, label.size = 3) +
+      ggtitle(paste0(ds$name, " - Cell Type (SingleR)")) + labs(color = "Cell Type")
+    pdf(file.path(out_dir, "nepc_umap_celltypes.pdf"), width = 9, height = 6); print(p4); dev.off()
+    pdf(file.path(out_dir, "nepc_umap_clusters_named_and_celltypes.pdf"), width = 14, height = 6); print(p1 + p4); dev.off()
   }
   pdf(file.path(out_dir, "nepc_umap_clusters_and_populations.pdf"), width = 18, height = 6); print(p1 + p2); dev.off()
 
   if (isTRUE(cfg$save_rds)) saveRDS(seu, rds_path)
   msg("Outputs written to %s", out_dir)
-  print(ann[, c("cluster", "n_cells", "population", "panel_score", "singler_majority")])
+  print(ann[, c("cluster", "n_cells", "population", "singler_fraction", "population_panel")])
 
   res <- data.frame(dataset = ds$name, species = ds$species, dir = out_dir, status = "ok",
                     n_samples = length(unique(seu$sample)), n_cells = ncol(seu),

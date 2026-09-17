@@ -78,7 +78,7 @@ suppressPackageStartupMessages({
 set.seed(123)
 options(stringsAsFactors = FALSE, future.globals.maxSize = 8 * 1024^3)
 
-SCRIPT_VERSION <- "07_v1.2"
+SCRIPT_VERSION <- "07_v1.3"
 cat("\n[INFO] Pipeline version", SCRIPT_VERSION, "| Seurat", as.character(packageVersion("Seurat")), "\n\n")
 
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
@@ -112,11 +112,10 @@ cfg <- list(
   min_cells_gene       = 3,
   min_features_cell    = 200,
   max_features_cell    = Inf,     # e.g. 8000 to drop likely doublets
-  max_mito_pct         = 20,
-  nfeatures            = 2000,
-  npcs                 = 30,
-  resolution           = 0.3,
-  umap_min_dist        = 0.3,
+  max_mito_pct         = Inf,     # batch-pipeline setting: no mitochondrial filter (e.g. 20 to enable)
+  nfeatures            = 1000,    # batch-pipeline setting
+  npcs                 = 20,      # batch-pipeline setting
+  resolution           = 0.05,    # batch-pipeline setting
   max_cells_per_sample = Inf,     # e.g. 10000 to subsample huge samples
   chunk_cols           = 2000,    # dense -> sparse conversion chunk size
   min_cells_dataset    = 100,     # abort a dataset with fewer cells after QC
@@ -130,11 +129,19 @@ cfg <- list(
   top_markers_report = 30,
 
   # ---- Part 1: annotation ----
+  # "singler": each cluster is named by the majority SingleR label of its cells
+  #            (celldex HumanPrimaryCellAtlasData / MouseRNAseqData, label.main,
+  #            run on counts) — the batch-pipeline setting. The marker-panel
+  #            label is still computed and reported as population_panel.
+  # "panel":   name clusters by the canonical marker panels instead.
+  annotation_method  = "singler",
+  run_singler        = TRUE,
+  singler_max_cells  = 20000,
+  singler_assay      = "counts",  # batch-pipeline setting ("logcounts" also works)
+  singler_labels     = "label.main",
   ann_min_genes  = 3,             # panel genes that must be detected
   ann_min_score  = 0.30,          # mean z of the winning panel
   ann_min_margin = 0.10,          # winner minus runner-up
-  run_singler        = TRUE,
-  singler_max_cells  = 20000,
   save_rds           = TRUE,
 
   # ---- Part 2: recurrence ----
@@ -237,6 +244,50 @@ POPULATION_MARKERS <- list(
   Adipocyte                   = c("ADIPOQ","LEP","PLIN1","CIDEA","FABP4","CIDEC")
 )
 POPULATION_MARKERS <- lapply(POPULATION_MARKERS, toupper)
+
+# SingleR label.main vocabularies differ between the human (HPCA) and mouse
+# (MouseRNAseq) references; both are mapped onto one shared vocabulary so that a
+# population can be counted across human and mouse datasets. Unlisted labels are
+# normalised automatically (spaces -> "_", plural "cells" -> "cell").
+SINGLER_LABEL_MAP <- c(
+  "T_cells" = "T_cell", "T cells" = "T_cell",
+  "B_cell" = "B_cell", "B cells" = "B_cell", "Pre-B_cell_CD34-" = "B_cell", "Pro-B_cell_CD34+" = "B_cell",
+  "NK_cell" = "NK_cell", "NK cells" = "NK_cell",
+  "Macrophage" = "Macrophage", "Macrophages" = "Macrophage", "Microglia" = "Macrophage",
+  "Monocyte" = "Monocyte", "Monocytes" = "Monocyte",
+  "DC" = "Dendritic_cell", "Dendritic cells" = "Dendritic_cell",
+  "Granulocytes" = "Granulocyte", "Neutrophils" = "Granulocyte", "Myelocyte" = "Granulocyte",
+  "Pro-Myelocyte" = "Granulocyte", "GMP" = "Myeloid_progenitor", "CMP" = "Myeloid_progenitor",
+  "MEP" = "Myeloid_progenitor", "HSC_-G-CSF" = "Myeloid_progenitor", "HSC_CD34+" = "Myeloid_progenitor",
+  "Erythroblast" = "Erythroid", "Erythrocytes" = "Erythroid", "Platelets" = "Platelet",
+  "Fibroblasts" = "Fibroblast",
+  "Endothelial_cells" = "Endothelial_cell", "Endothelial cells" = "Endothelial_cell",
+  "Epithelial_cells" = "Epithelial_cell", "Epithelial cells" = "Epithelial_cell",
+  "Keratinocytes" = "Epithelial_cell", "Hepatocytes" = "Hepatocyte",
+  "Smooth_muscle_cells" = "Smooth_muscle_cell", "Cardiomyocytes" = "Smooth_muscle_cell",
+  "Neurons" = "Neuron", "Neuroepithelial_cell" = "Neuron",
+  "Astrocyte" = "Glia", "Astrocytes" = "Glia", "Oligodendrocytes" = "Glia", "OPCs" = "Glia",
+  "Tissue_stem_cells" = "Tissue_stem_cell", "MSC" = "Tissue_stem_cell",
+  "Chondrocytes" = "Chondrocyte", "Osteoblasts" = "Osteoblast",
+  "Adipocytes" = "Adipocyte",
+  "iPS_cells" = "Stem_cell", "Embryonic_stem_cells" = "Stem_cell"
+)
+
+# Canonical marker panel used for a SingleR-derived population in Part 3.
+SINGLER_TO_PANEL <- c(
+  T_cell = "T_cell", B_cell = "B_cell", NK_cell = "NK_cell",
+  Macrophage = "Macrophage_myeloid", Monocyte = "Macrophage_myeloid", Dendritic_cell = "Dendritic_cell",
+  Granulocyte = "Neutrophil", Erythroid = "Erythroid",
+  Fibroblast = "Fibroblast", Endothelial_cell = "Endothelial",
+  Smooth_muscle_cell = "Smooth_muscle_myofibroblast",
+  Neuron = "Neuroendocrine", Tissue_stem_cell = "ASPC_adipose_progenitor",
+  Adipocyte = "Adipocyte", Epithelial_cell = "Epithelial_cell", Plasma_cell = "Plasma_cell"
+)
+
+# Extra canonical signatures for populations without a panel of their own.
+EXTRA_SIGNATURES <- list(
+  Epithelial_cell = toupper(c("EPCAM","KRT8","KRT18","KRT19","CDH1","CLDN4","CLDN7","KRT5","KRT14","KLK3","AR"))
+)
 
 # ============================================================================
 # GENERIC HELPERS
@@ -700,6 +751,20 @@ assign_population <- function(scores) {
   bind_rows(rows)
 }
 
+# Map SingleR labels of either reference onto the shared vocabulary.
+harmonize_singler_label <- function(x) {
+  x <- as.character(x)
+  out <- unname(SINGLER_LABEL_MAP[x])
+  miss <- is.na(out) & !is.na(x)
+  if (any(miss)) {
+    y <- gsub("[ .-]+", "_", trimws(x[miss]))
+    y <- sub("_?[Cc]ells$", "_cell", y)
+    y <- sub("^(.*[^s])s$", "\\1", y)         # simple plural -> singular
+    out[miss] <- y
+  }
+  out
+}
+
 get_singler_ref <- function(species) {
   if (identical(species, "mouse")) celldex::MouseRNAseqData() else celldex::HumanPrimaryCellAtlasData()
 }
@@ -719,7 +784,9 @@ run_singler <- function(seu, species) {
     sce <- suppressWarnings(Seurat::as.SingleCellExperiment(obj))
     ref <- get_singler_ref(species)
     msg("  SingleR reference: %s", if (species == "mouse") "MouseRNAseqData" else "HumanPrimaryCellAtlasData")
-    sr  <- SingleR::SingleR(test = sce, ref = ref, labels = ref$label.main, assay.type.test = "logcounts")
+    sr  <- SingleR::SingleR(test = sce, ref = ref,
+                            labels = SummarizedExperiment::colData(ref)[[cfg$singler_labels %||% "label.main"]],
+                            assay.type.test = cfg$singler_assay %||% "counts")
     out <- setNames(sr$labels, colnames(obj))
     rm(sce, obj, sr); gc(verbose = FALSE)
     out
@@ -791,7 +858,7 @@ process_dataset <- function(ds) {
   seu <- RunPCA(seu, npcs = npcs, verbose = FALSE)
   seu <- FindNeighbors(seu, dims = 1:npcs, verbose = FALSE)
   seu <- FindClusters(seu, resolution = cfg$resolution, verbose = FALSE)
-  seu <- RunUMAP(seu, dims = 1:npcs, min.dist = cfg$umap_min_dist, verbose = FALSE)
+  seu <- RunUMAP(seu, dims = 1:npcs, verbose = FALSE)
   seu <- join_layers_safe(seu)
   Idents(seu) <- seu$seurat_clusters
   msg("Clusters found: %d (resolution %g, %d PCs)", length(levels(seu$seurat_clusters)), cfg$resolution, npcs)
@@ -827,14 +894,15 @@ process_dataset <- function(ds) {
     sr <- run_singler(seu, ds$species)
     if (!is.null(sr)) lab[names(sr)] <- sr
   }
-  seu$singler_label <- lab
+  seu$singler_label <- lab                                   # reference label as returned
+  seu$singler_population <- harmonize_singler_label(lab)     # shared human/mouse vocabulary
   sr_major <- seu@meta.data %>%
     mutate(cluster = as.character(seurat_clusters)) %>%
-    filter(!is.na(singler_label)) %>%
-    count(cluster, singler_label, name = "n_lab") %>%
+    filter(!is.na(singler_population)) %>%
+    count(cluster, singler_population, name = "n_lab") %>%
     group_by(cluster) %>% mutate(frac = n_lab / sum(n_lab)) %>%
     slice_max(order_by = n_lab, n = 1, with_ties = FALSE) %>% ungroup() %>%
-    transmute(cluster, singler_majority = singler_label, singler_fraction = round(frac, 3))
+    transmute(cluster, singler_majority = singler_population, singler_fraction = round(frac, 3))
 
   # ---- STEP 5: assemble the cluster annotation table ----
   sizes <- seu@meta.data %>% mutate(cluster = as.character(seurat_clusters)) %>%
@@ -844,20 +912,29 @@ process_dataset <- function(ds) {
       slice_head(n = 10) %>% summarise(top_markers = paste(gene, collapse = ";"), .groups = "drop")
   } else data.frame(cluster = character(0), top_markers = character(0))
 
-  ann <- ann %>% left_join(sizes, by = "cluster") %>% left_join(sr_major, by = "cluster") %>%
+  use_singler <- identical(cfg$annotation_method, "singler")
+  ann <- ann %>% rename(population_panel = population) %>%
+    left_join(sizes, by = "cluster") %>% left_join(sr_major, by = "cluster") %>%
     left_join(top_mk, by = "cluster") %>%
     mutate(dataset = ds$name, species = ds$species,
-           population_label = ifelse(population == "Unassigned" & !is.na(singler_majority),
-                                     paste0("Unassigned/", singler_majority), population)) %>%
-    select(dataset, species, cluster, n_cells, pct_cells, population, population_label,
-           best_panel, panel_score, runner_up, runner_up_score, margin,
-           singler_majority, singler_fraction, top_markers) %>%
+           cluster_name = paste0("Cluster_", cluster),
+           annotation_method = if (use_singler) "singler_majority" else "marker_panel",
+           population = if (use_singler) ifelse(is.na(singler_majority), "Unassigned", singler_majority)
+                        else population_panel) %>%
+    select(dataset, species, cluster, cluster_name, n_cells, pct_cells, population, annotation_method,
+           singler_majority, singler_fraction, population_panel,
+           best_panel, panel_score, runner_up, runner_up_score, margin, top_markers) %>%
     arrange(suppressWarnings(as.numeric(cluster)))
+  if (use_singler && all(is.na(ann$singler_majority))) {
+    warn_msg("SingleR produced no labels; clusters are Unassigned (set cfg$annotation_method = 'panel' to use marker panels)")
+  }
   write.csv(ann, file.path(out_dir, "07_cluster_annotation.csv"), row.names = FALSE)
 
   pop_map <- setNames(ann$population, ann$cluster)
   seu$population <- unname(pop_map[as.character(seu$seurat_clusters)])
+  seu$cluster_name <- paste0("Cluster_", seu$seurat_clusters)
   seu$cluster_population <- paste0("C", seu$seurat_clusters, ":", seu$population)
+  seu$celltype <- seu$singler_label                       # batch-pipeline column name
 
   if (!is.null(markers) && nrow(markers)) {
     markers$population <- unname(pop_map[markers$cluster])
@@ -873,23 +950,25 @@ process_dataset <- function(ds) {
   write.csv(seu@meta.data, file.path(out_dir, "07_cell_metadata.csv"), row.names = TRUE)
 
   # ---- STEP 6: plots ----
-  p1 <- DimPlot(seu, group.by = "seurat_clusters", label = TRUE, repel = TRUE) + ggtitle(paste0(ds$name, " - clusters"))
+  p1 <- DimPlot(seu, group.by = "cluster_name", label = TRUE, repel = TRUE, label.size = 4) +
+    ggtitle(paste0(ds$name, " - Named Clusters")) + labs(color = "Cluster")
   p2 <- DimPlot(seu, group.by = "cluster_population", label = TRUE, repel = TRUE, label.size = 3) +
     ggtitle(paste0(ds$name, " - annotated populations")) + theme(legend.text = element_text(size = 7))
-  p3 <- DimPlot(seu, group.by = "sample") + ggtitle(paste0(ds$name, " - sample"))
-  pdf(file.path(out_dir, "07_umap_clusters.pdf"), width = 8, height = 6); print(p1); dev.off()
+  p3 <- DimPlot(seu, group.by = "sample") + ggtitle(paste0(ds$name, " - Sample")) + labs(color = "Sample")
+  pdf(file.path(out_dir, "07_umap_clusters_named.pdf"), width = 8, height = 6); print(p1); dev.off()
   pdf(file.path(out_dir, "07_umap_populations.pdf"), width = 11, height = 6); print(p2); dev.off()
   pdf(file.path(out_dir, "07_umap_sample.pdf"), width = 9, height = 6); print(p3); dev.off()
-  if (any(!is.na(seu$singler_label))) {
-    p4 <- DimPlot(seu, group.by = "singler_label", label = TRUE, repel = TRUE, label.size = 3) +
-      ggtitle(paste0(ds$name, " - SingleR"))
-    pdf(file.path(out_dir, "07_umap_singler.pdf"), width = 10, height = 6); print(p4); dev.off()
+  if (any(!is.na(seu$celltype))) {
+    p4 <- DimPlot(seu, group.by = "celltype", label = TRUE, repel = TRUE, label.size = 3) +
+      ggtitle(paste0(ds$name, " - Cell Type (SingleR)")) + labs(color = "Cell Type")
+    pdf(file.path(out_dir, "07_umap_celltypes.pdf"), width = 9, height = 6); print(p4); dev.off()
+    pdf(file.path(out_dir, "07_umap_clusters_named_and_celltypes.pdf"), width = 14, height = 6); print(p1 + p4); dev.off()
   }
   pdf(file.path(out_dir, "07_umap_clusters_and_populations.pdf"), width = 18, height = 6); print(p1 + p2); dev.off()
 
   if (isTRUE(cfg$save_rds)) saveRDS(seu, rds_path)
   msg("Outputs written to %s", out_dir)
-  print(ann[, c("cluster", "n_cells", "population", "panel_score", "singler_majority")])
+  print(ann[, c("cluster", "n_cells", "population", "singler_fraction", "population_panel")])
 
   res <- data.frame(dataset = ds$name, species = ds$species, dir = out_dir, status = "ok",
                     n_samples = length(unique(seu$sample)), n_cells = ncol(seu),
@@ -1001,10 +1080,23 @@ build_consensus_signature <- function(pop, all_markers) {
   df
 }
 
+# canonical panel for a population name from either annotation method
+canonical_signature_for <- function(pop) {
+  if (!is.null(POPULATION_MARKERS[[pop]])) return(POPULATION_MARKERS[[pop]])
+  if (!is.null(EXTRA_SIGNATURES[[pop]]))   return(EXTRA_SIGNATURES[[pop]])
+  panel <- unname(SINGLER_TO_PANEL[pop])
+  if (!is.na(panel)) {
+    if (!is.null(POPULATION_MARKERS[[panel]])) return(POPULATION_MARKERS[[panel]])
+    if (!is.null(EXTRA_SIGNATURES[[panel]]))   return(EXTRA_SIGNATURES[[panel]])
+  }
+  NULL
+}
+
 build_signatures <- function(recurrent, all_markers) {
   out <- list()
   for (pop in recurrent$population) {
-    canon <- POPULATION_MARKERS[[pop]]
+    canon <- canonical_signature_for(pop)
+    if (is.null(canon)) warn_msg("No canonical panel for population '%s'; consensus markers only", pop)
     if (!is.null(canon)) {
       out[[length(out) + 1]] <- data.frame(population = pop, signature_type = "canonical", gene = canon,
                                            n_datasets = NA_integer_, mean_log2FC = NA_real_)

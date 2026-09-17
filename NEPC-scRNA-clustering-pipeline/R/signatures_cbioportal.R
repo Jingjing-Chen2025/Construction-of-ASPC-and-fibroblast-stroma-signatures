@@ -19,10 +19,23 @@ build_consensus_signature <- function(pop, all_markers) {
   df
 }
 
+# canonical panel for a population name from either annotation method
+canonical_signature_for <- function(pop) {
+  if (!is.null(POPULATION_MARKERS[[pop]])) return(POPULATION_MARKERS[[pop]])
+  if (!is.null(EXTRA_SIGNATURES[[pop]]))   return(EXTRA_SIGNATURES[[pop]])
+  panel <- unname(SINGLER_TO_PANEL[pop])
+  if (!is.na(panel)) {
+    if (!is.null(POPULATION_MARKERS[[panel]])) return(POPULATION_MARKERS[[panel]])
+    if (!is.null(EXTRA_SIGNATURES[[panel]]))   return(EXTRA_SIGNATURES[[panel]])
+  }
+  NULL
+}
+
 build_signatures <- function(recurrent, all_markers) {
   out <- list()
   for (pop in recurrent$population) {
-    canon <- POPULATION_MARKERS[[pop]]
+    canon <- canonical_signature_for(pop)
+    if (is.null(canon)) warn_msg("No canonical panel for population '%s'; consensus markers only", pop)
     if (!is.null(canon)) {
       out[[length(out) + 1]] <- data.frame(population = pop, signature_type = "canonical", gene = canon,
                                            n_datasets = NA_integer_, mean_log2FC = NA_real_)

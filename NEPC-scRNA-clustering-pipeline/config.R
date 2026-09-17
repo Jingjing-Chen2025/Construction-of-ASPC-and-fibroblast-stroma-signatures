@@ -17,11 +17,10 @@ cfg <- list(
   min_cells_gene       = 3,
   min_features_cell    = 200,
   max_features_cell    = Inf,     # e.g. 8000 to drop likely doublets
-  max_mito_pct         = 20,
-  nfeatures            = 2000,
-  npcs                 = 30,
-  resolution           = 0.3,
-  umap_min_dist        = 0.3,
+  max_mito_pct         = Inf,     # batch-pipeline setting: no mitochondrial filter (e.g. 20 to enable)
+  nfeatures            = 1000,    # batch-pipeline setting
+  npcs                 = 20,      # batch-pipeline setting
+  resolution           = 0.05,    # batch-pipeline setting
   max_cells_per_sample = Inf,     # e.g. 10000 to subsample huge samples
   chunk_cols           = 2000,    # dense -> sparse conversion chunk size
   min_cells_dataset    = 100,     # abort a dataset with fewer cells after QC
@@ -35,11 +34,19 @@ cfg <- list(
   top_markers_report = 30,
 
   # ---- Part 1: annotation ----
+  # "singler": each cluster is named by the majority SingleR label of its cells
+  #            (celldex HumanPrimaryCellAtlasData / MouseRNAseqData, label.main,
+  #            run on counts) — the batch-pipeline setting. The marker-panel
+  #            label is still computed and reported as population_panel.
+  # "panel":   name clusters by the canonical marker panels instead.
+  annotation_method  = "singler",
+  run_singler        = TRUE,
+  singler_max_cells  = 20000,
+  singler_assay      = "counts",  # batch-pipeline setting ("logcounts" also works)
+  singler_labels     = "label.main",
   ann_min_genes  = 3,             # panel genes that must be detected
   ann_min_score  = 0.30,          # mean z of the winning panel
   ann_min_margin = 0.10,          # winner minus runner-up
-  run_singler        = TRUE,
-  singler_max_cells  = 20000,
   save_rds           = TRUE,
 
   # ---- Part 2: recurrence ----
@@ -142,3 +149,47 @@ POPULATION_MARKERS <- list(
   Adipocyte                   = c("ADIPOQ","LEP","PLIN1","CIDEA","FABP4","CIDEC")
 )
 POPULATION_MARKERS <- lapply(POPULATION_MARKERS, toupper)
+
+# SingleR label.main vocabularies differ between the human (HPCA) and mouse
+# (MouseRNAseq) references; both are mapped onto one shared vocabulary so that a
+# population can be counted across human and mouse datasets. Unlisted labels are
+# normalised automatically (spaces -> "_", plural "cells" -> "cell").
+SINGLER_LABEL_MAP <- c(
+  "T_cells" = "T_cell", "T cells" = "T_cell",
+  "B_cell" = "B_cell", "B cells" = "B_cell", "Pre-B_cell_CD34-" = "B_cell", "Pro-B_cell_CD34+" = "B_cell",
+  "NK_cell" = "NK_cell", "NK cells" = "NK_cell",
+  "Macrophage" = "Macrophage", "Macrophages" = "Macrophage", "Microglia" = "Macrophage",
+  "Monocyte" = "Monocyte", "Monocytes" = "Monocyte",
+  "DC" = "Dendritic_cell", "Dendritic cells" = "Dendritic_cell",
+  "Granulocytes" = "Granulocyte", "Neutrophils" = "Granulocyte", "Myelocyte" = "Granulocyte",
+  "Pro-Myelocyte" = "Granulocyte", "GMP" = "Myeloid_progenitor", "CMP" = "Myeloid_progenitor",
+  "MEP" = "Myeloid_progenitor", "HSC_-G-CSF" = "Myeloid_progenitor", "HSC_CD34+" = "Myeloid_progenitor",
+  "Erythroblast" = "Erythroid", "Erythrocytes" = "Erythroid", "Platelets" = "Platelet",
+  "Fibroblasts" = "Fibroblast",
+  "Endothelial_cells" = "Endothelial_cell", "Endothelial cells" = "Endothelial_cell",
+  "Epithelial_cells" = "Epithelial_cell", "Epithelial cells" = "Epithelial_cell",
+  "Keratinocytes" = "Epithelial_cell", "Hepatocytes" = "Hepatocyte",
+  "Smooth_muscle_cells" = "Smooth_muscle_cell", "Cardiomyocytes" = "Smooth_muscle_cell",
+  "Neurons" = "Neuron", "Neuroepithelial_cell" = "Neuron",
+  "Astrocyte" = "Glia", "Astrocytes" = "Glia", "Oligodendrocytes" = "Glia", "OPCs" = "Glia",
+  "Tissue_stem_cells" = "Tissue_stem_cell", "MSC" = "Tissue_stem_cell",
+  "Chondrocytes" = "Chondrocyte", "Osteoblasts" = "Osteoblast",
+  "Adipocytes" = "Adipocyte",
+  "iPS_cells" = "Stem_cell", "Embryonic_stem_cells" = "Stem_cell"
+)
+
+# Canonical marker panel used for a SingleR-derived population in Part 3.
+SINGLER_TO_PANEL <- c(
+  T_cell = "T_cell", B_cell = "B_cell", NK_cell = "NK_cell",
+  Macrophage = "Macrophage_myeloid", Monocyte = "Macrophage_myeloid", Dendritic_cell = "Dendritic_cell",
+  Granulocyte = "Neutrophil", Erythroid = "Erythroid",
+  Fibroblast = "Fibroblast", Endothelial_cell = "Endothelial",
+  Smooth_muscle_cell = "Smooth_muscle_myofibroblast",
+  Neuron = "Neuroendocrine", Tissue_stem_cell = "ASPC_adipose_progenitor",
+  Adipocyte = "Adipocyte", Epithelial_cell = "Epithelial_cell", Plasma_cell = "Plasma_cell"
+)
+
+# Extra canonical signatures for populations without a panel of their own.
+EXTRA_SIGNATURES <- list(
+  Epithelial_cell = toupper(c("EPCAM","KRT8","KRT18","KRT19","CDH1","CLDN4","CLDN7","KRT5","KRT14","KLK3","AR"))
+)
