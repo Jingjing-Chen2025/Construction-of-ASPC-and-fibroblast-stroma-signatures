@@ -1,0 +1,1343 @@
+# ============================================================================
+# 07_ NEPC scRNA-seq: per-dataset clustering + cell-population annotation,
+#     recurrent populations across datasets, and correlation of their
+#     signatures with the NEPC (Beltran, custom UP) signature in bulk
+#     RNA-seq from PRAD TCGA and prad_su2c_2019 (cBioPortal)
+# ============================================================================
+#
+# INPUT  — seven NEPC dataset folders (one folder = one dataset):
+#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE137829         human
+#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE210358         human
+#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE210358_TKO     mouse
+#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE235036_TKO     mouse
+#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE264573         human
+#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE292074         human
+#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE296986_TKO     mouse
+#
+# PART 1 — per dataset (all samples in the folder are MERGED into one object)
+#   1. Scan the folder and auto-detect samples + their file format
+#      (10x triplets, 10x directories, .h5, custom triplets, dense CSV,
+#       gene-cell tables, flat genes x cells matrices, tar.gz / zip archives)
+#   2. Load each sample; per-cell QC (min features, mitochondrial %)
+#   3. Merge -> NormalizeData -> HVGs -> ScaleData -> PCA -> SNN graph ->
+#      Louvain clustering -> UMAP            (unsupervised clustering)
+#   4. FindAllMarkers for every cluster
+#   5. Cell-subpopulation annotation of every cluster, two independent layers:
+#        (a) PRIMARY  — canonical marker-panel scoring (POPULATION_MARKERS):
+#            cluster-level mean log-normalised expression of each panel gene,
+#            z-scored across clusters, averaged per panel; the best-scoring
+#            panel names the cluster ("Unassigned" if score/margin too low)
+#        (b) SECONDARY — SingleR per-cell reference labels (celldex
+#            HumanPrimaryCellAtlas / MouseRNAseq) summarised to the majority
+#            label per cluster
+#   6. Outputs -> <dataset folder>/07_clustering/
+#
+# PART 2 — recurrent populations
+#   Every annotated population is counted across datasets. Populations seen in
+#   MORE THAN cfg$recurrence_min_datasets datasets (default 3, i.e. >= 4 of 7)
+#   are listed in 07_recurrent_populations.csv. Counting by cluster occurrences
+#   instead of datasets is available via cfg$recurrence_count_by.
+#
+# PART 3 — correlation with the NEPC signature in bulk cohorts
+#   For every recurrent population two signatures are built:
+#        canonical         the known marker panel used for annotation
+#        consensus_markers data-derived markers of that population recurring
+#                          in >= cfg$consensus_min_datasets datasets
+#   Bulk mRNA expression is fetched from the cBioPortal REST API for
+#   prad_tcga and prad_su2c_2019 (local datahub files can be used instead via
+#   cfg$cbio_local_files). Per sample: log2(x + 1) -> gene-wise z-score ->
+#   signature score = mean z over signature genes. Each population score is
+#   correlated (Pearson + Spearman) with the NEPC score across samples; every
+#   signature gene is also correlated individually with the NEPC score.
+#   Outputs -> <NEPC_ROOT>/07_cross_dataset/
+#
+# REQUIRED PACKAGES
+#   Seurat (>= 4; v5 layers handled), SingleR, celldex, SingleCellExperiment,
+#   Matrix, data.table, dplyr, tidyr, tibble, stringr, ggplot2, patchwork,
+#   httr, jsonlite. (hdf5r only if a dataset ships .h5 matrices.)
+#
+# RE-RUNNING
+#   Set cfg$run_part1 / run_part2 / run_part3. Part 1 is skipped for a dataset
+#   whose 07_clustering/07_seurat_annotated.rds already exists when
+#   cfg$reuse_existing = TRUE. Parts 2 and 3 only read Part 1 outputs.
+# ============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(stringr)
+  library(ggplot2)
+  library(patchwork)
+})
+
+set.seed(123)
+options(stringsAsFactors = FALSE, future.globals.maxSize = 8 * 1024^3)
+
+SCRIPT_VERSION <- "07_v1"
+
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+
+msg      <- function(...) cat("[INFO]", sprintf(...), "\n")
+warn_msg <- function(...) cat("[WARN]", sprintf(...), "\n")
+hdr      <- function(...) cat("\n========================================\n",
+                              sprintf(...), "\n========================================\n", sep = "")
+
+# ---- raise the macOS vector memory ceiling if the R build supports it -----
+if (exists("mem.maxVSize")) {
+  cur <- try(mem.maxVSize(), silent = TRUE)
+  if (!inherits(cur, "try-error")) {
+    try(mem.maxVSize(vsize = 64 * 1024), silent = TRUE)
+  }
+}
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+NEPC_ROOT <- "/Volumes/Jingjing_Chen/NEPC scRNA dataset"
+OUT_CROSS <- file.path(NEPC_ROOT, "07_cross_dataset")
+
+cfg <- list(
+  run_part1 = TRUE,
+  run_part2 = TRUE,
+  run_part3 = TRUE,
+  reuse_existing = TRUE,          # skip Part 1 for datasets already processed
+
+  # ---- Part 1: QC + clustering ----
+  min_cells_gene       = 3,
+  min_features_cell    = 200,
+  max_features_cell    = Inf,     # e.g. 8000 to drop likely doublets
+  max_mito_pct         = 20,
+  nfeatures            = 2000,
+  npcs                 = 30,
+  resolution           = 0.3,
+  umap_min_dist        = 0.3,
+  max_cells_per_sample = Inf,     # e.g. 10000 to subsample huge samples
+  chunk_cols           = 2000,    # dense -> sparse conversion chunk size
+
+  # ---- Part 1: markers ----
+  marker_min_pct   = 0.25,
+  marker_logfc     = 0.25,
+  marker_p_adj     = 0.05,
+  top_markers_report = 30,
+
+  # ---- Part 1: annotation ----
+  ann_min_genes  = 3,             # panel genes that must be detected
+  ann_min_score  = 0.30,          # mean z of the winning panel
+  ann_min_margin = 0.10,          # winner minus runner-up
+  run_singler        = TRUE,
+  singler_max_cells  = 20000,
+  save_rds           = TRUE,
+
+  # ---- Part 2: recurrence ----
+  recurrence_min_datasets = 3,    # populations in MORE THAN this many datasets
+  recurrence_count_by     = "datasets",   # "datasets" | "clusters"
+
+  # ---- Part 3: signatures ----
+  consensus_min_datasets = 2,
+  consensus_top_n        = 50,
+  exclude_gene_regex     = "^(MT-|RP[SL][0-9]|RPLP|MRP[SL]|HB[AB])",
+  exclude_nepc_genes_from_signatures = TRUE,   # avoid circular overlap
+
+  # ---- Part 3: cBioPortal ----
+  cbio_base      = "https://www.cbioportal.org/api",
+  cbio_timeout   = 180,
+  cbio_retries   = 4,
+  cbio_use_cache = TRUE,
+  cbio_gene_batch = 200,
+  cbio_studies = list(
+    prad_tcga = list(
+      study_id = "prad_tcga",
+      label    = "PRAD TCGA",
+      # explicit profile wins; otherwise these patterns are tried in order,
+      # then any non-z-score MRNA_EXPRESSION profile
+      profile_id       = NULL,
+      profile_patterns = c("rna_seq_v2_mrna$", "rna_seq_mrna$", "mrna_seq_fpkm", "mrna$")
+    ),
+    prad_su2c_2019 = list(
+      study_id = "prad_su2c_2019",
+      label    = "SU2C/PCF 2019 (mCRPC)",
+      profile_id       = NULL,
+      profile_patterns = c("fpkm_polya$", "polya$", "fpkm_capture$", "capture$",
+                           "rna_seq_mrna$", "mrna$")
+    )
+  ),
+  # Optional offline fallback: named list study_id -> path to a cBioPortal
+  # datahub expression file (data_mrna_seq_v2_rsem.txt / data_mrna_seq_fpkm*.txt)
+  cbio_local_files = list(),
+
+  min_samples_cor = 10
+)
+
+datasets <- list(
+  list(name = "GSE137829",     dir = file.path(NEPC_ROOT, "GSE137829"),     species = "human"),
+  list(name = "GSE210358",     dir = file.path(NEPC_ROOT, "GSE210358"),     species = "human"),
+  list(name = "GSE210358_TKO", dir = file.path(NEPC_ROOT, "GSE210358_TKO"), species = "mouse"),
+  list(name = "GSE235036_TKO", dir = file.path(NEPC_ROOT, "GSE235036_TKO"), species = "mouse"),
+  list(name = "GSE264573",     dir = file.path(NEPC_ROOT, "GSE264573"),     species = "human"),
+  list(name = "GSE292074",     dir = file.path(NEPC_ROOT, "GSE292074"),     species = "human"),
+  list(name = "GSE296986_TKO", dir = file.path(NEPC_ROOT, "GSE296986_TKO"), species = "mouse")
+)
+
+# ============================================================================
+# SIGNATURES
+# ============================================================================
+NEPC_BELTRAN_CUSTOM_UP <- toupper(c(
+  "ASXL3","CAND2","ETV5","GPX2","JAKMIP2","KIAA0408","SOGA3","TRIM9","BRINP1",
+  "C7ORF76","GNAO1","KCNB2","KCND2","LRRC16B","MAP10","NRSN1",
+  "PCSK1","PROX1","RGS7","SCG3","SEC11C","SEZ6","ST8SIA3","SVOP","SYT11",
+  "AURKA","DNMT1","EZH2","MYCN"
+))
+
+# Symbols that cBioPortal may know under a different HUGO name. Tried only
+# when the primary symbol is not found.
+GENE_ALIASES <- c(
+  LRRC16B  = "CARMIL3",
+  C7ORF76  = "C7orf76",
+  KIAA0408 = "KIAA0408",
+  ACPP     = "ACP3",
+  FAM64A   = "PIMREG",
+  WISP2    = "CCN5",
+  CTGF     = "CCN2",
+  CYR61    = "CCN1"
+)
+
+# Canonical marker panels used for cluster annotation (human symbols; mouse
+# symbols are matched after toupper()). Each panel = one candidate population.
+POPULATION_MARKERS <- list(
+  Luminal_epithelial          = c("KLK3","KLK2","AR","NKX3-1","TMPRSS2","KRT8","KRT18","EPCAM","FOLH1","MSMB","ACPP"),
+  Basal_epithelial            = c("KRT5","KRT14","KRT15","TP63","DST","LGALS7","KRT17"),
+  Club_Hillock_epithelial     = c("SCGB1A1","SCGB3A1","PIGR","KRT13","KRT4","LTF","MMP7","WFDC2"),
+  Neuroendocrine              = c("CHGA","CHGB","SYP","ENO2","ASCL1","INSM1","NCAM1","SCG2","SCG3","NEUROD1","FOXA2","PCSK1","SOX2","STMN2","TUBB3"),
+  Cycling                     = c("MKI67","TOP2A","CENPF","BIRC5","UBE2C","CCNB1","STMN1","TYMS"),
+  Fibroblast                  = c("COL1A1","COL1A2","COL3A1","DCN","LUM","PDGFRA","FBLN1","C7","APOD","SFRP2"),
+  ASPC_adipose_progenitor     = c("PDGFRA","DPP4","PI16","CD34","CD55","ANXA3","WNT2","CD248","SEMA3C","MFAP5","CLEC3B","IGFBP6"),
+  Smooth_muscle_myofibroblast = c("ACTA2","MYH11","TAGLN","CNN1","DES","MYL9","ACTG2","TPM2"),
+  Pericyte                    = c("RGS5","PDGFRB","MCAM","NOTCH3","KCNJ8","ABCC9","HIGD1B"),
+  Endothelial                 = c("PECAM1","VWF","CDH5","CLDN5","FLT1","KDR","EMCN","PLVAP"),
+  Lymphatic_endothelial       = c("PROX1","LYVE1","PDPN","CCL21","FLT4","MMRN1"),
+  T_cell                      = c("CD3D","CD3E","CD3G","CD2","TRAC","CD8A","CD4","IL7R","CD7"),
+  NK_cell                     = c("NKG7","GNLY","KLRD1","KLRF1","NCR1","PRF1","GZMB"),
+  B_cell                      = c("MS4A1","CD79A","CD79B","CD19","BANK1","PAX5"),
+  Plasma_cell                 = c("MZB1","JCHAIN","SDC1","XBP1","IGKC","TNFRSF17","PRDM1"),
+  Macrophage_myeloid          = c("CD68","CD14","LYZ","C1QA","C1QB","CD163","AIF1","FCGR3A","CSF1R","MS4A7"),
+  Dendritic_cell              = c("CLEC9A","CD1C","FCER1A","LAMP3","IRF8","CLEC10A","XCR1"),
+  Mast_cell                   = c("TPSAB1","TPSB2","CPA3","KIT","MS4A2","HDC"),
+  Neutrophil                  = c("S100A8","S100A9","CSF3R","FCGR3B","CXCR2","G0S2","RETNLG"),
+  Schwann_neural              = c("PLP1","S100B","MPZ","SOX10","NGFR","CDH19"),
+  Erythroid                   = c("HBB","HBA1","HBA2","ALAS2","HBA-A1","HBA-A2","HBB-BS"),
+  Adipocyte                   = c("ADIPOQ","LEP","PLIN1","CIDEA","FABP4","CIDEC")
+)
+POPULATION_MARKERS <- lapply(POPULATION_MARKERS, toupper)
+
+# ============================================================================
+# GENERIC HELPERS
+# ============================================================================
+sanitize_gene_names <- function(x) {
+  x <- str_trim(as.character(x))
+  x <- gsub("﻿", "", x, fixed = TRUE)
+  x <- gsub("\r", "", x, fixed = TRUE)
+  x <- gsub('"', "", x, fixed = TRUE)
+  x[x == "" | is.na(x)] <- "NA_FEATURE"
+  x
+}
+
+sanitize_cell_names <- function(x) {
+  x <- str_trim(as.character(x))
+  x <- gsub("﻿", "", x, fixed = TRUE)
+  x <- gsub("\r", "", x, fixed = TRUE)
+  x <- gsub('"', "", x, fixed = TRUE)
+  x[x == "" | is.na(x)] <- "NA_CELL"
+  x
+}
+
+collapse_duplicate_features <- function(mat) {
+  rn <- rownames(mat)
+  if (is.null(rn) || !any(duplicated(rn))) return(mat)
+  msg("  Collapsing %d duplicated feature name(s).", sum(duplicated(rn)))
+  f <- factor(rn, levels = unique(rn))
+  G <- Matrix::sparse.model.matrix(~ 0 + f)
+  agg <- Matrix::t(G) %*% mat
+  rownames(agg) <- levels(f)
+  as(agg, "dgCMatrix")
+}
+
+finalize_matrix <- function(mat) {
+  if (!inherits(mat, "dgCMatrix")) mat <- as(as(mat, "CsparseMatrix"), "dgCMatrix")
+  rownames(mat) <- sanitize_gene_names(rownames(mat))
+  colnames(mat) <- make.unique(sanitize_cell_names(colnames(mat)))
+  collapse_duplicate_features(mat)
+}
+
+open_maybe_gz <- function(path) if (grepl("\\.gz$", path)) gzfile(path) else file(path)
+
+peek_lines <- function(path, n = 5) {
+  con <- open_maybe_gz(path)
+  on.exit(close(con), add = TRUE)
+  readLines(con, n = n, warn = FALSE)
+}
+
+detect_sep <- function(lines) {
+  if (!length(lines)) return("\t")
+  counts <- c(
+    "\t" = max(lengths(strsplit(lines, "\t", fixed = TRUE))) - 1,
+    ","  = max(lengths(strsplit(lines, ",",  fixed = TRUE))) - 1,
+    " "  = max(lengths(strsplit(lines, " ",  fixed = TRUE))) - 1
+  )
+  names(which.max(counts))
+}
+
+looks_like_barcodes <- function(x, n = 200) {
+  x <- head(as.character(x), n)
+  if (!length(x)) return(FALSE)
+  frac_acgt <- mean(grepl("^[ACGTN]{8,}(-[0-9]+)?$", toupper(x)))
+  frac_long <- mean(nchar(x) >= 14)
+  frac_acgt > 0.5 || frac_long > 0.7
+}
+
+sniff_table <- function(path, sample_name) {
+  lines <- peek_lines(path, n = 3)
+  sep <- detect_sep(lines)
+  hdr_n  <- length(strsplit(lines[1], sep, fixed = TRUE)[[1]])
+  data_n <- if (length(lines) >= 2) length(strsplit(lines[2], sep, fixed = TRUE)[[1]]) else hdr_n
+  list(sep = sep, header_fields = hdr_n, data_fields = data_n, offset = (data_n == hdr_n + 1))
+}
+
+df_to_sparse_by_chunks <- function(df, chunk = cfg$chunk_cols, label = "") {
+  nc <- ncol(df)
+  if (nc == 0) stop("No numeric columns to convert (", label, ")")
+  starts <- seq(1, nc, by = chunk)
+  blocks <- vector("list", length(starts))
+  for (i in seq_along(starts)) {
+    a <- starts[i]; b <- min(a + chunk - 1, nc)
+    blk <- as.matrix(df[, a:b, drop = FALSE])
+    suppressWarnings(storage.mode(blk) <- "double")
+    blk[is.na(blk)] <- 0
+    blocks[[i]] <- as(as(blk, "CsparseMatrix"), "dgCMatrix")
+    rm(blk)
+    if (i %% 5 == 0 || i == length(starts)) gc(verbose = FALSE)
+  }
+  out <- if (length(blocks) == 1) blocks[[1]] else do.call(cbind, blocks)
+  rm(blocks); gc(verbose = FALSE)
+  out
+}
+
+# Seurat v4 / v5 compatibility -------------------------------------------------
+join_layers_safe <- function(obj) {
+  if (exists("JoinLayers", envir = asNamespace("Seurat"), inherits = FALSE)) {
+    tryCatch(JoinLayers(obj), error = function(e) obj)
+  } else obj
+}
+
+get_data_layer <- function(obj, assay = "RNA") {
+  tryCatch(GetAssayData(obj, assay = assay, layer = "data"),
+           error = function(e) GetAssayData(obj, assay = assay, slot = "data"))
+}
+
+get_counts_layer <- function(obj, assay = "RNA") {
+  tryCatch(GetAssayData(obj, assay = assay, layer = "counts"),
+           error = function(e) GetAssayData(obj, assay = assay, slot = "counts"))
+}
+
+# ============================================================================
+# READERS — each returns a dgCMatrix (genes x cells)
+# ============================================================================
+read_triplet_10x <- function(barcodes, features, matrix_mtx, sample_name) {
+  bc <- readLines(open_maybe_gz(barcodes))
+  bc <- make.unique(sanitize_cell_names(bc))
+  ft <- data.table::fread(features, header = FALSE)
+  genes <- if (ncol(ft) >= 2) ft[[2]] else ft[[1]]
+  genes <- sanitize_gene_names(genes)
+  m <- as(as(Matrix::readMM(open_maybe_gz(matrix_mtx)), "CsparseMatrix"), "dgCMatrix")
+  if (nrow(m) != length(genes) || ncol(m) != length(bc)) {
+    if (ncol(m) == length(genes) && nrow(m) == length(bc)) {
+      msg("  %s: matrix transposed; correcting.", sample_name)
+      m <- Matrix::t(m)
+    } else {
+      stop(sprintf("Dimension mismatch for %s: matrix %dx%d, features %d, barcodes %d",
+                   sample_name, nrow(m), ncol(m), length(genes), length(bc)))
+    }
+  }
+  rownames(m) <- genes; colnames(m) <- bc
+  finalize_matrix(m)
+}
+
+read_dir_10x <- function(dir_path, sample_name) {
+  mtx <- list.files(dir_path, pattern = "matrix\\.mtx(\\.gz)?$", recursive = TRUE, full.names = TRUE)
+  if (!length(mtx)) stop("No matrix.mtx in directory: ", dir_path)
+  mat_dir <- dirname(mtx[1])
+  bc <- list.files(mat_dir, pattern = "barcodes\\.tsv(\\.gz)?$", full.names = TRUE)
+  ft <- list.files(mat_dir, pattern = "(features|genes)\\.tsv(\\.gz)?$", full.names = TRUE)
+  if (!length(bc) || !length(ft)) stop("Incomplete 10x directory: ", mat_dir)
+  read_triplet_10x(bc[1], ft[1], mtx[1], sample_name)
+}
+
+read_h5_10x <- function(path, sample_name) {
+  if (!requireNamespace("hdf5r", quietly = TRUE)) stop("hdf5r is required to read ", basename(path))
+  m <- Seurat::Read10X_h5(path)
+  if (is.list(m)) {
+    nm <- names(m)
+    pick <- if ("Gene Expression" %in% nm) "Gene Expression" else nm[1]
+    msg("  %s: multi-modal h5, using '%s'", sample_name, pick)
+    m <- m[[pick]]
+  }
+  finalize_matrix(m)
+}
+
+read_triplet_custom <- function(barcode_csv, genes_csv, counts_mtx, sample_name) {
+  bc_df <- data.table::fread(cmd = paste("gzip -cdf", shQuote(barcode_csv)), data.table = FALSE)
+  bc <- if (ncol(bc_df) == 1) bc_df[[1]] else bc_df[[ncol(bc_df)]]
+  bc <- make.unique(sanitize_cell_names(bc))
+  g_df <- data.table::fread(cmd = paste("gzip -cdf", shQuote(genes_csv)), data.table = FALSE)
+  genes <- if (ncol(g_df) == 1) g_df[[1]] else g_df[[ncol(g_df)]]
+  genes <- sanitize_gene_names(genes)
+  m <- as(as(Matrix::readMM(open_maybe_gz(counts_mtx)), "CsparseMatrix"), "dgCMatrix")
+  if (nrow(m) == length(genes) && ncol(m) == length(bc)) {
+    rownames(m) <- genes; colnames(m) <- bc
+  } else if (ncol(m) == length(genes) && nrow(m) == length(bc)) {
+    msg("  %s: matrix transposed; correcting.", sample_name)
+    m <- Matrix::t(m); rownames(m) <- genes; colnames(m) <- bc
+  } else {
+    stop(sprintf("Dimension mismatch for %s: matrix %dx%d, genes %d, barcodes %d",
+                 sample_name, nrow(m), ncol(m), length(genes), length(bc)))
+  }
+  finalize_matrix(m)
+}
+
+read_dense_csv <- function(path, sample_name) {
+  dt <- data.table::fread(cmd = paste("gzip -cdf", shQuote(path)), data.table = FALSE)
+  if (!("V1" %in% colnames(dt))) colnames(dt)[1] <- "V1"
+  cells <- make.unique(sanitize_cell_names(dt[["V1"]]))
+  drop  <- intersect(c("V1", "CLUSTER", "Cluster", "cluster"), colnames(dt))
+  keep  <- setdiff(colnames(dt), drop)
+  genes <- sanitize_gene_names(keep)
+  sp <- df_to_sparse_by_chunks(dt[, keep, drop = FALSE], label = sample_name)
+  rm(dt); gc(verbose = FALSE)
+  rownames(sp) <- cells
+  colnames(sp) <- genes
+  msg("  %s: dense_csv %d cells x %d genes -> transposing.", sample_name, nrow(sp), ncol(sp))
+  finalize_matrix(Matrix::t(sp))
+}
+
+read_gene_cell_table <- function(path, sample_name) {
+  dt <- data.table::fread(cmd = paste("gzip -cdf", shQuote(path)), data.table = FALSE)
+  nms <- colnames(dt)
+  if (!all(c("Gene_ID", "Symbol") %in% nms)) stop("Unrecognised gene_cell_exprs_table format: ", basename(path))
+  genes <- sanitize_gene_names(dt[["Symbol"]])
+  keep  <- setdiff(nms, c("Gene_ID", "Symbol"))
+  sp <- df_to_sparse_by_chunks(dt[, keep, drop = FALSE], label = sample_name)
+  rm(dt); gc(verbose = FALSE)
+  rownames(sp) <- genes
+  colnames(sp) <- make.unique(sanitize_cell_names(keep))
+  finalize_matrix(sp)
+}
+
+read_matrix_flat <- function(path, sample_name) {
+  sn <- sniff_table(path, sample_name)
+  read_try <- function(sep, header_offset) {
+    args <- list(cmd = paste("gzip -cdf", shQuote(path)), sep = sep,
+                 data.table = FALSE, showProgress = FALSE)
+    if (header_offset) {
+      args$header <- FALSE
+      d <- do.call(data.table::fread, args)
+      hd <- as.character(unlist(d[1, ]))
+      d <- d[-1, , drop = FALSE]
+      hd <- hd[!is.na(hd) & hd != ""]
+      colnames(d) <- c("GENE", hd)[seq_len(ncol(d))]
+      d
+    } else {
+      args$header <- TRUE
+      do.call(data.table::fread, args)
+    }
+  }
+  dt <- NULL
+  attempts <- list(
+    list(sep = sn$sep, off = sn$offset), list(sep = sn$sep, off = !sn$offset),
+    list(sep = "\t", off = FALSE), list(sep = ",", off = FALSE),
+    list(sep = " ", off = TRUE), list(sep = " ", off = FALSE)
+  )
+  for (a in attempts) {
+    dt <- tryCatch(read_try(a$sep, a$off), error = function(e) NULL)
+    if (!is.null(dt) && ncol(dt) >= 2 && nrow(dt) >= 2) break
+    dt <- NULL
+  }
+  if (is.null(dt)) stop("Could not parse flat matrix: ", basename(path))
+  ids  <- sanitize_gene_names(dt[[1]])
+  keep <- colnames(dt)[-1]
+  sp <- df_to_sparse_by_chunks(dt[, keep, drop = FALSE], label = sample_name)
+  rm(dt); gc(verbose = FALSE)
+  rownames(sp) <- ids
+  colnames(sp) <- make.unique(sanitize_cell_names(keep))
+  if (looks_like_barcodes(rownames(sp)) && !looks_like_barcodes(colnames(sp))) {
+    msg("  %s: row IDs look like barcodes -> transposing.", sample_name)
+    sp <- Matrix::t(sp)
+  }
+  finalize_matrix(sp)
+}
+
+read_labelled_csv <- function(path, sample_name) {
+  sn <- sniff_table(path, sample_name)
+  dt <- data.table::fread(cmd = paste("gzip -cdf", shQuote(path)), sep = sn$sep,
+                          data.table = FALSE, showProgress = FALSE)
+  if (ncol(dt) < 2) stop("Labelled CSV has < 2 columns: ", basename(path))
+  if (!nzchar(colnames(dt)[1]) || colnames(dt)[1] %in% c("V1", "")) colnames(dt)[1] <- "ROWID"
+  rowid <- make.unique(sanitize_cell_names(dt[[1]]))
+  is_num <- vapply(dt[-1], function(v) {
+    if (is.numeric(v)) return(TRUE)
+    mean(!is.na(suppressWarnings(as.numeric(head(v, 500))))) > 0.9
+  }, logical(1))
+  keep <- names(is_num)[is_num]
+  if (!length(keep)) stop("No numeric columns found in ", basename(path), " (annotation table, not expression)")
+  sp <- df_to_sparse_by_chunks(dt[, keep, drop = FALSE], label = sample_name)
+  rm(dt); gc(verbose = FALSE)
+  rownames(sp) <- rowid
+  colnames(sp) <- sanitize_gene_names(keep)
+  row_bc <- looks_like_barcodes(rownames(sp)); col_bc <- looks_like_barcodes(colnames(sp))
+  if (row_bc && !col_bc) {
+    sp <- Matrix::t(sp)
+  } else if (!row_bc && !col_bc && ncol(sp) > nrow(sp)) {
+    msg("  %s: more columns than rows -> transposing (shape heuristic).", sample_name)
+    sp <- Matrix::t(sp)
+  }
+  finalize_matrix(sp)
+}
+
+read_archive <- function(path, sample_name, kind = c("tar", "zip")) {
+  kind <- match.arg(kind)
+  exdir <- file.path(tempdir(), paste0("ex_", gsub("[^A-Za-z0-9_]", "_", sample_name), "_", as.integer(Sys.time())))
+  dir.create(exdir, recursive = TRUE, showWarnings = FALSE)
+  on.exit(unlink(exdir, recursive = TRUE, force = TRUE), add = TRUE)
+  if (kind == "tar") utils::untar(path, exdir = exdir) else utils::unzip(path, exdir = exdir)
+  read_dir_10x(exdir, sample_name)
+}
+
+# ============================================================================
+# SAMPLE DISCOVERY
+# ============================================================================
+ANNOTATION_ONLY_PATTERNS <- paste(
+  "rename_cluster", "TCRresult", "TCR_result", "tcr", "cell_annotation", "cellannotation",
+  "_metadata", "metadata_", "clonotype", "barcode_annotation", sep = "|")
+
+PIPELINE_OUTPUT_PATTERNS <- paste0(
+  "^(metadata_merged|sample_summary|cluster_counts|sample_manifest|batch_run_log|",
+  "matrix_file_comparison|cluster\\.markers|seurat_merged|umap_|07_|tau_|ratio_|target_markers)")
+
+scan_dataset <- function(dir_path) {
+  files <- list.files(dir_path, full.names = FALSE, recursive = FALSE)
+  files <- files[!grepl("^\\.", files)]
+  samples <- list(); claimed <- character(0)
+  add <- function(s) samples[[length(samples) + 1]] <<- s
+
+  # --- 10x triplets: <pfx>_barcodes.tsv(.gz) + _features/_genes + _matrix.mtx ---
+  bc10x <- grep("_barcodes\\.tsv(\\.gz)?$", files, value = TRUE)
+  for (b in bc10x) {
+    pfx <- sub("_barcodes\\.tsv(\\.gz)?$", "", b)
+    f <- grep(paste0("^", pfx, "_(features|genes)\\.tsv(\\.gz)?$"), files, value = TRUE)
+    m <- grep(paste0("^", pfx, "_matrix\\.mtx(\\.gz)?$"), files, value = TRUE)
+    if (length(f) && length(m)) {
+      add(list(sample_id = pfx, type = "triplet_10x", barcodes = file.path(dir_path, b),
+               features = file.path(dir_path, f[1]), matrix = file.path(dir_path, m[1])))
+      claimed <- c(claimed, b, f[1], m[1])
+    }
+  }
+  # --- custom triplets: .barcode.csv / .genes.csv / .counts.mtx ---
+  bccus <- grep("\\.barcode\\.csv(\\.gz)?$", files, value = TRUE)
+  for (b in bccus) {
+    pfx <- sub("\\.barcode\\.csv(\\.gz)?$", "", b)
+    g <- grep(paste0("^", pfx, "\\.genes\\.csv(\\.gz)?$"), files, value = TRUE)
+    m <- grep(paste0("^", pfx, "\\.counts\\.mtx(\\.gz)?$"), files, value = TRUE)
+    if (length(g) && length(m)) {
+      add(list(sample_id = pfx, type = "triplet_custom", barcodes = file.path(dir_path, b),
+               features = file.path(dir_path, g[1]), matrix = file.path(dir_path, m[1])))
+      claimed <- c(claimed, b, g[1], m[1])
+    }
+  }
+  # --- single files, archives and 10x sub-directories ---
+  for (f in setdiff(files, claimed)) {
+    fp <- file.path(dir_path, f)
+    if (grepl(PIPELINE_OUTPUT_PATTERNS, f)) next
+    if (dir.exists(fp)) {
+      has_mtx <- length(list.files(fp, pattern = "matrix\\.mtx(\\.gz)?$", recursive = TRUE)) > 0
+      if (has_mtx) add(list(sample_id = f, type = "dir_10x", path = fp))
+      next
+    }
+    if (grepl("\\.(rds|rda|RData)(\\.gz)?$", f, ignore.case = TRUE)) next
+    if (grepl("\\.(pdf|log|md|json|png|jpg|xlsx|xls|html|R|r|py)$", f)) next
+    if (grepl(ANNOTATION_ONLY_PATTERNS, f, ignore.case = TRUE)) next
+
+    ty <- if (grepl("\\.h5$", f))                                         "h5_10x"
+    else if (grepl("_dense\\.csv\\.gz$", f))                              "dense_csv"
+    else if (grepl("_gene_cell_exprs_table\\.txt\\.gz$", f))              "gene_cell_table"
+    else if (grepl("(_dge|data\\.raw\\.matrix|data\\.matrix|counts?|matrix|expr)\\.(txt|tsv)(\\.gz)?$", f, ignore.case = TRUE)) "matrix_txt"
+    else if (grepl("\\.count(s)?\\.csv(\\.gz)?$", f))                     "matrix_csv"
+    else if (grepl("\\.tar\\.gz$|\\.tgz$", f))                            "archive_tar"
+    else if (grepl("\\.zip$", f))                                         "archive_zip"
+    else if (grepl("\\.csv(\\.gz)?$", f))                                 "labelled_csv"
+    else NA_character_
+    if (is.na(ty)) next
+
+    sid <- f
+    sid <- sub("_dense\\.csv\\.gz$", "", sid)
+    sid <- sub("_gene_cell_exprs_table\\.txt\\.gz$", "", sid)
+    sid <- sub("_filtered_feature_bc_matrix", "", sid)
+    sid <- sub("_raw_feature_bc_matrix", "", sid)
+    sid <- sub("\\.count(s)?\\.csv(\\.gz)?$", "", sid)
+    sid <- sub("(_dge)?\\.(txt|tsv)(\\.gz)?$", "", sid)
+    sid <- sub("\\.csv(\\.gz)?$", "", sid)
+    sid <- sub("\\.tar\\.gz$|\\.tgz$|\\.zip$|\\.h5$", "", sid)
+    add(list(sample_id = sid, type = ty, path = fp))
+  }
+  samples
+}
+
+load_sample <- function(s, ds) {
+  m <- switch(s$type,
+    triplet_10x     = read_triplet_10x(s$barcodes, s$features, s$matrix, s$sample_id),
+    triplet_custom  = read_triplet_custom(s$barcodes, s$features, s$matrix, s$sample_id),
+    dir_10x         = read_dir_10x(s$path, s$sample_id),
+    h5_10x          = read_h5_10x(s$path, s$sample_id),
+    dense_csv       = read_dense_csv(s$path, s$sample_id),
+    gene_cell_table = read_gene_cell_table(s$path, s$sample_id),
+    matrix_txt      = read_matrix_flat(s$path, s$sample_id),
+    matrix_csv      = read_matrix_flat(s$path, s$sample_id),
+    labelled_csv    = read_labelled_csv(s$path, s$sample_id),
+    archive_tar     = read_archive(s$path, s$sample_id, "tar"),
+    archive_zip     = read_archive(s$path, s$sample_id, "zip"),
+    stop("Unknown sample type: ", s$type)
+  )
+  if (is.finite(cfg$max_cells_per_sample) && ncol(m) > cfg$max_cells_per_sample) {
+    msg("  %s: subsampling %d -> %d cells.", s$sample_id, ncol(m), cfg$max_cells_per_sample)
+    m <- m[, sample(colnames(m), cfg$max_cells_per_sample), drop = FALSE]
+  }
+  colnames(m) <- paste0(s$sample_id, "__", colnames(m))
+
+  seu <- CreateSeuratObject(counts = m, project = s$sample_id,
+                            min.cells = cfg$min_cells_gene, min.features = cfg$min_features_cell)
+  rm(m); gc(verbose = FALSE)
+
+  # ---- per-cell QC ----
+  mt_pattern <- if (identical(ds$species, "mouse")) "^mt-" else "^MT-"
+  n_mt <- sum(grepl(mt_pattern, rownames(seu)))
+  seu$percent.mt <- if (n_mt > 0) PercentageFeatureSet(seu, pattern = mt_pattern)[, 1] else rep(0, ncol(seu))
+  n_before <- ncol(seu)
+  keep <- seu$percent.mt <= cfg$max_mito_pct & seu$nFeature_RNA <= cfg$max_features_cell
+  if (any(!keep)) seu <- subset(seu, cells = colnames(seu)[keep])
+  msg("  QC %s: %d -> %d cells (mito > %g%% or nFeature > %s removed; %d MT genes)",
+      s$sample_id, n_before, ncol(seu), cfg$max_mito_pct, format(cfg$max_features_cell), n_mt)
+
+  seu$sample  <- s$sample_id
+  seu$dataset <- ds$name
+  seu$species <- ds$species
+  seu
+}
+
+# ============================================================================
+# CLUSTER ANNOTATION
+# ============================================================================
+# cluster x panel score matrix: mean log-normalised expression per cluster,
+# z-scored per gene across clusters, averaged over the panel genes.
+cluster_panel_scores <- function(seu, panels, cluster_col = "seurat_clusters") {
+  dat <- get_data_layer(seu)
+  cl  <- as.character(seu@meta.data[[cluster_col]])
+  lv  <- unique(cl)
+  num <- suppressWarnings(as.numeric(lv))
+  lv  <- if (!anyNA(num)) lv[order(num)] else sort(lv)
+  cl  <- factor(cl, levels = lv)
+  # cell x cluster indicator matrix (works for a single cluster too)
+  G   <- Matrix::sparseMatrix(i = seq_along(cl), j = as.integer(cl), x = 1,
+                              dims = c(length(cl), nlevels(cl)))
+  n_per <- Matrix::colSums(G)
+
+  genes_up    <- toupper(rownames(dat))
+  panel_genes <- unique(unlist(panels))
+  keep <- which(genes_up %in% panel_genes)
+  keep <- keep[!duplicated(genes_up[keep])]
+  if (!length(keep)) stop("None of the panel genes are present in the expression matrix.")
+
+  means <- as.matrix(dat[keep, , drop = FALSE] %*% G)
+  means <- sweep(means, 2, n_per, "/")
+  rownames(means) <- genes_up[keep]
+  colnames(means) <- levels(cl)
+
+  z <- if (ncol(means) > 1) t(scale(t(means))) else means
+  z[!is.finite(z)] <- 0
+
+  scores <- vapply(names(panels), function(p) {
+    g <- intersect(panels[[p]], rownames(z))
+    if (length(g) < cfg$ann_min_genes) return(rep(NA_real_, ncol(z)))
+    colMeans(z[g, , drop = FALSE])
+  }, numeric(ncol(z)))
+  scores <- matrix(scores, nrow = ncol(z), dimnames = list(colnames(z), names(panels)))
+
+  detected <- vapply(names(panels), function(p) length(intersect(panels[[p]], rownames(z))), integer(1))
+  list(scores = scores, cluster_means = means, detected = detected)
+}
+
+assign_population <- function(scores) {
+  rows <- lapply(seq_len(nrow(scores)), function(i) {
+    s <- scores[i, ]; s <- s[!is.na(s)]
+    if (!length(s)) {
+      return(data.frame(cluster = rownames(scores)[i], population = "Unassigned",
+                        best_panel = NA_character_, panel_score = NA_real_,
+                        runner_up = NA_character_, runner_up_score = NA_real_, margin = NA_real_))
+    }
+    o <- order(s, decreasing = TRUE)
+    top <- unname(s[o[1]])
+    second <- if (length(s) > 1) unname(s[o[2]]) else NA_real_
+    margin <- if (is.na(second)) top else top - second
+    lab <- if (top >= cfg$ann_min_score && margin >= cfg$ann_min_margin) names(s)[o[1]] else "Unassigned"
+    data.frame(cluster = rownames(scores)[i], population = lab,
+               best_panel = names(s)[o[1]], panel_score = top,
+               runner_up = if (length(s) > 1) names(s)[o[2]] else NA_character_,
+               runner_up_score = second, margin = margin)
+  })
+  bind_rows(rows)
+}
+
+get_singler_ref <- function(species) {
+  if (identical(species, "mouse")) celldex::MouseRNAseqData() else celldex::HumanPrimaryCellAtlasData()
+}
+
+run_singler <- function(seu, species) {
+  if (!requireNamespace("SingleR", quietly = TRUE) || !requireNamespace("celldex", quietly = TRUE) ||
+      !requireNamespace("SingleCellExperiment", quietly = TRUE)) {
+    warn_msg("SingleR / celldex / SingleCellExperiment not installed; skipping reference annotation.")
+    return(NULL)
+  }
+  tryCatch({
+    obj <- seu
+    if (ncol(obj) > cfg$singler_max_cells) {
+      msg("  Downsampling to %d cells for SingleR.", cfg$singler_max_cells)
+      obj <- subset(obj, cells = sample(colnames(obj), cfg$singler_max_cells))
+    }
+    sce <- suppressWarnings(Seurat::as.SingleCellExperiment(obj))
+    ref <- get_singler_ref(species)
+    msg("  SingleR reference: %s", if (species == "mouse") "MouseRNAseqData" else "HumanPrimaryCellAtlasData")
+    sr  <- SingleR::SingleR(test = sce, ref = ref, labels = ref$label.main, assay.type.test = "logcounts")
+    out <- setNames(sr$labels, colnames(obj))
+    rm(sce, obj, sr); gc(verbose = FALSE)
+    out
+  }, error = function(e) { warn_msg("  SingleR failed: %s", conditionMessage(e)); NULL })
+}
+
+# ============================================================================
+# PART 1 — per-dataset clustering + annotation
+# ============================================================================
+process_dataset <- function(ds) {
+  hdr("DATASET: %s (%s)", ds$name, ds$species)
+  if (!dir.exists(ds$dir)) stop("Dataset directory not found: ", ds$dir)
+  out_dir <- file.path(ds$dir, "07_clustering")
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  rds_path <- file.path(out_dir, "07_seurat_annotated.rds")
+
+  if (isTRUE(cfg$reuse_existing) && file.exists(rds_path) &&
+      file.exists(file.path(out_dir, "07_cluster_annotation.csv"))) {
+    msg("Existing outputs found in %s; skipping (cfg$reuse_existing = TRUE).", out_dir)
+    ann <- read.csv(file.path(out_dir, "07_cluster_annotation.csv"))
+    return(data.frame(dataset = ds$name, species = ds$species, dir = out_dir, status = "reused",
+                      n_samples = NA_integer_, n_cells = sum(ann$n_cells), n_clusters = nrow(ann)))
+  }
+
+  # ---- STEP 1: discover + load samples ----
+  samples <- scan_dataset(ds$dir)
+  if (!length(samples)) stop("No recognisable samples found in ", ds$dir)
+  msg("Detected %d sample(s): %s", length(samples),
+      paste(vapply(samples, function(s) sprintf("%s[%s]", s$sample_id, s$type), character(1)), collapse = ", "))
+
+  seurat_list <- list(); load_log <- list()
+  for (s in samples) {
+    err <- NA_character_
+    res <- tryCatch(load_sample(s, ds), error = function(e) {
+      err <<- conditionMessage(e); warn_msg("  FAILED %s: %s", s$sample_id, err); NULL })
+    load_log[[length(load_log) + 1]] <- data.frame(
+      dataset = ds$name, sample_id = s$sample_id, type = s$type,
+      file = basename(s$path %||% s$matrix), status = if (is.null(res)) "failed" else "ok", error = err,
+      n_cells = if (is.null(res)) NA_integer_ else ncol(res),
+      n_genes = if (is.null(res)) NA_integer_ else nrow(res))
+    if (!is.null(res)) seurat_list[[s$sample_id]] <- res
+    gc(verbose = FALSE)
+  }
+  write.csv(bind_rows(load_log), file.path(out_dir, "07_sample_manifest.csv"), row.names = FALSE)
+  if (!length(seurat_list)) stop("All samples failed to load in ", ds$name, " (see 07_sample_manifest.csv)")
+
+  # ---- STEP 2: merge + unsupervised clustering ----
+  seu <- if (length(seurat_list) == 1) seurat_list[[1]] else
+    merge(seurat_list[[1]], y = seurat_list[-1], add.cell.ids = NULL)
+  rm(seurat_list); gc(verbose = FALSE)
+  msg("Merged: %d genes x %d cells from %d sample(s)", nrow(seu), ncol(seu), length(unique(seu$sample)))
+
+  seu <- NormalizeData(seu, verbose = FALSE)
+  seu <- FindVariableFeatures(seu, nfeatures = cfg$nfeatures, verbose = FALSE)
+  seu <- ScaleData(seu, features = VariableFeatures(seu), verbose = FALSE)
+  npcs <- min(cfg$npcs, ncol(seu) - 1, length(VariableFeatures(seu)) - 1)
+  seu <- RunPCA(seu, npcs = npcs, verbose = FALSE)
+  seu <- FindNeighbors(seu, dims = 1:npcs, verbose = FALSE)
+  seu <- FindClusters(seu, resolution = cfg$resolution, verbose = FALSE)
+  seu <- RunUMAP(seu, dims = 1:npcs, min.dist = cfg$umap_min_dist, verbose = FALSE)
+  seu <- join_layers_safe(seu)
+  Idents(seu) <- seu$seurat_clusters
+  msg("Clusters found: %d (resolution %g, %d PCs)", length(levels(seu$seurat_clusters)), cfg$resolution, npcs)
+  gc(verbose = FALSE)
+
+  # ---- STEP 3: markers ----
+  markers <- NULL
+  if (length(levels(seu$seurat_clusters)) >= 2) {
+    markers <- tryCatch(
+      FindAllMarkers(seu, only.pos = TRUE, min.pct = cfg$marker_min_pct,
+                     logfc.threshold = cfg$marker_logfc, verbose = FALSE),
+      error = function(e) { warn_msg("FindAllMarkers failed: %s", conditionMessage(e)); NULL })
+  } else warn_msg("Only one cluster; skipping markers.")
+  if (!is.null(markers) && nrow(markers)) {
+    markers$cluster <- as.character(markers$cluster)
+    markers$dataset <- ds$name
+    markers$gene_upper <- toupper(markers$gene)
+    p_col <- if ("p_val_adj" %in% colnames(markers)) "p_val_adj" else "p_val"
+    markers <- markers[markers[[p_col]] < cfg$marker_p_adj, , drop = FALSE]
+  }
+
+  # ---- STEP 4: annotation (a) canonical panels ----
+  ps  <- cluster_panel_scores(seu, POPULATION_MARKERS)
+  ann <- assign_population(ps$scores)
+  write.csv(cbind(cluster = rownames(ps$scores), as.data.frame(round(ps$scores, 4))),
+            file.path(out_dir, "07_panel_scores_by_cluster.csv"), row.names = FALSE)
+  msg("Panel genes detected: %s",
+      paste(sprintf("%s=%d", names(ps$detected), ps$detected), collapse = ", "))
+
+  # ---- STEP 4: annotation (b) SingleR ----
+  lab <- rep(NA_character_, ncol(seu)); names(lab) <- colnames(seu)
+  if (isTRUE(cfg$run_singler)) {
+    sr <- run_singler(seu, ds$species)
+    if (!is.null(sr)) lab[names(sr)] <- sr
+  }
+  seu$singler_label <- lab
+  sr_major <- seu@meta.data %>%
+    mutate(cluster = as.character(seurat_clusters)) %>%
+    filter(!is.na(singler_label)) %>%
+    count(cluster, singler_label, name = "n_lab") %>%
+    group_by(cluster) %>% mutate(frac = n_lab / sum(n_lab)) %>%
+    slice_max(order_by = n_lab, n = 1, with_ties = FALSE) %>% ungroup() %>%
+    transmute(cluster, singler_majority = singler_label, singler_fraction = round(frac, 3))
+
+  # ---- STEP 5: assemble the cluster annotation table ----
+  sizes <- seu@meta.data %>% mutate(cluster = as.character(seurat_clusters)) %>%
+    count(cluster, name = "n_cells") %>% mutate(pct_cells = round(100 * n_cells / sum(n_cells), 2))
+  top_mk <- if (!is.null(markers) && nrow(markers)) {
+    markers %>% group_by(cluster) %>% arrange(desc(avg_log2FC), .by_group = TRUE) %>%
+      slice_head(n = 10) %>% summarise(top_markers = paste(gene, collapse = ";"), .groups = "drop")
+  } else data.frame(cluster = character(0), top_markers = character(0))
+
+  ann <- ann %>% left_join(sizes, by = "cluster") %>% left_join(sr_major, by = "cluster") %>%
+    left_join(top_mk, by = "cluster") %>%
+    mutate(dataset = ds$name, species = ds$species,
+           population_label = ifelse(population == "Unassigned" & !is.na(singler_majority),
+                                     paste0("Unassigned/", singler_majority), population)) %>%
+    select(dataset, species, cluster, n_cells, pct_cells, population, population_label,
+           best_panel, panel_score, runner_up, runner_up_score, margin,
+           singler_majority, singler_fraction, top_markers) %>%
+    arrange(suppressWarnings(as.numeric(cluster)))
+  write.csv(ann, file.path(out_dir, "07_cluster_annotation.csv"), row.names = FALSE)
+
+  pop_map <- setNames(ann$population, ann$cluster)
+  seu$population <- unname(pop_map[as.character(seu$seurat_clusters)])
+  seu$cluster_population <- paste0("C", seu$seurat_clusters, ":", seu$population)
+
+  if (!is.null(markers) && nrow(markers)) {
+    markers$population <- unname(pop_map[markers$cluster])
+    write.csv(markers, file.path(out_dir, "07_cluster_markers_sig.csv"), row.names = FALSE)
+    top_tbl <- markers %>% group_by(cluster) %>% arrange(desc(avg_log2FC), .by_group = TRUE) %>%
+      slice_head(n = cfg$top_markers_report) %>% ungroup()
+    write.csv(top_tbl, file.path(out_dir, "07_cluster_markers_top.csv"), row.names = FALSE)
+  }
+
+  pop_counts <- seu@meta.data %>% count(population, name = "n_cells") %>%
+    mutate(pct_cells = round(100 * n_cells / sum(n_cells), 2), dataset = ds$name)
+  write.csv(pop_counts, file.path(out_dir, "07_population_counts.csv"), row.names = FALSE)
+  write.csv(seu@meta.data, file.path(out_dir, "07_cell_metadata.csv"), row.names = TRUE)
+
+  # ---- STEP 6: plots ----
+  p1 <- DimPlot(seu, group.by = "seurat_clusters", label = TRUE, repel = TRUE) + ggtitle(paste0(ds$name, " - clusters"))
+  p2 <- DimPlot(seu, group.by = "cluster_population", label = TRUE, repel = TRUE, label.size = 3) +
+    ggtitle(paste0(ds$name, " - annotated populations")) + theme(legend.text = element_text(size = 7))
+  p3 <- DimPlot(seu, group.by = "sample") + ggtitle(paste0(ds$name, " - sample"))
+  pdf(file.path(out_dir, "07_umap_clusters.pdf"), width = 8, height = 6); print(p1); dev.off()
+  pdf(file.path(out_dir, "07_umap_populations.pdf"), width = 11, height = 6); print(p2); dev.off()
+  pdf(file.path(out_dir, "07_umap_sample.pdf"), width = 9, height = 6); print(p3); dev.off()
+  if (any(!is.na(seu$singler_label))) {
+    p4 <- DimPlot(seu, group.by = "singler_label", label = TRUE, repel = TRUE, label.size = 3) +
+      ggtitle(paste0(ds$name, " - SingleR"))
+    pdf(file.path(out_dir, "07_umap_singler.pdf"), width = 10, height = 6); print(p4); dev.off()
+  }
+  pdf(file.path(out_dir, "07_umap_clusters_and_populations.pdf"), width = 18, height = 6); print(p1 + p2); dev.off()
+
+  if (isTRUE(cfg$save_rds)) saveRDS(seu, rds_path)
+  msg("Outputs written to %s", out_dir)
+  print(ann[, c("cluster", "n_cells", "population", "panel_score", "singler_majority")])
+
+  res <- data.frame(dataset = ds$name, species = ds$species, dir = out_dir, status = "ok",
+                    n_samples = length(unique(seu$sample)), n_cells = ncol(seu),
+                    n_clusters = length(levels(seu$seurat_clusters)))
+  rm(seu); gc(verbose = FALSE)
+  res
+}
+
+dir.create(OUT_CROSS, showWarnings = FALSE, recursive = TRUE)
+run_log <- list()
+
+if (isTRUE(cfg$run_part1)) {
+  hdr("PART 1 — clustering + annotation per dataset")
+  for (ds in datasets) {
+    t0 <- Sys.time()
+    res <- tryCatch(process_dataset(ds), error = function(e) {
+      warn_msg("DATASET FAILED [%s]: %s", ds$name, conditionMessage(e))
+      data.frame(dataset = ds$name, species = ds$species, dir = ds$dir,
+                 status = paste("failed:", conditionMessage(e)),
+                 n_samples = NA_integer_, n_cells = NA_integer_, n_clusters = NA_integer_)
+    })
+    res$minutes <- round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 2)
+    run_log[[length(run_log) + 1]] <- res
+    gc(verbose = FALSE)
+  }
+  run_log_df <- bind_rows(run_log)
+  print(run_log_df)
+  write.csv(run_log_df, file.path(OUT_CROSS, "07_run_log.csv"), row.names = FALSE)
+}
+
+# ============================================================================
+# PART 2 — recurrent populations across datasets
+# ============================================================================
+read_all_annotations <- function() {
+  tbls <- lapply(datasets, function(ds) {
+    f <- file.path(ds$dir, "07_clustering", "07_cluster_annotation.csv")
+    if (!file.exists(f)) { warn_msg("Missing annotation for %s (%s)", ds$name, f); return(NULL) }
+    read.csv(f, colClasses = c(cluster = "character"))
+  })
+  bind_rows(tbls)
+}
+
+read_all_markers <- function() {
+  tbls <- lapply(datasets, function(ds) {
+    f <- file.path(ds$dir, "07_clustering", "07_cluster_markers_sig.csv")
+    if (!file.exists(f)) return(NULL)
+    read.csv(f, colClasses = c(cluster = "character"))
+  })
+  bind_rows(tbls)
+}
+
+recurrent <- NULL
+if (isTRUE(cfg$run_part2) || isTRUE(cfg$run_part3)) {
+  hdr("PART 2 — recurrent populations (present in > %d %s)",
+      cfg$recurrence_min_datasets, cfg$recurrence_count_by)
+  all_ann <- read_all_annotations()
+  if (!nrow(all_ann)) stop("No Part 1 annotation tables found; run Part 1 first.")
+  write.csv(all_ann, file.path(OUT_CROSS, "07_all_cluster_annotations.csv"), row.names = FALSE)
+
+  recurrence <- all_ann %>%
+    filter(population != "Unassigned") %>%
+    group_by(population) %>%
+    summarise(n_datasets = n_distinct(dataset),
+              n_clusters = n(),
+              total_cells = sum(n_cells),
+              datasets = paste(sort(unique(dataset)), collapse = ";"),
+              clusters = paste(paste0(dataset, ":C", cluster), collapse = ";"),
+              mean_panel_score = round(mean(panel_score, na.rm = TRUE), 3),
+              .groups = "drop") %>%
+    mutate(n_datasets_total = length(unique(all_ann$dataset)),
+           count_used = if (cfg$recurrence_count_by == "clusters") n_clusters else n_datasets,
+           recurrent = count_used > cfg$recurrence_min_datasets) %>%
+    arrange(desc(n_datasets), desc(n_clusters))
+  write.csv(recurrence, file.path(OUT_CROSS, "07_population_recurrence.csv"), row.names = FALSE)
+
+  presence <- all_ann %>% filter(population != "Unassigned") %>%
+    count(population, dataset, name = "n_clusters") %>%
+    pivot_wider(names_from = dataset, values_from = n_clusters, values_fill = 0)
+  write.csv(presence, file.path(OUT_CROSS, "07_population_presence_matrix.csv"), row.names = FALSE)
+
+  recurrent <- recurrence %>% filter(recurrent)
+  write.csv(recurrent, file.path(OUT_CROSS, "07_recurrent_populations.csv"), row.names = FALSE)
+
+  cat("\nPopulations appearing in more than", cfg$recurrence_min_datasets, cfg$recurrence_count_by, ":\n")
+  if (nrow(recurrent)) {
+    print(as.data.frame(recurrent[, c("population", "n_datasets", "n_clusters", "total_cells", "datasets")]))
+  } else cat("  (none)\n")
+}
+
+# ============================================================================
+# PART 3 — signatures of recurrent populations vs NEPC signature in bulk
+# ============================================================================
+
+# ---- 3a. signature construction -------------------------------------------
+build_consensus_signature <- function(pop, all_markers) {
+  if (is.null(all_markers) || !nrow(all_markers)) return(NULL)
+  df <- all_markers %>%
+    filter(population == pop, avg_log2FC > 0) %>%
+    mutate(gene = toupper(gene)) %>%
+    filter(!grepl(cfg$exclude_gene_regex, gene)) %>%
+    group_by(dataset, gene) %>%
+    summarise(avg_log2FC = max(avg_log2FC), .groups = "drop") %>%
+    group_by(gene) %>%
+    summarise(n_datasets = n_distinct(dataset), mean_log2FC = mean(avg_log2FC), .groups = "drop") %>%
+    filter(n_datasets >= cfg$consensus_min_datasets) %>%
+    arrange(desc(n_datasets), desc(mean_log2FC)) %>%
+    slice_head(n = cfg$consensus_top_n)
+  if (!nrow(df)) return(NULL)
+  df
+}
+
+build_signatures <- function(recurrent, all_markers) {
+  out <- list()
+  for (pop in recurrent$population) {
+    canon <- POPULATION_MARKERS[[pop]]
+    if (!is.null(canon)) {
+      out[[length(out) + 1]] <- data.frame(population = pop, signature_type = "canonical", gene = canon,
+                                           n_datasets = NA_integer_, mean_log2FC = NA_real_)
+    }
+    cons <- build_consensus_signature(pop, all_markers)
+    if (!is.null(cons)) {
+      out[[length(out) + 1]] <- data.frame(population = pop, signature_type = "consensus_markers",
+                                           gene = cons$gene, n_datasets = cons$n_datasets,
+                                           mean_log2FC = round(cons$mean_log2FC, 3))
+    } else warn_msg("No consensus markers for %s (need >= %d datasets)", pop, cfg$consensus_min_datasets)
+  }
+  sig <- bind_rows(out)
+  if (!nrow(sig)) return(sig)
+  sig$in_nepc_signature <- sig$gene %in% NEPC_BELTRAN_CUSTOM_UP
+  sig$used_for_scoring  <- !(isTRUE(cfg$exclude_nepc_genes_from_signatures) & sig$in_nepc_signature)
+  sig
+}
+
+# ---- 3b. cBioPortal access ---------------------------------------------------
+cbio_cache_dir <- file.path(OUT_CROSS, "cbioportal_cache")
+
+cbio_request <- function(path, query = NULL, body_json = NULL, cache_key = NULL) {
+  if (!requireNamespace("httr", quietly = TRUE) || !requireNamespace("jsonlite", quietly = TRUE))
+    stop("Packages 'httr' and 'jsonlite' are required for cBioPortal access.")
+  cf <- if (!is.null(cache_key)) file.path(cbio_cache_dir, paste0(gsub("[^A-Za-z0-9_.-]", "_", cache_key), ".rds")) else NULL
+  if (!is.null(cf) && isTRUE(cfg$cbio_use_cache) && file.exists(cf)) return(readRDS(cf))
+  url <- paste0(cfg$cbio_base, path)
+  last_err <- "unknown"
+  for (attempt in seq_len(cfg$cbio_retries)) {
+    resp <- tryCatch({
+      if (is.null(body_json)) {
+        httr::GET(url, query = query, httr::accept_json(), httr::timeout(cfg$cbio_timeout))
+      } else {
+        httr::POST(url, query = query, body = body_json, httr::content_type_json(),
+                   httr::accept_json(), httr::timeout(cfg$cbio_timeout))
+      }
+    }, error = function(e) { last_err <<- conditionMessage(e); NULL })
+    if (!is.null(resp)) {
+      if (httr::status_code(resp) == 200) {
+        txt <- httr::content(resp, as = "text", encoding = "UTF-8")
+        out <- jsonlite::fromJSON(txt, simplifyVector = TRUE)
+        if (!is.null(cf)) { dir.create(cbio_cache_dir, showWarnings = FALSE, recursive = TRUE); saveRDS(out, cf) }
+        return(out)
+      }
+      last_err <- sprintf("HTTP %d: %s", httr::status_code(resp),
+                          substr(httr::content(resp, as = "text", encoding = "UTF-8"), 1, 200))
+    }
+    warn_msg("  cBioPortal request failed (attempt %d/%d) %s -> %s", attempt, cfg$cbio_retries, path, last_err)
+    Sys.sleep(2^attempt)
+  }
+  stop("cBioPortal request failed: ", path, " (", last_err, ")")
+}
+
+json_array <- function(x) jsonlite::toJSON(as.list(x), auto_unbox = TRUE)
+
+cbio_pick_profile <- function(st) {
+  profs <- cbio_request(sprintf("/studies/%s/molecular-profiles", st$study_id),
+                        cache_key = paste0(st$study_id, "_profiles"))
+  if (!is.data.frame(profs) || !nrow(profs)) stop("No molecular profiles returned for ", st$study_id)
+  msg("  %s molecular profiles:", st$study_id)
+  for (i in seq_len(nrow(profs)))
+    msg("    %-55s %-18s %s", profs$molecularProfileId[i], profs$molecularAlterationType[i], profs$name[i])
+  if (!is.null(st$profile_id)) {
+    if (!st$profile_id %in% profs$molecularProfileId) stop("Requested profile not found: ", st$profile_id)
+    return(profs[profs$molecularProfileId == st$profile_id, , drop = FALSE])
+  }
+  cand <- profs[profs$molecularAlterationType == "MRNA_EXPRESSION" &
+                !grepl("zscore", profs$molecularProfileId, ignore.case = TRUE), , drop = FALSE]
+  if (!nrow(cand)) stop("No non-z-score MRNA_EXPRESSION profile for ", st$study_id)
+  for (pat in st$profile_patterns) {
+    hit <- grep(pat, cand$molecularProfileId, ignore.case = TRUE)
+    if (length(hit)) return(cand[hit[1], , drop = FALSE])
+  }
+  cand[1, , drop = FALSE]
+}
+
+cbio_pick_sample_list <- function(study_id) {
+  sl <- cbio_request(sprintf("/studies/%s/sample-lists", study_id), cache_key = paste0(study_id, "_sample_lists"))
+  if (!is.data.frame(sl) || !nrow(sl)) stop("No sample lists for ", study_id)
+  pref <- c(paste0(study_id, "_all"), grep("mrna|rna_seq", sl$sampleListId, value = TRUE, ignore.case = TRUE))
+  pref <- pref[pref %in% sl$sampleListId]
+  if (length(pref)) return(pref[1])
+  sl$sampleListId[which.max(sl$sampleCount)]
+}
+
+cbio_gene_lookup <- function(symbols) {
+  symbols <- unique(symbols[!is.na(symbols) & symbols != ""])
+  fetch <- function(syms) {
+    if (!length(syms)) return(NULL)
+    res <- cbio_request("/genes/fetch", query = list(geneIdType = "HUGO_GENE_SYMBOL", projection = "SUMMARY"),
+                        body_json = json_array(syms),
+                        cache_key = paste0("genes_", substr(digest_string(paste(sort(syms), collapse = ",")), 1, 12)))
+    if (is.data.frame(res) && nrow(res)) res[, c("entrezGeneId", "hugoGeneSymbol")] else NULL
+  }
+  found <- list()
+  for (i in seq(1, length(symbols), by = 500)) {
+    found[[length(found) + 1]] <- fetch(symbols[i:min(i + 499, length(symbols))])
+  }
+  found <- bind_rows(found)
+  found$query_symbol <- if (nrow(found)) toupper(found$hugoGeneSymbol) else character(0)
+
+  # retry missing symbols via aliases (and the C#orf# capitalisation rule)
+  missing <- setdiff(symbols, found$query_symbol)
+  if (length(missing)) {
+    alt <- vapply(missing, function(s) {
+      if (s %in% names(GENE_ALIASES)) GENE_ALIASES[[s]]
+      else if (grepl("^C[0-9XY]+ORF[0-9]+$", s)) sub("ORF", "orf", s)
+      else NA_character_
+    }, character(1))
+    alt <- alt[!is.na(alt) & alt != names(alt)]
+    if (length(alt)) {
+      res <- fetch(unname(alt))
+      if (!is.null(res) && nrow(res)) {
+        res$query_symbol <- names(alt)[match(res$hugoGeneSymbol, alt)]
+        res$query_symbol[is.na(res$query_symbol)] <- names(alt)[match(toupper(res$hugoGeneSymbol), toupper(alt))][is.na(res$query_symbol)]
+        found <- bind_rows(found, res[!is.na(res$query_symbol), ])
+      }
+    }
+  }
+  found <- found[!duplicated(found$query_symbol), , drop = FALSE]
+  still_missing <- setdiff(symbols, found$query_symbol)
+  if (length(still_missing)) msg("  %d symbol(s) not resolvable in cBioPortal: %s",
+                                 length(still_missing), paste(still_missing, collapse = ", "))
+  found
+}
+
+digest_string <- function(x) {
+  # lightweight stable hash without extra dependencies
+  v <- utf8ToInt(x)
+  h <- 0
+  for (b in v) h <- (h * 31 + b) %% 2147483647
+  sprintf("%d_%d", h, nchar(x))
+}
+
+cbio_fetch_expression <- function(profile_id, sample_list_id, gene_tbl) {
+  ids <- unique(gene_tbl$entrezGeneId)
+  chunks <- split(ids, ceiling(seq_along(ids) / cfg$cbio_gene_batch))
+  parts <- list()
+  for (k in seq_along(chunks)) {
+    body <- jsonlite::toJSON(list(entrezGeneIds = as.list(chunks[[k]]), sampleListId = sample_list_id),
+                             auto_unbox = TRUE)
+    res <- cbio_request(sprintf("/molecular-profiles/%s/molecular-data/fetch", profile_id),
+                        query = list(projection = "SUMMARY"), body_json = body,
+                        cache_key = sprintf("%s_%s_expr_%d_of_%d_%s", profile_id, sample_list_id, k,
+                                            length(chunks), digest_string(paste(chunks[[k]], collapse = ","))))
+    if (is.data.frame(res) && nrow(res)) parts[[k]] <- res[, c("sampleId", "entrezGeneId", "value")]
+    msg("  fetched gene batch %d/%d (%d rows)", k, length(chunks), if (is.data.frame(res)) nrow(res) else 0)
+  }
+  df <- bind_rows(parts)
+  if (!nrow(df)) stop("No expression values returned for profile ", profile_id)
+  df$value <- suppressWarnings(as.numeric(df$value))
+  mat <- tapply(df$value, list(df$entrezGeneId, df$sampleId), function(v) v[1])
+  mat <- as.matrix(mat)
+  sym <- gene_tbl$query_symbol[match(as.integer(rownames(mat)), gene_tbl$entrezGeneId)]
+  keep <- !is.na(sym)
+  mat <- mat[keep, , drop = FALSE]
+  rownames(mat) <- sym[keep]
+  mat
+}
+
+load_bulk_local <- function(path) {
+  dt <- data.table::fread(path, data.table = FALSE)
+  sym_col <- intersect(c("Hugo_Symbol", "gene", "Gene", "symbol"), colnames(dt))[1]
+  if (is.na(sym_col)) stop("Cannot find a gene-symbol column in ", path)
+  drop <- intersect(c(sym_col, "Entrez_Gene_Id"), colnames(dt))
+  sym  <- toupper(dt[[sym_col]])
+  m <- as.matrix(dt[, setdiff(colnames(dt), drop), drop = FALSE])
+  suppressWarnings(storage.mode(m) <- "double")
+  keep <- !is.na(sym) & sym != "" & !duplicated(sym)
+  m <- m[keep, , drop = FALSE]; rownames(m) <- sym[keep]
+  m
+}
+
+get_bulk_matrix <- function(key, st, genes_needed) {
+  local <- cfg$cbio_local_files[[key]]
+  if (!is.null(local) && file.exists(local)) {
+    msg("  Using local expression file for %s: %s", st$study_id, local)
+    m <- load_bulk_local(local)
+    return(list(mat = m[rownames(m) %in% genes_needed, , drop = FALSE],
+                profile_id = paste0("local:", basename(local)), sample_list = NA_character_,
+                profile_name = "local file"))
+  }
+  prof <- cbio_pick_profile(st)
+  sl   <- cbio_pick_sample_list(st$study_id)
+  msg("  %s -> profile '%s' (%s), sample list '%s'", st$study_id, prof$molecularProfileId, prof$name, sl)
+  genes <- cbio_gene_lookup(genes_needed)
+  if (!nrow(genes)) stop("No genes resolved for ", st$study_id)
+  m <- cbio_fetch_expression(prof$molecularProfileId, sl, genes)
+  list(mat = m, profile_id = prof$molecularProfileId, sample_list = sl, profile_name = prof$name)
+}
+
+# ---- 3c. scoring + correlation ---------------------------------------------
+to_log2 <- function(mat) {
+  mx <- suppressWarnings(max(mat, na.rm = TRUE))
+  mn <- suppressWarnings(min(mat, na.rm = TRUE))
+  if (is.finite(mx) && mx > 50 && is.finite(mn) && mn >= 0) {
+    msg("  values look linear (max %.1f) -> log2(x + 1)", mx); log2(mat + 1)
+  } else { msg("  values look already log-scaled (max %.2f); used as is", mx); mat }
+}
+
+score_signature <- function(logmat, genes) {
+  g <- intersect(unique(toupper(genes)), rownames(logmat))
+  if (length(g) < 2) return(list(score = setNames(rep(NA_real_, ncol(logmat)), colnames(logmat)), genes = g))
+  sub <- logmat[g, , drop = FALSE]
+  sds  <- apply(sub, 1, stats::sd, na.rm = TRUE)
+  keep <- rowSums(is.finite(sub)) >= cfg$min_samples_cor & !is.na(sds) & sds > 0
+  sub  <- sub[keep, , drop = FALSE]
+  if (nrow(sub) < 2) return(list(score = setNames(rep(NA_real_, ncol(logmat)), colnames(logmat)), genes = rownames(sub)))
+  z <- t(scale(t(sub)))
+  list(score = colMeans(z, na.rm = TRUE), genes = rownames(sub))
+}
+
+cor_pair <- function(x, y, method) {
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) < cfg$min_samples_cor) return(c(r = NA_real_, p = NA_real_, n = sum(ok)))
+  ct <- suppressWarnings(stats::cor.test(x[ok], y[ok], method = method))
+  c(r = unname(ct$estimate), p = ct$p.value, n = sum(ok))
+}
+
+if (isTRUE(cfg$run_part3)) {
+  hdr("PART 3 — recurrent-population signatures vs NEPC signature (cBioPortal)")
+  if (is.null(recurrent) || !nrow(recurrent)) {
+    warn_msg("No recurrent populations; Part 3 has nothing to correlate.")
+  } else {
+    all_markers <- read_all_markers()
+    signatures  <- build_signatures(recurrent, all_markers)
+    if (!nrow(signatures)) stop("No signatures could be built for the recurrent populations.")
+    write.csv(signatures, file.path(OUT_CROSS, "07_recurrent_population_signatures.csv"), row.names = FALSE)
+    sig_n <- signatures %>% filter(used_for_scoring) %>% count(population, signature_type, name = "n_genes")
+    msg("Signatures (genes used for scoring): %s",
+        paste(sprintf("%s/%s=%d", sig_n$population, sig_n$signature_type, sig_n$n_genes), collapse = ", "))
+
+    genes_needed <- unique(c(NEPC_BELTRAN_CUSTOM_UP, signatures$gene[signatures$used_for_scoring]))
+    sig_sets <- signatures %>% filter(used_for_scoring) %>%
+      group_by(population, signature_type) %>% summarise(genes = list(gene), .groups = "drop")
+
+    summary_rows <- list(); gene_rows <- list(); profiles_used <- list(); plots <- list()
+
+    for (key in names(cfg$cbio_studies)) {
+      st <- cfg$cbio_studies[[key]]
+      hdr("Bulk cohort: %s (%s)", st$label, st$study_id)
+      bulk <- tryCatch(get_bulk_matrix(key, st, genes_needed), error = function(e) {
+        warn_msg("Could not obtain expression for %s: %s", st$study_id, conditionMessage(e)); NULL })
+      if (is.null(bulk)) next
+
+      logmat <- to_log2(bulk$mat)
+      msg("  %d genes x %d samples (of %d requested genes)", nrow(logmat), ncol(logmat), length(genes_needed))
+      write.csv(cbind(gene = rownames(logmat), as.data.frame(round(logmat, 4))),
+                file.path(OUT_CROSS, sprintf("07_bulk_log2_expression_%s.csv", st$study_id)), row.names = FALSE)
+      profiles_used[[key]] <- data.frame(study_id = st$study_id, label = st$label, profile_id = bulk$profile_id,
+                                         profile_name = bulk$profile_name, sample_list = bulk$sample_list,
+                                         n_samples = ncol(logmat), n_genes = nrow(logmat))
+
+      nepc <- score_signature(logmat, NEPC_BELTRAN_CUSTOM_UP)
+      msg("  NEPC signature: %d/%d genes present", length(nepc$genes), length(NEPC_BELTRAN_CUSTOM_UP))
+      scores <- data.frame(sample_id = colnames(logmat), NEPC_score = unname(nepc$score))
+
+      for (i in seq_len(nrow(sig_sets))) {
+        pop <- sig_sets$population[i]; typ <- sig_sets$signature_type[i]
+        gs  <- sig_sets$genes[[i]]
+        sc  <- score_signature(logmat, gs)
+        col <- paste0(pop, "__", typ)
+        scores[[col]] <- unname(sc$score)
+        for (m in c("pearson", "spearman")) {
+          cp <- cor_pair(sc$score, nepc$score, m)
+          summary_rows[[length(summary_rows) + 1]] <- data.frame(
+            study_id = st$study_id, cohort = st$label, population = pop, signature_type = typ,
+            n_genes_signature = length(gs), n_genes_present = length(sc$genes),
+            method = m, r = unname(cp["r"]), p = unname(cp["p"]), n_samples = unname(cp["n"]))
+        }
+        for (g in sc$genes) {
+          cp <- cor_pair(logmat[g, ], nepc$score, "spearman")
+          gene_rows[[length(gene_rows) + 1]] <- data.frame(
+            study_id = st$study_id, population = pop, signature_type = typ, gene = g,
+            rho = unname(cp["r"]), p = unname(cp["p"]), n_samples = unname(cp["n"]))
+        }
+      }
+      write.csv(scores, file.path(OUT_CROSS, sprintf("07_bulk_signature_scores_%s.csv", st$study_id)), row.names = FALSE)
+
+      # scatter plots: population score vs NEPC score
+      long <- scores %>% pivot_longer(-c(sample_id, NEPC_score), names_to = "signature", values_to = "score") %>%
+        filter(is.finite(score), is.finite(NEPC_score))
+      if (nrow(long)) {
+        p <- ggplot(long, aes(x = NEPC_score, y = score)) +
+          geom_point(alpha = 0.5, size = 1) + geom_smooth(method = "lm", se = TRUE, colour = "firebrick") +
+          facet_wrap(~ signature, scales = "free_y") + theme_bw(base_size = 9) +
+          labs(title = sprintf("%s: population signature score vs NEPC (Beltran custom UP) score", st$label),
+               x = "NEPC signature score (mean z)", y = "population signature score (mean z)")
+        pdf(file.path(OUT_CROSS, sprintf("07_nepc_correlation_scatter_%s.pdf", st$study_id)), width = 12, height = 9)
+        print(p); dev.off()
+      }
+    }
+
+    if (length(summary_rows)) {
+      cor_summary <- bind_rows(summary_rows) %>%
+        group_by(study_id, method) %>% mutate(p_adj_BH = p.adjust(p, method = "BH")) %>% ungroup() %>%
+        mutate(r = round(r, 4), p = signif(p, 4), p_adj_BH = signif(p_adj_BH, 4)) %>%
+        arrange(study_id, method, desc(abs(r)))
+      write.csv(cor_summary, file.path(OUT_CROSS, "07_nepc_correlation_summary.csv"), row.names = FALSE)
+      cat("\nCorrelation of recurrent-population signatures with the NEPC signature:\n")
+      print(as.data.frame(cor_summary %>% select(study_id, population, signature_type, method, r, p, p_adj_BH, n_samples)))
+
+      cor_wide <- cor_summary %>% filter(method == "pearson") %>%
+        select(population, signature_type, study_id, r) %>%
+        pivot_wider(names_from = study_id, values_from = r, names_prefix = "pearson_r_")
+      write.csv(cor_wide, file.path(OUT_CROSS, "07_nepc_correlation_wide.csv"), row.names = FALSE)
+
+      # heatmap of correlation coefficients
+      hm <- cor_summary %>% mutate(sig = paste0(population, "\n", signature_type))
+      p_hm <- ggplot(hm, aes(x = study_id, y = sig, fill = r)) + geom_tile() +
+        geom_text(aes(label = sprintf("%.2f\np=%.1e", r, p)), size = 2.5) +
+        scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick", limits = c(-1, 1)) +
+        facet_wrap(~ method) + theme_bw(base_size = 9) + labs(x = NULL, y = NULL, fill = "r")
+      pdf(file.path(OUT_CROSS, "07_nepc_correlation_heatmap.pdf"), width = 8, height = 2 + 0.5 * length(unique(hm$sig)))
+      print(p_hm); dev.off()
+    }
+    if (length(gene_rows)) {
+      gene_cor <- bind_rows(gene_rows) %>%
+        group_by(study_id) %>% mutate(p_adj_BH = p.adjust(p, method = "BH")) %>% ungroup() %>%
+        mutate(rho = round(rho, 4), p = signif(p, 4), p_adj_BH = signif(p_adj_BH, 4)) %>%
+        arrange(study_id, population, signature_type, desc(rho))
+      write.csv(gene_cor, file.path(OUT_CROSS, "07_nepc_correlation_per_gene.csv"), row.names = FALSE)
+    }
+    if (length(profiles_used)) {
+      write.csv(bind_rows(profiles_used), file.path(OUT_CROSS, "07_cbioportal_profiles_used.csv"), row.names = FALSE)
+    }
+
+    prov <- c(
+      sprintf("script_version: %s", SCRIPT_VERSION),
+      sprintf("run_date: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+      sprintf("datasets: %s", paste(vapply(datasets, function(d) d$name, character(1)), collapse = ", ")),
+      sprintf("clustering: nfeatures=%d npcs=%d resolution=%g min_features=%d max_mito=%g",
+              cfg$nfeatures, cfg$npcs, cfg$resolution, cfg$min_features_cell, cfg$max_mito_pct),
+      sprintf("annotation: panel z-score, min_score=%g min_margin=%g; SingleR=%s",
+              cfg$ann_min_score, cfg$ann_min_margin, cfg$run_singler),
+      sprintf("recurrence: population in > %d %s", cfg$recurrence_min_datasets, cfg$recurrence_count_by),
+      sprintf("recurrent populations: %s", paste(recurrent$population, collapse = ", ")),
+      sprintf("consensus signature: markers in >= %d datasets, top %d by (n_datasets, mean log2FC); excluded %s",
+              cfg$consensus_min_datasets, cfg$consensus_top_n, cfg$exclude_gene_regex),
+      sprintf("NEPC-overlapping genes excluded from population signatures: %s", cfg$exclude_nepc_genes_from_signatures),
+      sprintf("NEPC signature (%d genes): %s", length(NEPC_BELTRAN_CUSTOM_UP), paste(NEPC_BELTRAN_CUSTOM_UP, collapse = ",")),
+      "bulk scoring: log2(x+1) if linear -> gene-wise z across samples -> mean z over signature genes",
+      "correlation: Pearson and Spearman of population score vs NEPC score; BH-adjusted within study and method",
+      if (length(profiles_used)) paste0("cBioPortal profiles: ",
+        paste(vapply(profiles_used, function(p) sprintf("%s=%s", p$study_id, p$profile_id), character(1)), collapse = "; ")) else "cBioPortal profiles: none"
+    )
+    writeLines(prov, file.path(OUT_CROSS, "07_PROVENANCE.txt"))
+  }
+}
+
+hdr("07_ COMPLETE — cross-dataset outputs in %s", OUT_CROSS)
