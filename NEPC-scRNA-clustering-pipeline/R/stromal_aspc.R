@@ -39,7 +39,7 @@ map_to_human_symbols <- function(mat, species) {
   collapse_duplicate_features(mat)
 }
 
-extract_stromal_cells <- function(ds) {
+extract_stromal_cells <- function(ds) {   # returns list(obj = Seurat, by_sample = data.frame)
   rds <- file.path(ds$dir, "nepc_clustering", "nepc_seurat_annotated.rds")
   if (!file.exists(rds)) { warn_msg("  %s: no coarse result (%s)", ds$name, rds); return(NULL) }
   seu <- readRDS(rds)
@@ -50,6 +50,9 @@ extract_stromal_cells <- function(ds) {
   pick[is.na(pick)] <- FALSE
   cells <- colnames(seu)[pick]
   msg("  %s: %d of %d cells are mesenchymal", ds$name, length(cells), ncol(seu))
+  by_sample <- data.frame(dataset = ds$name, group = ds$group, sample = md$sample, stromal = pick) %>%
+    group_by(dataset, group, sample) %>%
+    summarise(n_total_cells = n(), n_stromal_cells = sum(stromal), .groups = "drop")
   if (length(cells) < cfg$min_cells_population) { warn_msg("  %s: too few stromal cells; skipped", ds$name); return(NULL) }
   if (length(cells) > cfg$stromal_max_cells_per_dataset) {
     cells <- sample(cells, cfg$stromal_max_cells_per_dataset)
@@ -63,8 +66,12 @@ extract_stromal_cells <- function(ds) {
   names(meta)[names(meta) == "seurat_clusters"] <- "coarse_cluster"
   names(meta)[names(meta) == "population"]      <- "coarse_population"
   meta$coarse_cluster <- as.character(meta$coarse_cluster)
+  meta$group <- ds$group
+  used <- as.data.frame(table(meta$sample), stringsAsFactors = FALSE); names(used) <- c("sample", "n_stromal_used")
+  by_sample <- by_sample %>% left_join(used, by = "sample") %>% mutate(n_stromal_used = ifelse(is.na(n_stromal_used), 0L, n_stromal_used))
   rm(seu, md); gc(verbose = FALSE)
-  CreateSeuratObject(counts = counts, project = ds$name, meta.data = meta, min.cells = 0, min.features = 0)
+  list(obj = CreateSeuratObject(counts = counts, project = ds$name, meta.data = meta, min.cells = 0, min.features = 0),
+       by_sample = by_sample)
 }
 
 # per-cell ASPC decision from the score matrix and the cluster label
@@ -86,18 +93,19 @@ call_aspc_cells <- function(scores, cluster_population) {
   list(call = call, pass = pass, threshold = thr)
 }
 
-run_stromal_tier <- function() {
-  hdr("PART 1b — integrated stromal tier (ASPC)")
-  out_dir <- file.path(OUT_CROSS, "stromal")
+run_stromal_tier <- function(group) {
+  hdr("PART 1b — integrated stromal tier (ASPC): %s datasets", group)
+  out_dir <- file.path(OUT_CROSS, paste0("stromal_", group))
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-  objs <- list()
-  for (ds in datasets) {
+  objs <- list(); extraction <- list()
+  for (ds in group_datasets(group)) {
     o <- tryCatch(extract_stromal_cells(ds), error = function(e) {
       warn_msg("  %s: stromal extraction failed: %s", ds$name, clean_msg(conditionMessage(e))); NULL })
-    if (!is.null(o)) objs[[ds$name]] <- o
+    if (!is.null(o)) { objs[[ds$name]] <- o$obj; extraction[[ds$name]] <- o$by_sample }
   }
-  if (length(objs) < 2) stop("fewer than two datasets contribute stromal cells; nothing to integrate")
+  if (length(extraction)) write.csv(bind_rows(extraction), file.path(out_dir, "nepc_stromal_extraction_by_sample.csv"), row.names = FALSE)
+  if (length(objs) < 2) stop("fewer than two ", group, " datasets contribute stromal cells; nothing to integrate")
 
   seu <- merge(objs[[1]], y = objs[-1]); rm(objs); gc(verbose = FALSE)
   seu <- join_layers_safe(seu)
@@ -165,9 +173,9 @@ run_stromal_tier <- function() {
 
   # ---- per-dataset population table (Part 2 reads this) ----
   by_ds <- md %>% filter(!stromal_population %in% c("Contaminant", "Unassigned")) %>%
-    count(dataset, species, stromal_population, name = "n_cells") %>%
+    count(dataset, group, species, stromal_population, name = "n_cells") %>%
     group_by(dataset) %>% mutate(pct_of_stromal = round(100 * n_cells / sum(n_cells), 2)) %>% ungroup() %>%
-    transmute(dataset, species, cluster = paste0("S_", stromal_population), population = stromal_population,
+    transmute(dataset, group, species, cluster = paste0("S_", stromal_population), population = stromal_population,
               n_cells, pct_of_stromal, panel_score = NA_real_, tier = "stromal")
   write.csv(by_ds, file.path(out_dir, "nepc_stromal_population_by_dataset.csv"), row.names = FALSE)
 
@@ -209,7 +217,7 @@ run_stromal_tier <- function() {
   if (length(per_ds)) write.csv(bind_rows(per_ds), file.path(out_dir, "nepc_stromal_markers_by_dataset.csv"), row.names = FALSE)
 
   # ---- plots ----
-  p1 <- DimPlot(seu, group.by = "stromal_cluster", label = TRUE, repel = TRUE) + ggtitle("Stromal tier - clusters")
+  p1 <- DimPlot(seu, group.by = "stromal_cluster", label = TRUE, repel = TRUE) + ggtitle(paste0(group, " stromal tier - clusters"))
   p2 <- DimPlot(seu, group.by = "stromal_population", label = TRUE, repel = TRUE, label.size = 3) + ggtitle("Stromal tier - populations")
   p3 <- DimPlot(seu, group.by = "dataset") + ggtitle("Stromal tier - dataset")
   p4 <- DimPlot(seu, group.by = "aspc_call") + ggtitle("ASPC call")

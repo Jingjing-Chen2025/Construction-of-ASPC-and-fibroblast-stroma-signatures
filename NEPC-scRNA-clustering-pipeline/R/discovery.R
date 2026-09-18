@@ -24,6 +24,44 @@ sample_id_from_file <- function(f) {
   sid
 }
 
+# ---- raw vs processed duplicates for the same GSM ---------------------------
+file_is_integer_valued <- function(path, n_rows = 40, n_cols = 60) {
+  lines <- tryCatch(peek_lines(path, n = n_rows + 1), error = function(e) character(0))
+  if (length(lines) < 2) return(TRUE)
+  sep  <- detect_sep(lines)
+  vals <- unlist(lapply(lines[-1], function(l) {
+    f <- strsplit(l, sep, fixed = TRUE)[[1]]
+    if (length(f) < 2) return(numeric(0))
+    suppressWarnings(as.numeric(f[2:min(length(f), n_cols + 1)]))
+  }))
+  vals <- vals[is.finite(vals)]
+  if (!length(vals)) return(TRUE)
+  all(abs(vals - round(vals)) < 1e-8) && !any(vals < 0)
+}
+
+# Some folders (e.g. GSE141445) ship a raw and a processed matrix for the same GSM.
+# Keep one file per accession: prefer "raw" in the name, then integer-valued files.
+triage_duplicate_gsm <- function(samples) {
+  if (length(samples) < 2) return(samples)
+  ids <- vapply(samples, function(s) s$sample_id, character(1))
+  gsm <- ifelse(grepl("^GSM[0-9]+", ids), sub("^(GSM[0-9]+).*", "\\1", ids), ids)
+  keep <- rep(TRUE, length(samples))
+  for (g in unique(gsm[duplicated(gsm)])) {
+    idx   <- which(gsm == g)
+    files <- vapply(samples[idx], function(s) basename(s$path %||% s$matrix), character(1))
+    is_raw <- grepl("raw", files, ignore.case = TRUE)
+    is_int <- vapply(samples[idx], function(s)
+      if (identical(s$type, "text_gz")) file_is_integer_valued(s$path) else TRUE, logical(1))
+    pick <- if (any(is_raw & is_int)) which(is_raw & is_int)[1]
+            else if (any(is_raw)) which(is_raw)[1]
+            else if (any(is_int)) which(is_int)[1] else 1L
+    msg("  %s: %d matrices for the same accession (%s); keeping %s",
+        g, length(idx), paste(files, collapse = ", "), files[pick])
+    keep[idx[-pick]] <- FALSE
+  }
+  samples[keep]
+}
+
 # ---- sample discovery --------------------------------------------------------
 # One sample is EITHER
 #   (i)  a 10x triplet  <sample>_barcodes.tsv.gz + <sample>_features.tsv.gz (or _genes.tsv.gz)
@@ -116,6 +154,9 @@ load_sample <- function(s, ds) {
     msg("  %s: subsampling %d -> %d cells.", s$sample_id, ncol(m), cfg$max_cells_per_sample)
     m <- m[, sample(colnames(m), cfg$max_cells_per_sample), drop = FALSE]
   }
+  if (identical(s$type, "text_gz") && !file_is_integer_valued(s$path)) {
+    warn_msg("  %s: values are not integer counts (processed matrix?); used as counts anyway", s$sample_id)
+  }
   colnames(m) <- paste0(s$sample_id, "__", colnames(m))
 
   seu <- CreateSeuratObject(counts = m, project = s$sample_id,
@@ -141,6 +182,7 @@ load_sample <- function(s, ds) {
 
   seu$sample  <- s$sample_id
   seu$dataset <- ds$name
+  seu$group   <- ds$group %||% NA_character_
   seu$species <- ds$species
   seu
 }

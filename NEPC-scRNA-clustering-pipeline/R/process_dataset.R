@@ -2,7 +2,7 @@
 # process_dataset.R — PART 1: merge, cluster, annotate one dataset
 # ============================================================================
 process_dataset <- function(ds) {
-  hdr("DATASET: %s (%s)", ds$name, ds$species)
+  hdr("DATASET: %s (%s, %s)", ds$name, ds$group %||% "?", ds$species)
   if (!dir.exists(ds$dir)) stop("Dataset directory not found: ", ds$dir)
   out_dir <- file.path(ds$dir, "nepc_clustering")
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
@@ -12,13 +12,14 @@ process_dataset <- function(ds) {
       file.exists(file.path(out_dir, "nepc_cluster_annotation.csv"))) {
     msg("Existing outputs found in %s; skipping (cfg$reuse_existing = TRUE).", out_dir)
     ann <- read.csv(file.path(out_dir, "nepc_cluster_annotation.csv"))
-    return(data.frame(dataset = ds$name, species = ds$species, dir = out_dir, status = "reused",
+    return(data.frame(dataset = ds$name, group = ds$group, species = ds$species, dir = out_dir, status = "reused",
                       n_samples = NA_integer_, n_cells = sum(ann$n_cells), n_clusters = nrow(ann)))
   }
 
   # ---- STEP 1: discover + load samples ----
   samples <- scan_dataset(ds$dir)
   if (!length(samples)) stop("No recognisable samples found in ", ds$dir)
+  samples <- triage_duplicate_gsm(samples)
   msg("Detected %d sample(s): %s", length(samples),
       paste(vapply(samples, function(s) sprintf("%s[%s]", s$sample_id, s$type), character(1)), collapse = ", "))
 
@@ -135,7 +136,7 @@ process_dataset <- function(ds) {
   ann <- ann %>% rename(population_panel = population) %>%
     left_join(sizes, by = "cluster") %>% left_join(sr_major, by = "cluster") %>%
     left_join(top_mk, by = "cluster") %>% left_join(ref_major, by = "cluster") %>%
-    mutate(dataset = ds$name, species = ds$species,
+    mutate(dataset = ds$name, group = ds$group, species = ds$species,
            cluster_name = paste0("Cluster_", cluster),
            annotation_method = if (use_singler) "singler_majority" else "marker_panel",
            population = if (use_singler) ifelse(is.na(singler_majority), "Unassigned", singler_majority)
@@ -144,7 +145,7 @@ process_dataset <- function(ds) {
            compartment_singler = compartment_of(singler_majority),
            compartment_agreement = ifelse(is.na(compartment_singler) | population_panel == "Unassigned", NA,
                                           compartment_panel == compartment_singler)) %>%
-    select(dataset, species, cluster, cluster_name, n_cells, pct_cells, population, annotation_method,
+    select(dataset, group, species, cluster, cluster_name, n_cells, pct_cells, population, annotation_method,
            population_panel, singler_majority, singler_fraction, compartment_agreement,
            reference_majority, reference_fraction,
            best_panel, panel_score, runner_up, runner_up_score, margin, top_markers) %>%
@@ -198,7 +199,7 @@ process_dataset <- function(ds) {
   msg("Outputs written to %s", out_dir)
   print(ann[, c("cluster", "n_cells", "population", "singler_majority", "compartment_agreement")])
 
-  res <- data.frame(dataset = ds$name, species = ds$species, dir = out_dir, status = "ok",
+  res <- data.frame(dataset = ds$name, group = ds$group, species = ds$species, dir = out_dir, status = "ok",
                     n_samples = length(unique(seu$sample)), n_cells = ncol(seu),
                     n_clusters = length(levels(seu$seurat_clusters)))
   rm(seu); gc(verbose = FALSE)

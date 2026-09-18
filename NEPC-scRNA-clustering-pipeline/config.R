@@ -4,8 +4,10 @@
 # ============================================================================
 # CONFIG
 # ============================================================================
-NEPC_ROOT <- "/Volumes/Jingjing_Chen/NEPC scRNA dataset"
-OUT_CROSS <- file.path(NEPC_ROOT, "nepc_cross_dataset")
+NEPC_ROOT  <- "/Volumes/Jingjing_Chen/NEPC scRNA dataset"
+ADENO_ROOT <- "/Volumes/Jingjing_Chen/Adenocarcinoma scRNA dataset"
+# cross-dataset results (both groups) — per-dataset results stay in <dataset>/nepc_clustering/
+OUT_CROSS  <- "/Volumes/Jingjing_Chen/NEPC_vs_Adeno_scRNA_results"
 
 cfg <- list(
   run_part1 = TRUE,
@@ -75,9 +77,13 @@ cfg <- list(
   ann_min_margin = 0.10,          # winner minus runner-up
   save_rds           = TRUE,
 
-  # ---- Part 2: recurrence ----
-  recurrence_min_datasets = 3,    # populations in MORE THAN this many datasets
+  # ---- Part 2: recurrence -> group-specific cell sets ----
+  recurrence_min_datasets = 3,    # a population in MORE THAN this many datasets of a group = group-specific cell set
   recurrence_count_by     = "datasets",   # "datasets" | "clusters"
+  composition_min_cells_sample = 50,      # samples with fewer cells are excluded from composition means
+
+  # ---- Part 3: which groups' cell sets are correlated with the NEPC signature ----
+  correlate_groups = c("NEPC"),   # c("NEPC", "Adeno") to also run the adenocarcinoma cell sets
 
   # ---- Part 3: signatures ----
   consensus_min_datasets = 2,
@@ -115,15 +121,36 @@ cfg <- list(
   min_samples_cor = 10
 )
 
-datasets <- list(
-  list(name = "GSE137829",     dir = file.path(NEPC_ROOT, "GSE137829"),     species = "human"),
-  list(name = "GSE210358",     dir = file.path(NEPC_ROOT, "GSE210358"),     species = "human"),
-  list(name = "GSE210358_TKO", dir = file.path(NEPC_ROOT, "GSE210358_TKO"), species = "mouse"),
-  list(name = "GSE235036_TKO", dir = file.path(NEPC_ROOT, "GSE235036_TKO"), species = "mouse"),
-  list(name = "GSE264573",     dir = file.path(NEPC_ROOT, "GSE264573"),     species = "human"),
-  list(name = "GSE292074",     dir = file.path(NEPC_ROOT, "GSE292074"),     species = "human"),
-  list(name = "GSE296986_TKO", dir = file.path(NEPC_ROOT, "GSE296986_TKO"), species = "mouse")
+# Two dataset groups. Every folder is one dataset; name = <group>_<accession> because
+# several accessions occur in both groups.
+NEPC_DATASETS <- list(
+  list(accession = "GSE137829",     species = "human"),
+  list(accession = "GSE210358",     species = "human"),
+  list(accession = "GSE210358_TKO", species = "mouse"),
+  list(accession = "GSE235036_TKO", species = "mouse"),
+  list(accession = "GSE264573",     species = "human"),
+  list(accession = "GSE292074",     species = "human"),
+  list(accession = "GSE296986_TKO", species = "mouse")
 )
+ADENO_DATASETS <- list(
+  list(accession = "GSE137829", species = "human"),
+  list(accession = "GSE141445", species = "human"),   # raw + processed matrices for GSM4203181: triaged
+  list(accession = "GSE176031", species = "human"),
+  list(accession = "GSE181294", species = "human"),
+  list(accession = "GSE210358", species = "human"),
+  list(accession = "GSE264573", species = "human"),
+  list(accession = "GSE268307", species = "human"),
+  list(accession = "GSE292074", species = "human"),
+  list(accession = "GSE296986", species = "mouse")
+)
+datasets <- c(
+  lapply(NEPC_DATASETS,  function(d) list(name = paste0("NEPC_", d$accession),  accession = d$accession,
+                                          dir = file.path(NEPC_ROOT, d$accession),  species = d$species, group = "NEPC")),
+  lapply(ADENO_DATASETS, function(d) list(name = paste0("Adeno_", d$accession), accession = d$accession,
+                                          dir = file.path(ADENO_ROOT, d$accession), species = d$species, group = "Adeno"))
+)
+GROUPS <- c("NEPC", "Adeno")
+group_datasets <- function(group) Filter(function(d) identical(d$group, group), datasets)
 
 # ============================================================================
 # SIGNATURES
