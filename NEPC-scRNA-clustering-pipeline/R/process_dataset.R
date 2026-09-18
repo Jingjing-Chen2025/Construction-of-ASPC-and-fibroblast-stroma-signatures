@@ -60,13 +60,10 @@ process_dataset <- function(ds) {
   if (!length(vf)) stop("No variable features could be determined")
   seu <- ScaleData(seu, features = vf, verbose = FALSE)
   npcs <- min(cfg$npcs, ncol(seu) - 1, length(vf) - 1)
-  seu <- RunPCA(seu, npcs = npcs, verbose = FALSE)
-  seu <- FindNeighbors(seu, dims = 1:npcs, verbose = FALSE)
-  seu <- FindClusters(seu, resolution = cfg$resolution, verbose = FALSE)
-  seu <- RunUMAP(seu, dims = 1:npcs, verbose = FALSE)
-  seu <- join_layers_safe(seu)
-  Idents(seu) <- seu$seurat_clusters
-  msg("Clusters found: %d (resolution %g, %d PCs)", length(levels(seu$seurat_clusters)), cfg$resolution, npcs)
+  integ <- if (identical(cfg$integrate_samples, "harmony")) "sample" else NULL
+  seu <- embed_and_cluster(seu, npcs, cfg$resolution, cfg$extra_resolutions, integ, label = "")
+  rt <- resolution_table(seu)
+  if (!is.null(rt)) write.csv(rt, file.path(out_dir, "nepc_clusters_by_resolution.csv"), row.names = FALSE)
   gc(verbose = FALSE)
 
   # ---- STEP 3: markers ----
@@ -101,6 +98,23 @@ process_dataset <- function(ds) {
   }
   seu$singler_label <- lab                                   # reference label as returned
   seu$singler_population <- harmonize_singler_label(lab)     # shared human/mouse vocabulary
+  # optional prostate-specific reference (Song 2022 / Henry 2018 ...) as a third label
+  ref_lab <- run_singler_custom(seu, cfg$prostate_reference_rds, cfg$prostate_reference_label)
+  seu$reference_label <- NA_character_
+  if (!is.null(ref_lab)) seu$reference_label[match(names(ref_lab), colnames(seu))] <- unname(ref_lab)
+  ref_major <- if (!is.null(ref_lab)) seu@meta.data %>%
+    mutate(cluster = as.character(seurat_clusters)) %>% filter(!is.na(reference_label)) %>%
+    count(cluster, reference_label, name = "n_lab") %>% group_by(cluster) %>%
+    mutate(frac = n_lab / sum(n_lab)) %>% slice_max(order_by = n_lab, n = 1, with_ties = FALSE) %>%
+    ungroup() %>% transmute(cluster, reference_majority = reference_label, reference_fraction = round(frac, 3))
+  else data.frame(cluster = character(0), reference_majority = character(0), reference_fraction = numeric(0))
+  # per-cell panel scores (UCell if installed)
+  cell_scores <- tryCatch(score_cells(seu, POPULATION_MARKERS), error = function(e) {
+    warn_msg("per-cell scoring failed: %s", conditionMessage(e)); NULL })
+  if (!is.null(cell_scores)) {
+    for (p in colnames(cell_scores)) seu[[paste0("score_", p)]] <- unname(cell_scores[colnames(seu), p])
+    msg("  per-cell panel scores: %s (%d panels)", attr(cell_scores, "method"), ncol(cell_scores))
+  }
   sr_major <- seu@meta.data %>%
     mutate(cluster = as.character(seurat_clusters)) %>%
     filter(!is.na(singler_population)) %>%
@@ -120,16 +134,23 @@ process_dataset <- function(ds) {
   use_singler <- identical(cfg$annotation_method, "singler")
   ann <- ann %>% rename(population_panel = population) %>%
     left_join(sizes, by = "cluster") %>% left_join(sr_major, by = "cluster") %>%
-    left_join(top_mk, by = "cluster") %>%
+    left_join(top_mk, by = "cluster") %>% left_join(ref_major, by = "cluster") %>%
     mutate(dataset = ds$name, species = ds$species,
            cluster_name = paste0("Cluster_", cluster),
            annotation_method = if (use_singler) "singler_majority" else "marker_panel",
            population = if (use_singler) ifelse(is.na(singler_majority), "Unassigned", singler_majority)
-                        else population_panel) %>%
+                        else population_panel,
+           compartment_panel = compartment_of(population_panel),
+           compartment_singler = compartment_of(singler_majority),
+           compartment_agreement = ifelse(is.na(compartment_singler) | population_panel == "Unassigned", NA,
+                                          compartment_panel == compartment_singler)) %>%
     select(dataset, species, cluster, cluster_name, n_cells, pct_cells, population, annotation_method,
-           singler_majority, singler_fraction, population_panel,
+           population_panel, singler_majority, singler_fraction, compartment_agreement,
+           reference_majority, reference_fraction,
            best_panel, panel_score, runner_up, runner_up_score, margin, top_markers) %>%
     arrange(suppressWarnings(as.numeric(cluster)))
+  n_dis <- sum(ann$compartment_agreement %in% FALSE)
+  if (n_dis > 0) warn_msg("%d cluster(s) where the marker panel and SingleR disagree on the compartment; see nepc_cluster_annotation.csv", n_dis)
   if (use_singler && all(is.na(ann$singler_majority))) {
     warn_msg("SingleR produced no labels; clusters are Unassigned (set cfg$annotation_method = 'panel' to use marker panels)")
   }
@@ -137,6 +158,8 @@ process_dataset <- function(ds) {
 
   pop_map <- setNames(ann$population, ann$cluster)
   seu$population <- unname(pop_map[as.character(seu$seurat_clusters)])
+  panel_map <- setNames(ann$population_panel, ann$cluster)
+  seu$population_panel <- unname(panel_map[as.character(seu$seurat_clusters)])
   seu$cluster_name <- paste0("Cluster_", seu$seurat_clusters)
   seu$cluster_population <- paste0("C", seu$seurat_clusters, ":", seu$population)
   seu$celltype <- seu$singler_label                       # batch-pipeline column name
@@ -173,7 +196,7 @@ process_dataset <- function(ds) {
 
   if (isTRUE(cfg$save_rds)) saveRDS(seu, rds_path)
   msg("Outputs written to %s", out_dir)
-  print(ann[, c("cluster", "n_cells", "population", "singler_fraction", "population_panel")])
+  print(ann[, c("cluster", "n_cells", "population", "singler_majority", "compartment_agreement")])
 
   res <- data.frame(dataset = ds$name, species = ds$species, dir = out_dir, status = "ok",
                     n_samples = length(unique(seu$sample)), n_cells = ncol(seu),

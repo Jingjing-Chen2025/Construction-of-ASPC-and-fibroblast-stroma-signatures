@@ -40,7 +40,7 @@ cluster_panel_scores <- function(seu, panels, cluster_col = "seurat_clusters") {
   list(scores = scores, cluster_means = means, detected = detected)
 }
 
-assign_population <- function(scores) {
+assign_population <- function(scores, min_score = cfg$ann_min_score, min_margin = cfg$ann_min_margin) {
   rows <- lapply(seq_len(nrow(scores)), function(i) {
     s <- scores[i, ]; s <- s[!is.na(s)]
     if (!length(s)) {
@@ -52,7 +52,7 @@ assign_population <- function(scores) {
     top <- unname(s[o[1]])
     second <- if (length(s) > 1) unname(s[o[2]]) else NA_real_
     margin <- if (is.na(second)) top else top - second
-    lab <- if (top >= cfg$ann_min_score && margin >= cfg$ann_min_margin) names(s)[o[1]] else "Unassigned"
+    lab <- if (top >= min_score && margin >= min_margin) names(s)[o[1]] else "Unassigned"
     data.frame(cluster = rownames(scores)[i], population = lab,
                best_panel = names(s)[o[1]], panel_score = top,
                runner_up = if (length(s) > 1) names(s)[o[2]] else NA_character_,
@@ -103,3 +103,75 @@ run_singler <- function(seu, species) {
   }, error = function(e) { warn_msg("  SingleR failed: %s", conditionMessage(e)); NULL })
 }
 
+
+# ============================================================================
+# Per-cell panel scores (UCell if installed, otherwise mean of per-gene z-scores)
+# ============================================================================
+score_cells <- function(seu, panels) {
+  dat <- get_data_layer(seu)
+  genes_up <- toupper(rownames(dat))
+  panels_present <- lapply(panels, function(g) rownames(dat)[match(intersect(g, genes_up), genes_up)])
+  panels_present <- panels_present[vapply(panels_present, length, integer(1)) >= 2]
+  if (!length(panels_present)) stop("No panel genes present for per-cell scoring")
+  if (requireNamespace("UCell", quietly = TRUE)) {
+    sc <- UCell::ScoreSignatures_UCell(dat, features = panels_present, name = "")
+    sc <- as.matrix(sc)[colnames(dat), , drop = FALSE]
+    attr(sc, "method") <- "UCell"
+    return(sc)
+  }
+  sub <- dat[unique(unlist(panels_present)), , drop = FALSE]
+  mu  <- Matrix::rowMeans(sub)
+  sdv <- sqrt(Matrix::rowMeans(sub^2) - mu^2); sdv[!is.finite(sdv) | sdv == 0] <- 1
+  sc  <- vapply(names(panels_present), function(p) {
+    g <- panels_present[[p]]
+    z <- (as.matrix(sub[g, , drop = FALSE]) - mu[g]) / sdv[g]
+    colMeans(z)
+  }, numeric(ncol(sub)))
+  sc <- matrix(sc, nrow = ncol(sub), dimnames = list(colnames(sub), names(panels_present)))
+  attr(sc, "method") <- "mean_z"
+  sc
+}
+
+# compartment agreement between the panel label and the SingleR majority label
+compartment_of <- function(x) {
+  out <- unname(PANEL_COMPARTMENT[as.character(x)])
+  out[is.na(out) & !is.na(x)] <- "unknown"
+  out
+}
+
+# ---- SingleR with an optional user-supplied reference ----------------------
+load_reference_object <- function(path, label_col) {
+  ref <- readRDS(path)
+  if (inherits(ref, "Seurat")) ref <- Seurat::as.SingleCellExperiment(ref)
+  if (!inherits(ref, "SummarizedExperiment")) stop("Reference must be a Seurat or SingleCellExperiment object: ", path)
+  if (!label_col %in% colnames(SummarizedExperiment::colData(ref)))
+    stop("Reference has no column '", label_col, "'. Available: ",
+         paste(head(colnames(SummarizedExperiment::colData(ref)), 20), collapse = ", "))
+  if (!"logcounts" %in% SummarizedExperiment::assayNames(ref)) {
+    if ("counts" %in% SummarizedExperiment::assayNames(ref)) {
+      ref <- scuttle::logNormCounts(ref)
+    } else stop("Reference has neither logcounts nor counts")
+  }
+  ref
+}
+
+run_singler_custom <- function(seu, ref_path, label_col, max_cells = cfg$singler_max_cells) {
+  if (is.null(ref_path) || !file.exists(ref_path)) return(NULL)
+  if (!requireNamespace("SingleR", quietly = TRUE)) return(NULL)
+  tryCatch({
+    ref <- load_reference_object(ref_path, label_col)
+    obj <- seu
+    if (ncol(obj) > max_cells) obj <- subset(obj, cells = sample(colnames(obj), max_cells))
+    sce <- suppressWarnings(Seurat::as.SingleCellExperiment(obj))
+    # match genes case-insensitively (mouse queries against a human reference)
+    rownames(sce) <- toupper(rownames(sce)); rownames(ref) <- toupper(rownames(ref))
+    sce <- sce[!duplicated(rownames(sce)), ]; ref <- ref[!duplicated(rownames(ref)), ]
+    common <- intersect(rownames(sce), rownames(ref))
+    msg("  custom reference %s: %d shared genes, %d labels", basename(ref_path), length(common),
+        length(unique(SummarizedExperiment::colData(ref)[[label_col]])))
+    sr <- SingleR::SingleR(test = sce[common, ], ref = ref[common, ],
+                           labels = SummarizedExperiment::colData(ref)[[label_col]],
+                           assay.type.test = "logcounts")
+    setNames(sr$labels, colnames(obj))
+  }, error = function(e) { warn_msg("  custom-reference SingleR failed: %s", conditionMessage(e)); NULL })
+}

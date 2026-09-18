@@ -20,8 +20,10 @@
 #   R/readers.R                 format-specific matrix readers
 #   R/discovery.R               sample discovery + per-sample loading and QC
 #   R/annotation.R              cluster annotation (marker panels + SingleR)
-#   R/process_dataset.R         PART 1: one dataset end to end
-#   R/recurrence.R              PART 2: collect Part 1 outputs
+#   R/clustering.R              PCA -> Harmony -> clustering at several resolutions -> UMAP
+#   R/process_dataset.R         PART 1: coarse tier, one dataset end to end
+#   R/stromal_aspc.R            PART 1b: integrated stromal tier (ASPC) across datasets
+#   R/recurrence.R              PART 2: collect Part 1 / 1b outputs
 #   R/signatures_cbioportal.R   PART 3: signatures, cBioPortal, scoring, correlation
 #   run_pipeline.R              this file: runs Parts 1-3
 #
@@ -68,8 +70,8 @@ if (!file.exists(file.path(PIPELINE_DIR, "config.R")) || !dir.exists(file.path(P
        "). Run with Rscript run_pipeline.R from the pipeline folder, or setwd() to it first.")
 }
 source(file.path(PIPELINE_DIR, "config.R"))
-for (mod in c("helpers", "readers", "discovery", "annotation", "process_dataset",
-              "recurrence", "signatures_cbioportal")) {
+for (mod in c("helpers", "readers", "discovery", "clustering", "annotation", "process_dataset",
+              "stromal_aspc", "recurrence", "signatures_cbioportal")) {
   source(file.path(PIPELINE_DIR, "R", paste0(mod, ".R")))
 }
 cat("\n[INFO] Pipeline version", SCRIPT_VERSION, "loaded from", PIPELINE_DIR, "\n")
@@ -103,6 +105,14 @@ if (isTRUE(cfg$run_part1)) {
 }
 
 # ============================================================================
+# PART 1b — integrated stromal tier (ASPC) across all datasets
+# ============================================================================
+if (isTRUE(cfg$run_part1) && isTRUE(cfg$run_stromal_tier)) {
+  stromal_res <- tryCatch(run_stromal_tier(), error = function(e) {
+    warn_msg("STROMAL TIER FAILED: %s", clean_msg(conditionMessage(e))); NULL })
+}
+
+# ============================================================================
 # PART 2 — recurrent populations across datasets
 # ============================================================================
 recurrent <- NULL
@@ -113,9 +123,10 @@ if (isTRUE(cfg$run_part2) || isTRUE(cfg$run_part3)) {
   if (!nrow(all_ann)) stop("No Part 1 annotation tables found; run Part 1 first.")
   write.csv(all_ann, file.path(OUT_CROSS, "nepc_all_cluster_annotations.csv"), row.names = FALSE)
 
+  all_ann <- all_ann %>% filter(n_cells >= cfg$min_cells_population)
   recurrence <- all_ann %>%
-    filter(population != "Unassigned") %>%
-    group_by(population) %>%
+    filter(!population %in% c("Unassigned", "Contaminant")) %>%
+    group_by(tier, population) %>%
     summarise(n_datasets = n_distinct(dataset),
               n_clusters = n(),
               total_cells = sum(n_cells),
@@ -129,8 +140,8 @@ if (isTRUE(cfg$run_part2) || isTRUE(cfg$run_part3)) {
     arrange(desc(n_datasets), desc(n_clusters))
   write.csv(recurrence, file.path(OUT_CROSS, "nepc_population_recurrence.csv"), row.names = FALSE)
 
-  presence <- all_ann %>% filter(population != "Unassigned") %>%
-    count(population, dataset, name = "n_clusters") %>%
+  presence <- all_ann %>% filter(!population %in% c("Unassigned", "Contaminant")) %>%
+    count(tier, population, dataset, name = "n_clusters") %>%
     pivot_wider(names_from = dataset, values_from = n_clusters, values_fill = 0)
   write.csv(presence, file.path(OUT_CROSS, "nepc_population_presence_matrix.csv"), row.names = FALSE)
 
@@ -139,7 +150,7 @@ if (isTRUE(cfg$run_part2) || isTRUE(cfg$run_part3)) {
 
   cat("\nPopulations appearing in more than", cfg$recurrence_min_datasets, cfg$recurrence_count_by, ":\n")
   if (nrow(recurrent)) {
-    print(as.data.frame(recurrent[, c("population", "n_datasets", "n_clusters", "total_cells", "datasets")]))
+    print(as.data.frame(recurrent[, c("tier", "population", "n_datasets", "n_clusters", "total_cells", "datasets")]))
   } else cat("  (none)\n")
 }
 
@@ -155,13 +166,13 @@ if (isTRUE(cfg$run_part3)) {
     signatures  <- build_signatures(recurrent, all_markers)
     if (!nrow(signatures)) stop("No signatures could be built for the recurrent populations.")
     write.csv(signatures, file.path(OUT_CROSS, "nepc_recurrent_population_signatures.csv"), row.names = FALSE)
-    sig_n <- signatures %>% filter(used_for_scoring) %>% count(population, signature_type, name = "n_genes")
+    sig_n <- signatures %>% filter(used_for_scoring) %>% count(tier, population, signature_type, name = "n_genes")
     msg("Signatures (genes used for scoring): %s",
-        paste(sprintf("%s/%s=%d", sig_n$population, sig_n$signature_type, sig_n$n_genes), collapse = ", "))
+        paste(sprintf("%s:%s/%s=%d", sig_n$tier, sig_n$population, sig_n$signature_type, sig_n$n_genes), collapse = ", "))
 
     genes_needed <- unique(c(NEPC_BELTRAN_CUSTOM_UP, signatures$gene[signatures$used_for_scoring]))
     sig_sets <- signatures %>% filter(used_for_scoring) %>%
-      group_by(population, signature_type) %>% summarise(genes = list(gene), .groups = "drop")
+      group_by(tier, population, signature_type) %>% summarise(genes = list(gene), .groups = "drop")
 
     summary_rows <- list(); gene_rows <- list(); profiles_used <- list(); plots <- list()
 
@@ -185,22 +196,22 @@ if (isTRUE(cfg$run_part3)) {
       scores <- data.frame(sample_id = colnames(logmat), NEPC_score = unname(nepc$score))
 
       for (i in seq_len(nrow(sig_sets))) {
-        pop <- sig_sets$population[i]; typ <- sig_sets$signature_type[i]
+        pop <- sig_sets$population[i]; typ <- sig_sets$signature_type[i]; tr <- sig_sets$tier[i]
         gs  <- sig_sets$genes[[i]]
         sc  <- score_signature(logmat, gs)
-        col <- paste0(pop, "__", typ)
+        col <- paste0(tr, ":", pop, "__", typ)
         scores[[col]] <- unname(sc$score)
         for (m in c("pearson", "spearman")) {
           cp <- cor_pair(sc$score, nepc$score, m)
           summary_rows[[length(summary_rows) + 1]] <- data.frame(
-            study_id = st$study_id, cohort = st$label, population = pop, signature_type = typ,
+            study_id = st$study_id, cohort = st$label, tier = tr, population = pop, signature_type = typ,
             n_genes_signature = length(gs), n_genes_present = length(sc$genes),
             method = m, r = unname(cp["r"]), p = unname(cp["p"]), n_samples = unname(cp["n"]))
         }
         for (g in sc$genes) {
           cp <- cor_pair(logmat[g, ], nepc$score, "spearman")
           gene_rows[[length(gene_rows) + 1]] <- data.frame(
-            study_id = st$study_id, population = pop, signature_type = typ, gene = g,
+            study_id = st$study_id, tier = tr, population = pop, signature_type = typ, gene = g,
             rho = unname(cp["r"]), p = unname(cp["p"]), n_samples = unname(cp["n"]))
         }
       }
@@ -227,15 +238,15 @@ if (isTRUE(cfg$run_part3)) {
         arrange(study_id, method, desc(abs(r)))
       write.csv(cor_summary, file.path(OUT_CROSS, "nepc_nepc_correlation_summary.csv"), row.names = FALSE)
       cat("\nCorrelation of recurrent-population signatures with the NEPC signature:\n")
-      print(as.data.frame(cor_summary %>% select(study_id, population, signature_type, method, r, p, p_adj_BH, n_samples)))
+      print(as.data.frame(cor_summary %>% select(study_id, tier, population, signature_type, method, r, p, p_adj_BH, n_samples)))
 
       cor_wide <- cor_summary %>% filter(method == "pearson") %>%
-        select(population, signature_type, study_id, r) %>%
+        select(tier, population, signature_type, study_id, r) %>%
         pivot_wider(names_from = study_id, values_from = r, names_prefix = "pearson_r_")
       write.csv(cor_wide, file.path(OUT_CROSS, "nepc_nepc_correlation_wide.csv"), row.names = FALSE)
 
       # heatmap of correlation coefficients
-      hm <- cor_summary %>% mutate(sig = paste0(population, "\n", signature_type))
+      hm <- cor_summary %>% mutate(sig = paste0(tier, ": ", population, "\n", signature_type))
       p_hm <- ggplot(hm, aes(x = study_id, y = sig, fill = r)) + geom_tile() +
         geom_text(aes(label = sprintf("%.2f\np=%.1e", r, p)), size = 2.5) +
         scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick", limits = c(-1, 1)) +

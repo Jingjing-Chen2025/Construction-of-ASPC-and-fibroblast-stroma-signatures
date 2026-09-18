@@ -21,8 +21,8 @@ build_consensus_signature <- function(pop, all_markers) {
 
 # canonical panel for a population name from either annotation method
 canonical_signature_for <- function(pop) {
+  if (!is.null(EXTRA_SIGNATURES[[pop]]))   return(EXTRA_SIGNATURES[[pop]])   # stromal-tier panels first
   if (!is.null(POPULATION_MARKERS[[pop]])) return(POPULATION_MARKERS[[pop]])
-  if (!is.null(EXTRA_SIGNATURES[[pop]]))   return(EXTRA_SIGNATURES[[pop]])
   panel <- unname(SINGLER_TO_PANEL[pop])
   if (!is.na(panel)) {
     if (!is.null(POPULATION_MARKERS[[panel]])) return(POPULATION_MARKERS[[panel]])
@@ -33,16 +33,19 @@ canonical_signature_for <- function(pop) {
 
 build_signatures <- function(recurrent, all_markers) {
   out <- list()
-  for (pop in recurrent$population) {
+  if (!"tier" %in% colnames(recurrent)) recurrent$tier <- "coarse"
+  if (!"tier" %in% colnames(all_markers) && nrow(all_markers)) all_markers$tier <- "coarse"
+  for (i in seq_len(nrow(recurrent))) {
+    pop <- recurrent$population[i]; tier <- recurrent$tier[i]
     canon <- canonical_signature_for(pop)
     if (is.null(canon)) warn_msg("No canonical panel for population '%s'; consensus markers only", pop)
     if (!is.null(canon)) {
-      out[[length(out) + 1]] <- data.frame(population = pop, signature_type = "canonical", gene = canon,
+      out[[length(out) + 1]] <- data.frame(population = pop, tier = tier, signature_type = "canonical", gene = canon,
                                            n_datasets = NA_integer_, mean_log2FC = NA_real_)
     }
-    cons <- build_consensus_signature(pop, all_markers)
+    cons <- build_consensus_signature(pop, all_markers[all_markers$tier == tier, , drop = FALSE])
     if (!is.null(cons)) {
-      out[[length(out) + 1]] <- data.frame(population = pop, signature_type = "consensus_markers",
+      out[[length(out) + 1]] <- data.frame(population = pop, tier = tier, signature_type = "consensus_markers",
                                            gene = cons$gene, n_datasets = cons$n_datasets,
                                            mean_log2FC = round(cons$mean_log2FC, 3))
     } else warn_msg("No consensus markers for %s (need >= %d datasets)", pop, cfg$consensus_min_datasets)

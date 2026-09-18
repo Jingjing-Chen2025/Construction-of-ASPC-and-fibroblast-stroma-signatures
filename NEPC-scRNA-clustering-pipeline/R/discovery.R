@@ -79,6 +79,31 @@ scan_dataset <- function(dir_path) {
   samples
 }
 
+# scDblFinder per sample (skipped when the package is missing or the sample is tiny)
+remove_doublets_safe <- function(seu, sample_name) {
+  if (!isTRUE(cfg$remove_doublets)) return(seu)
+  if (!requireNamespace("scDblFinder", quietly = TRUE) || !requireNamespace("SingleCellExperiment", quietly = TRUE)) {
+    if (!isTRUE(.doublet_warned)) {
+      warn_msg("scDblFinder not installed; doublets are not removed (BiocManager::install('scDblFinder'))")
+      assign(".doublet_warned", TRUE, envir = globalenv())
+    }
+    return(seu)
+  }
+  if (ncol(seu) < 200) return(seu)
+  cls <- tryCatch({
+    sce <- SingleCellExperiment::SingleCellExperiment(list(counts = get_counts_layer(seu)))
+    sce <- scDblFinder::scDblFinder(sce, verbose = FALSE)
+    as.character(sce$scDblFinder.class)
+  }, error = function(e) { warn_msg("  scDblFinder failed for %s: %s", sample_name, conditionMessage(e)); NULL })
+  if (is.null(cls)) return(seu)
+  seu$doublet_class <- cls
+  n_d <- sum(cls == "doublet")
+  if (n_d > 0) seu <- subset(seu, cells = colnames(seu)[cls != "doublet"])
+  msg("  Doublets %s: %d removed (%.1f%%)", sample_name, n_d, 100 * n_d / length(cls))
+  seu
+}
+.doublet_warned <- FALSE
+
 load_sample <- function(s, ds) {
   m <- switch(s$type,
     triplet_10x = read_triplet_10x(s$barcodes, s$features, s$matrix, s$sample_id),
@@ -112,6 +137,7 @@ load_sample <- function(s, ds) {
   if (any(!keep)) seu <- subset(seu, cells = colnames(seu)[keep])
   msg("  QC %s: %d -> %d cells (mito > %g%% or nFeature > %s removed; %d MT genes)",
       s$sample_id, n_before, ncol(seu), cfg$max_mito_pct, format(cfg$max_features_cell), n_mt)
+  seu <- remove_doublets_safe(seu, s$sample_id)
 
   seu$sample  <- s$sample_id
   seu$dataset <- ds$name

@@ -31,12 +31,22 @@ A `.txt.gz` / `.csv.gz` file holds one delimited matrix, either genes x cells (f
 
 ## Requirements
 
-R >= 4.1 with: Seurat (v4 or v5), SingleR, celldex, SingleCellExperiment, Matrix, data.table, dplyr, tidyr, tibble, stringr, ggplot2, patchwork, httr, jsonlite. `hdf5r` is only needed for `.h5` inputs.
+R >= 4.1 with: Seurat (v4 or v5), SingleR, celldex, SingleCellExperiment, Matrix, data.table, dplyr, tidyr, tibble, stringr, ggplot2, patchwork, httr, jsonlite.
+
+Recommended (used automatically when installed, skipped with a warning otherwise):
+
+| Package | Used for |
+| --- | --- |
+| `harmony` | integration by sample (coarse tier) and by dataset + sample (stromal tier) |
+| `scDblFinder` | doublet removal per sample |
+| `UCell` | per-cell marker-panel scores (fallback: mean of per-gene z-scores) |
+| `babelgene` | mouse-to-human ortholog mapping for the stromal tier (fallback: upper-casing) |
+| `scuttle` | log-normalising a user-supplied reference that only has counts |
 
 ```r
 install.packages(c("Seurat", "Matrix", "data.table", "dplyr", "tidyr", "tibble",
-                   "stringr", "ggplot2", "patchwork", "httr", "jsonlite"))
-BiocManager::install(c("SingleR", "celldex", "SingleCellExperiment"))
+                   "stringr", "ggplot2", "patchwork", "httr", "jsonlite", "harmony", "babelgene"))
+BiocManager::install(c("SingleR", "celldex", "SingleCellExperiment", "scDblFinder", "UCell", "scuttle"))
 ```
 
 ## Usage
@@ -51,20 +61,30 @@ Parts can be toggled with `cfg$run_part1`, `cfg$run_part2`, `cfg$run_part3`. Par
 
 ## Method
 
-### Part 1 — clustering and annotation (per dataset)
+### Part 1 — coarse tier: clustering and annotation (per dataset)
 
-The clustering and annotation settings follow the multi-cohort batch pipeline (`01_`): 1000 variable genes, 20 PCs, Louvain resolution 0.05, no mitochondrial filter, markers with `min.pct = 0.25`, `logfc.threshold = 0.25`, BH-adjusted p < 0.05, and SingleR with the species-matched celldex reference on counts.
+* Per-cell QC: minimum detected genes (`cfg$min_features_cell`), mitochondrial percentage (`cfg$max_mito_pct`, default 20), doublets removed per sample with scDblFinder (`cfg$remove_doublets`).
+* All samples of a dataset are merged and layers joined, then `NormalizeData` → `FindVariableFeatures(nfeatures = 2000)` → `ScaleData` → `RunPCA(npcs = 30)` → Harmony by sample (`cfg$integrate_samples`) → `FindNeighbors` → `FindClusters` at `cfg$resolution` (0.3) → `RunUMAP`. Clusters are also computed at `cfg$extra_resolutions` and the cluster counts are written to `nepc_clusters_by_resolution.csv` as a stability check.
+* `FindAllMarkers` (positive markers, `min.pct` 0.25, `logfc.threshold` 0.25, BH-adjusted p < 0.05).
+* Cluster annotation combines three sources:
+  * **Marker panels** (`POPULATION_MARKERS` in `config.R`: luminal, basal, club/hillock, neuroendocrine, cycling, fibroblast, ASPC-like adipose progenitor, smooth muscle/myofibroblast, pericyte, endothelial, lymphatic, T, NK, B, plasma, macrophage/myeloid, dendritic, mast, neutrophil, Schwann, erythroid, adipocyte). Per cluster, mean log-normalised expression of every panel gene is z-scored across clusters and averaged per panel; per cell, the same panels are scored with UCell (`score_<panel>` columns in the cell metadata).
+  * **SingleR** with celldex `HumanPrimaryCellAtlasData` / `MouseRNAseqData` (`label.main`, on counts), labels harmonised across the two references (`SINGLER_LABEL_MAP`), majority per cluster. Its compartment (epithelial / stromal / endothelial / immune) is compared with the panel label; disagreements are flagged in `compartment_agreement`.
+  * **Optional prostate reference** (`cfg$prostate_reference_rds`, e.g. Song et al. 2022 or Henry et al. 2018 saved as a Seurat/SingleCellExperiment object with a label column) run through SingleR and reported as `reference_majority`.
+  * `cfg$annotation_method` chooses which label names the cluster: `"panel"` (default) or `"singler"`. The batch-pipeline settings (1000 genes, 20 PCs, resolution 0.05, no mito filter, SingleR majority) are documented in `config.R` and can be restored there.
 
-* Per-cell QC: minimum detected genes (`cfg$min_features_cell`); mitochondrial percentage is computed but not filtered unless `cfg$max_mito_pct` is set.
-* All samples of the dataset are merged (sample of origin is kept in the metadata), layers are joined, then `NormalizeData` → `FindVariableFeatures(nfeatures = 1000)` → `ScaleData` → `RunPCA(npcs = 20)` → `FindNeighbors` → `FindClusters(resolution = 0.05)` → `RunUMAP`. Clusters are named `Cluster_<id>`.
-* `FindAllMarkers` (positive markers, BH-adjusted p < 0.05).
-* Cluster annotation (`cfg$annotation_method`):
-  * **`singler` (default)** — SingleR labels every cell with celldex `HumanPrimaryCellAtlasData` (human) or `MouseRNAseqData` (mouse), `label.main`, tested on counts, at most `cfg$singler_max_cells` cells. Labels of both references are mapped onto one shared vocabulary (`SINGLER_LABEL_MAP` in `config.R`, e.g. `T_cells`/`T cells` → `T_cell`, `Fibroblasts` → `Fibroblast`) so that populations can be compared across human and mouse datasets, and each cluster is named by the majority label of its cells (`singler_fraction` gives the majority share).
-  * **`panel`** — canonical marker panels (`POPULATION_MARKERS`): the mean log-normalised expression of every panel gene is z-scored across clusters and averaged per panel; the best panel names the cluster unless its score or its margin over the runner-up is too low (`Unassigned`). With `singler` this label is still reported as `population_panel`.
+### Part 1b — stromal tier: integrated ASPC identification (all datasets)
+
+Adipose stem and progenitor cells (ASPC, PDGFRA+ CD34+ DPP4+ PI16+) are a minority of the mesenchymal compartment and are not a class in the celldex references, so the coarse tier labels them fibroblasts. The stromal tier resolves them the way the adipose atlases do:
+
+1. From every dataset's coarse result, mesenchymal cells are taken (clusters labelled fibroblast, ASPC, smooth muscle or pericyte by the panels, or fibroblast / smooth muscle / tissue stem cell by SingleR; `cfg$stromal_populations`, `cfg$stromal_singler_populations`), at most `cfg$stromal_max_cells_per_dataset` per dataset.
+2. Mouse genes are mapped to human orthologs (babelgene), all datasets are merged and integrated with Harmony by dataset and sample, and reclustered at `cfg$stromal_resolution` (0.5).
+3. Clusters are labelled with the stromal panels (`STROMAL_MARKERS`): ASPC, committed preadipocyte, matrix fibroblast, myCAF, iCAF, smooth muscle, pericyte, Schwann, cycling, and contaminant panels (epithelial, immune, endothelial) that catch doublets and mis-assigned cells.
+4. ASPC is called per cell by consensus: the cell sits in an ASPC-labelled cluster **and** its per-cell ASPC score is above threshold (median + MAD of non-ASPC clusters, or `cfg$aspc_cell_min_score`) and above every competing stromal panel. `aspc_call` records `ASPC_consensus`, `ASPC_cluster_only`, `ASPC_cell_only` or `non_ASPC`. An optional adipose reference with ASPC labels (`cfg$stromal_reference_rds`, e.g. Emont et al. 2022 via Azimuth) adds a third, reference-based vote (`reference_majority`).
+5. Outputs in `<NEPC_ROOT>/nepc_cross_dataset/stromal/`: the integrated object, cluster annotation with the number of cells per dataset and `n_datasets_present`, per-dataset stromal population counts (fed to Part 2), ASPC calls per dataset, integrated and per-dataset markers (fed to Part 3), and UMAPs by cluster, population, dataset, ASPC call and panel scores.
 
 ### Part 2 — recurrent populations
 
-Every non-`Unassigned` population is counted across datasets. A population is *recurrent* when it is present in **more than** `cfg$recurrence_min_datasets` datasets (default 3, i.e. at least 4 of 7). Set `cfg$recurrence_count_by = "clusters"` to count cluster occurrences instead of datasets.
+Every non-`Unassigned` population of both tiers (coarse and stromal, `tier` column) with at least `cfg$min_cells_population` cells in a dataset is counted across datasets. A population is *recurrent* when it is present in **more than** `cfg$recurrence_min_datasets` datasets (default 3, i.e. at least 4 of 7). Set `cfg$recurrence_count_by = "clusters"` to count cluster occurrences instead of datasets.
 
 ### Part 3 — correlation with the NEPC signature
 
@@ -96,7 +116,11 @@ Cross-dataset, in `<NEPC_ROOT>/nepc_cross_dataset/`:
 | `nepc_all_cluster_annotations.csv` | all cluster annotations stacked |
 | `nepc_population_recurrence.csv` | every population with number of datasets/clusters and where it occurs |
 | `nepc_population_presence_matrix.csv` | population x dataset matrix of cluster counts |
-| `nepc_recurrent_populations.csv` | populations present in more than `cfg$recurrence_min_datasets` datasets |
+| `nepc_recurrent_populations.csv` | populations (coarse and stromal tier) present in more than `cfg$recurrence_min_datasets` datasets |
+| `stromal/nepc_stromal_cluster_annotation.csv` | integrated stromal clusters: population, panel score, fraction of cells passing the ASPC score, cells per dataset |
+| `stromal/nepc_aspc_calls_by_dataset.csv` | ASPC consensus / cluster-only / cell-only / non-ASPC counts per dataset |
+| `stromal/nepc_stromal_markers_integrated.csv`, `stromal/nepc_stromal_markers_by_dataset.csv` | stromal population markers (integrated, and per dataset for consensus signatures) |
+| `stromal/nepc_stromal_umap*.pdf`, `stromal/nepc_stromal_integrated.rds` | stromal-tier plots and object |
 | `nepc_recurrent_population_signatures.csv` | canonical and consensus signatures per recurrent population |
 | `nepc_cbioportal_profiles_used.csv` | study, molecular profile and sample list used |
 | `nepc_bulk_log2_expression_<study>.csv` | fetched expression (log2) |
@@ -108,5 +132,5 @@ Cross-dataset, in `<NEPC_ROOT>/nepc_cross_dataset/`:
 
 ## Notes
 
-* Clustering resolution (`cfg$resolution`, default 0.05) and PCs (`cfg$npcs`, default 20) follow the batch pipeline and give coarse compartments; raise the resolution (e.g. 0.3) to separate subpopulations.
+* Malignant versus normal epithelium is not resolved by this pipeline; run inferCNV or copyKAT on the epithelial cells of the coarse result, using immune and stromal cells as the diploid reference.
 * Mouse datasets are annotated with the same human panels via uppercase symbol matching; consensus signatures pool human and mouse markers the same way.

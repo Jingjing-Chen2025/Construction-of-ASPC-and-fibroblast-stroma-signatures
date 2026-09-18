@@ -1,4 +1,10 @@
 # ============================================================================
+# NOTE: this single-file script is SUPERSEDED by the modular pipeline in
+# NEPC-scRNA-clustering-pipeline/ (v2.0: Harmony integration, doublet removal,
+# UCell scoring, and the integrated stromal tier for ASPC). It is kept for
+# reference only and is no longer updated.
+# ============================================================================
+# ============================================================================
 # 07_ NEPC scRNA-seq: per-dataset clustering + cell-population annotation,
 #     recurrent populations across datasets, and correlation of their
 #     signatures with the NEPC (Beltran, custom UP) signature in bulk

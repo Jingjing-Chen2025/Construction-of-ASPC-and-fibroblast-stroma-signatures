@@ -17,10 +17,13 @@ cfg <- list(
   min_cells_gene       = 3,
   min_features_cell    = 200,
   max_features_cell    = Inf,     # e.g. 8000 to drop likely doublets
-  max_mito_pct         = Inf,     # batch-pipeline setting: no mitochondrial filter (e.g. 20 to enable)
-  nfeatures            = 1000,    # batch-pipeline setting
-  npcs                 = 20,      # batch-pipeline setting
-  resolution           = 0.05,    # batch-pipeline setting
+  max_mito_pct         = 20,      # recommended coarse-tier setting (Inf = batch-pipeline setting)
+  remove_doublets      = TRUE,    # scDblFinder per sample (skipped if not installed)
+  nfeatures            = 2000,    # recommended (1000 = batch-pipeline setting)
+  npcs                 = 30,      # recommended (20 = batch-pipeline setting)
+  resolution           = 0.3,     # recommended 0.2-0.5 (0.05 = batch-pipeline setting)
+  extra_resolutions    = c(0.1, 0.2, 0.5, 0.8),   # also stored, for stability checks (clustree-style)
+  integrate_samples    = "harmony",   # "harmony" (by sample, if installed) | "none"
   max_cells_per_sample = Inf,     # e.g. 10000 to subsample huge samples
   chunk_cols           = 2000,    # dense -> sparse conversion chunk size
   min_cells_dataset    = 100,     # abort a dataset with fewer cells after QC
@@ -39,11 +42,34 @@ cfg <- list(
   #            run on counts) — the batch-pipeline setting. The marker-panel
   #            label is still computed and reported as population_panel.
   # "panel":   name clusters by the canonical marker panels instead.
-  annotation_method  = "singler",
+  annotation_method  = "panel",   # recommended: marker panels name the cluster, SingleR checks the compartment
   run_singler        = TRUE,
   singler_max_cells  = 20000,
   singler_assay      = "counts",  # batch-pipeline setting ("logcounts" also works)
   singler_labels     = "label.main",
+  # Optional prostate reference for SingleR instead of celldex (e.g. Song et al. 2022 or
+  # Henry et al. 2018 as a Seurat or SingleCellExperiment .rds with a label column).
+  prostate_reference_rds   = NULL,
+  prostate_reference_label = "cell_type",
+  min_cells_population = 20,      # a population counts for a dataset with at least this many cells
+
+  # ---- Part 1b: stromal tier (ASPC) ----
+  run_stromal_tier            = TRUE,
+  stromal_populations         = c("Fibroblast", "ASPC_adipose_progenitor", "Smooth_muscle_myofibroblast", "Pericyte"),
+  stromal_singler_populations = c("Fibroblast", "Smooth_muscle_cell", "Tissue_stem_cell", "Chondrocyte", "Adipocyte"),
+  stromal_max_cells_per_dataset = 8000,
+  stromal_nfeatures           = 2000,
+  stromal_npcs                = 30,
+  stromal_resolution          = 0.5,
+  stromal_integrate           = "harmony",   # by dataset and sample (if installed)
+  stromal_ann_min_score       = 0.30,
+  stromal_ann_min_margin      = 0.10,
+  aspc_cell_min_score         = NULL,   # per-cell UCell/mean-z threshold; NULL = median of non-ASPC clusters + 1 MAD
+  map_mouse_orthologs         = TRUE,   # babelgene orthologs (skipped if not installed -> toupper)
+  # Optional adipose/stromal reference with ASPC labels (e.g. Emont et al. 2022 via Azimuth
+  # "adiposeref", saved as .rds) for a third, reference-based vote.
+  stromal_reference_rds       = NULL,
+  stromal_reference_label     = "celltype.l2",
   ann_min_genes  = 3,             # panel genes that must be detected
   ann_min_score  = 0.30,          # mean z of the winning panel
   ann_min_margin = 0.10,          # winner minus runner-up
@@ -178,6 +204,41 @@ SINGLER_LABEL_MAP <- c(
   "iPS_cells" = "Stem_cell", "Embryonic_stem_cells" = "Stem_cell"
 )
 
+# Coarse compartment of every panel / SingleR population (used to check agreement).
+PANEL_COMPARTMENT <- c(
+  Luminal_epithelial = "epithelial", Basal_epithelial = "epithelial", Club_Hillock_epithelial = "epithelial",
+  Neuroendocrine = "epithelial", Cycling = "cycling",
+  Fibroblast = "stromal", ASPC_adipose_progenitor = "stromal", Smooth_muscle_myofibroblast = "stromal",
+  Pericyte = "stromal", Adipocyte = "stromal", Schwann_neural = "stromal",
+  Endothelial = "endothelial", Lymphatic_endothelial = "endothelial",
+  T_cell = "immune", NK_cell = "immune", B_cell = "immune", Plasma_cell = "immune",
+  Macrophage_myeloid = "immune", Dendritic_cell = "immune", Mast_cell = "immune", Neutrophil = "immune",
+  Erythroid = "other",
+  # SingleR (harmonised) labels
+  Epithelial_cell = "epithelial", Neuron = "epithelial", Hepatocyte = "epithelial",
+  Smooth_muscle_cell = "stromal", Tissue_stem_cell = "stromal", Chondrocyte = "stromal", Osteoblast = "stromal",
+  Glia = "stromal", Endothelial_cell = "endothelial",
+  Macrophage = "immune", Monocyte = "immune", Granulocyte = "immune", Myeloid_progenitor = "immune",
+  Platelet = "other", Stem_cell = "other"
+)
+
+# Stromal-tier panels (second tier, mesenchymal cells only). Human symbols.
+STROMAL_MARKERS <- list(
+  ASPC_adipose_progenitor = c("PDGFRA","CD34","DPP4","PI16","CD55","WNT2","SEMA3C","ANXA3","CLEC3B","MFAP5","EBF2","CFD","GSN","APOD","IGFBP6","DCN","LUM"),
+  Committed_preadipocyte  = c("ICAM1","PPARG","LPL","CD36","FABP4","APOE","CIDEC","ADIPOQ","PLIN1"),
+  Fibroblast_matrix       = c("COL1A1","COL1A2","COL3A1","FBLN1","SFRP2","COL6A3","LUM","DCN","MGP"),
+  myCAF                   = c("ACTA2","TAGLN","POSTN","COL11A1","FAP","LRRC15","MMP11","COL10A1","CTHRC1","INHBA"),
+  iCAF                    = c("CXCL12","CXCL14","C3","C7","IL6","CCL2","HAS1","PLA2G2A","CFD","APOD"),
+  Smooth_muscle           = c("MYH11","CNN1","DES","ACTG2","MYL9","SYNPO2","LMOD1"),
+  Pericyte                = c("RGS5","PDGFRB","NOTCH3","KCNJ8","HIGD1B","ABCC9","MCAM"),
+  Schwann_neural          = c("PLP1","S100B","MPZ","SOX10","NGFR","CDH19"),
+  Contaminant_epithelial  = c("EPCAM","KRT8","KRT18","KRT5","KLK3","AR"),
+  Contaminant_immune      = c("PTPRC","CD3E","CD68","LYZ","MS4A1"),
+  Contaminant_endothelial = c("PECAM1","VWF","CDH5","CLDN5"),
+  Cycling                 = c("MKI67","TOP2A","CENPF","BIRC5","UBE2C")
+)
+STROMAL_MARKERS <- lapply(STROMAL_MARKERS, toupper)
+
 # Canonical marker panel used for a SingleR-derived population in Part 3.
 SINGLER_TO_PANEL <- c(
   T_cell = "T_cell", B_cell = "B_cell", NK_cell = "NK_cell",
@@ -190,6 +251,7 @@ SINGLER_TO_PANEL <- c(
 )
 
 # Extra canonical signatures for populations without a panel of their own.
-EXTRA_SIGNATURES <- list(
-  Epithelial_cell = toupper(c("EPCAM","KRT8","KRT18","KRT19","CDH1","CLDN4","CLDN7","KRT5","KRT14","KLK3","AR"))
+EXTRA_SIGNATURES <- c(
+  list(Epithelial_cell = toupper(c("EPCAM","KRT8","KRT18","KRT19","CDH1","CLDN4","CLDN7","KRT5","KRT14","KLK3","AR"))),
+  STROMAL_MARKERS[!grepl("^Contaminant", names(STROMAL_MARKERS))]
 )
