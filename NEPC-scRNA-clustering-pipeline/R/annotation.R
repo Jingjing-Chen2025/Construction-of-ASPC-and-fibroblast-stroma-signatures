@@ -165,6 +165,46 @@ score_cells <- function(seu, panels, keys = NULL) {
   sc
 }
 
+# ---- ASPC-aware subclustering of stromal clusters (coarse tier) ----------------
+# Returns seu with seurat_clusters / Idents updated: cells of ASPC-dominated
+# subclusters of a stromal cluster k form the new cluster "<k>A".
+subcluster_aspc <- function(seu, cell_scores, panels = POPULATION_MARKERS) {
+  if (!isTRUE(cfg$aspc_subcluster) || is.null(cell_scores)) return(seu)
+  if (!all(c("ASPC_specific", "Fibroblast_matrix") %in% colnames(cell_scores))) return(seu)
+  graph <- grep("_snn$", names(seu@graphs), value = TRUE)
+  if (!length(graph)) { warn_msg("  no SNN graph found; ASPC subclustering skipped"); return(seu) }
+  cs <- cell_scores[colnames(seu), , drop = FALSE]
+  aspc_high <- cs[, "ASPC_specific"] >= cfg$aspc_ucell_min & cs[, "ASPC_specific"] > cs[, "Fibroblast_matrix"]
+  pan  <- intersect(colnames(cs), names(panels))
+  best <- pan[max.col(cs[, pan, drop = FALSE], ties.method = "first")]
+  stromal_best <- best %in% c("Fibroblast", "ASPC_adipose_progenitor", "Pericyte", "Smooth_muscle_myofibroblast", "Adipocyte")
+  cl <- as.character(seu$seurat_clusters); new_cl <- cl; n_new <- 0L
+  for (k in unique(cl)) {
+    idx <- cl == k
+    if (mean(stromal_best[idx]) < 0.3) next
+    if (mean(aspc_high[idx]) < cfg$aspc_subcluster_min_frac || sum(aspc_high[idx]) < cfg$aspc_subcluster_min_cells) next
+    sub <- tryCatch(FindSubCluster(seu, cluster = k, graph.name = graph[1], subcluster.name = "aspc_sub",
+                                   resolution = cfg$aspc_subcluster_resolution),
+                    error = function(e) { warn_msg("  FindSubCluster failed for cluster %s: %s", k, conditionMessage(e)); NULL })
+    if (is.null(sub)) next
+    sc <- as.character(sub$aspc_sub)[idx]
+    fr <- tapply(aspc_high[idx], sc, mean); nn <- table(sc)
+    hit <- names(fr)[fr >= 0.5 & as.integer(nn[names(fr)]) >= cfg$min_cells_population]
+    if (!length(hit)) { msg("  cluster %s: %.0f%% ASPC-high cells but no ASPC-dominated subcluster", k, 100 * mean(aspc_high[idx])); next }
+    cells_k <- which(idx)[sc %in% hit]
+    new_cl[cells_k] <- paste0(k, "A"); n_new <- n_new + 1L
+    msg("  cluster %s: ASPC subcluster '%sA' with %d cells (%.0f%% ASPC-high) split off", k, k, length(cells_k),
+        100 * mean(aspc_high[cells_k]))
+  }
+  if (n_new > 0) {
+    lv <- unique(new_cl); num <- suppressWarnings(as.numeric(sub("A$", "", lv)))
+    lv <- lv[order(num, grepl("A$", lv))]
+    seu$seurat_clusters <- factor(new_cl, levels = lv)
+    Idents(seu) <- seu$seurat_clusters
+  }
+  seu
+}
+
 # Label from per-cell scores: the panel that is the best panel for the largest
 # fraction of the cluster's cells (magnitude-aware, unlike z-scores across
 # clusters, which let any panel slightly elevated in one cluster reach the

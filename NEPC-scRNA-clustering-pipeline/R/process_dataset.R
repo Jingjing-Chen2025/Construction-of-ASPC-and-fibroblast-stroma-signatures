@@ -74,6 +74,19 @@ process_dataset <- function(ds) {
   if (!is.null(rt)) write.csv(rt, file.path(out_dir, "nepc_clusters_by_resolution.csv"), row.names = FALSE)
   gc(verbose = FALSE)
 
+  # ---- STEP 2b: per-cell panel scores + ASPC-aware subclustering ----
+  keys <- gene_keys(rownames(seu), ds$species)
+  sp_panels <- panels_for_species(ds$species)
+  score_panels <- c(sp_panels, list(ASPC_specific = ASPC_SPECIFIC, Fibroblast_matrix = FIBROBLAST_MATRIX))
+  cell_scores <- tryCatch(score_cells(seu, score_panels, keys = keys), error = function(e) {
+    warn_msg("per-cell scoring failed: %s", conditionMessage(e)); NULL })
+  if (!is.null(cell_scores)) {
+    for (p in colnames(cell_scores)) seu[[paste0("score_", p)]] <- unname(cell_scores[colnames(seu), p])
+    msg("  per-cell panel scores: %s (%d panels)", attr(cell_scores, "method"), ncol(cell_scores))
+  }
+  seu <- subcluster_aspc(seu, cell_scores, sp_panels)
+  msg("Clusters after ASPC subclustering: %d", length(levels(seu$seurat_clusters)))
+
   # ---- STEP 3: markers ----
   markers <- NULL
   if (length(levels(seu$seurat_clusters)) >= 2) {
@@ -91,20 +104,12 @@ process_dataset <- function(ds) {
   }
 
   # ---- STEP 4: annotation (a) canonical panels ----
-  keys <- gene_keys(rownames(seu), ds$species)
-  score_panels <- c(POPULATION_MARKERS, list(ASPC_specific = ASPC_SPECIFIC, Fibroblast_matrix = FIBROBLAST_MATRIX))
-  cell_scores <- tryCatch(score_cells(seu, score_panels, keys = keys), error = function(e) {
-    warn_msg("per-cell scoring failed: %s", conditionMessage(e)); NULL })
-  if (!is.null(cell_scores)) {
-    for (p in colnames(cell_scores)) seu[[paste0("score_", p)]] <- unname(cell_scores[colnames(seu), p])
-    msg("  per-cell panel scores: %s (%d panels)", attr(cell_scores, "method"), ncol(cell_scores))
-  }
   if (identical(cfg$cluster_label_method, "ucell") && !is.null(cell_scores)) {
-    ps <- cluster_panel_scores_ucell(cell_scores, seu$seurat_clusters, POPULATION_MARKERS)
+    ps <- cluster_panel_scores_ucell(cell_scores, seu$seurat_clusters, sp_panels)
     write.csv(cbind(cluster = rownames(ps$cluster_means), as.data.frame(round(ps$cluster_means, 4))),
               file.path(out_dir, "nepc_panel_ucell_mean_by_cluster.csv"), row.names = FALSE)
   } else {
-    ps <- cluster_panel_scores(seu, POPULATION_MARKERS, keys = keys)
+    ps <- cluster_panel_scores(seu, sp_panels, keys = keys)
   }
   if (!is.null(ps$frac_top)) {
     ann <- assign_population_ucell(ps)

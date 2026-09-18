@@ -96,6 +96,12 @@ cfg <- list(
   # ASPC-specific genes outscore the fibroblast matrix genes in that cluster
   aspc_coarse_rule   = TRUE,
   aspc_ucell_min     = 0.10,      # per-cell ASPC-specific UCell score counted as "ASPC-high"
+  # ASPC-aware subclustering: stromal clusters with enough ASPC-high cells are subclustered and
+  # subclusters in which ASPC-high cells are the majority become their own "<k>A" ASPC cluster
+  aspc_subcluster            = TRUE,
+  aspc_subcluster_min_frac   = 0.10,   # fraction of ASPC-high cells in the cluster to trigger
+  aspc_subcluster_min_cells  = 100,    # and at least this many ASPC-high cells
+  aspc_subcluster_resolution = 0.4,
   mouse_immune_reference = "ImmGen",  # second SingleR reference for mouse (NULL = MouseRNAseq only)
   resolution_by_group = NULL,     # e.g. list(NEPC = 0.5) to cluster one group more finely
   save_rds           = TRUE,
@@ -274,9 +280,27 @@ PANEL_COMPARTMENT <- c(
   Platelet = "other", Stem_cell = "other"
 )
 
+# Mouse-specific replacements for panels whose human genes have no mouse counterpart
+# (Klk3/Klk2/Msmb) or a different name (Trp63, Cd24a, Ly6g, Mcpt4). Keys carry both the
+# upper-cased mouse symbol and the human ortholog, so either matching mode works.
+MOUSE_PANEL_OVERRIDES <- lapply(list(
+  Luminal_epithelial = c("KRT8","KRT18","NKX3-1","AR","PBSN","SBP","TGM4","MSMB","CD24A","CD24","HOXB13","SPINK1","FOLH1"),
+  Basal_epithelial   = c("KRT5","KRT14","KRT15","TRP63","TP63","DST","KRT17","LGALS7"),
+  NK_cell            = c("NKG7","GZMA","KLRB1C","NCR1","KLRD1","PRF1","KLRK1","GZMB"),
+  Neutrophil         = c("S100A8","S100A9","CSF3R","RETNLG","LY6G","CXCR2","MMP9","IL1B"),
+  Mast_cell          = c("CPA3","KIT","MS4A2","HDC","TPSB2","MCPT4","CMA1","TPSAB1"),
+  Plasma_cell        = c("JCHAIN","MZB1","XBP1","SDC1","IGKC","PRDM1","IGHM","TNFRSF17")
+), toupper)
+panels_for_species <- function(species) {
+  p <- POPULATION_MARKERS
+  if (identical(species, "mouse")) p[names(MOUSE_PANEL_OVERRIDES)] <- MOUSE_PANEL_OVERRIDES
+  p
+}
+
 # Coarse-tier ASPC rule panels: ASPC-specific genes (not shared with matrix fibroblasts)
 # versus fibroblast matrix genes.
-ASPC_SPECIFIC     <- toupper(c("DPP4","PI16","CD55","CD34","WNT2","CLEC3B","MFAP5","SEMA3C","ANXA3","CD248","IGFBP6","EBF2"))
+# CD34 (endothelium) and ANXA3 (club cells) are left out: they inflate the score outside the stroma.
+ASPC_SPECIFIC     <- toupper(c("DPP4","PI16","CD55","WNT2","CLEC3B","MFAP5","SEMA3C","CD248","IGFBP6","EBF2","GSN","CFD"))
 FIBROBLAST_MATRIX <- toupper(c("COL1A1","COL1A2","COL3A1","FBLN1","SFRP2","COL6A3","POSTN","CTHRC1"))
 
 # Stromal-tier panels (second tier, mesenchymal cells only). Human symbols.

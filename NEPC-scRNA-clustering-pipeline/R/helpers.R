@@ -1,7 +1,7 @@
 # ============================================================================
 # helpers.R — logging, small utilities, Seurat v4/v5 compatibility
 # ============================================================================
-SCRIPT_VERSION <- "nepc_scrna_pipeline_v2.3"
+SCRIPT_VERSION <- "nepc_scrna_pipeline_v2.4"
 
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
 
