@@ -62,7 +62,8 @@ process_dataset <- function(ds) {
   seu <- ScaleData(seu, features = vf, verbose = FALSE)
   npcs <- min(cfg$npcs, ncol(seu) - 1, length(vf) - 1)
   integ <- if (identical(cfg$integrate_samples, "harmony")) "sample" else NULL
-  seu <- embed_and_cluster(seu, npcs, cfg$resolution, cfg$extra_resolutions, integ, label = "")
+  res_used <- cfg$resolution_by_group[[ds$group %||% ""]] %||% cfg$resolution
+  seu <- embed_and_cluster(seu, npcs, res_used, cfg$extra_resolutions, integ, label = "")
   rt <- resolution_table(seu)
   if (!is.null(rt)) write.csv(rt, file.path(out_dir, "nepc_clusters_by_resolution.csv"), row.names = FALSE)
   gc(verbose = FALSE)
@@ -84,8 +85,28 @@ process_dataset <- function(ds) {
   }
 
   # ---- STEP 4: annotation (a) canonical panels ----
-  ps  <- cluster_panel_scores(seu, POPULATION_MARKERS)
-  ann <- assign_population(ps$scores)
+  keys <- gene_keys(rownames(seu), ds$species)
+  score_panels <- c(POPULATION_MARKERS, list(ASPC_specific = ASPC_SPECIFIC, Fibroblast_matrix = FIBROBLAST_MATRIX))
+  cell_scores <- tryCatch(score_cells(seu, score_panels, keys = keys), error = function(e) {
+    warn_msg("per-cell scoring failed: %s", conditionMessage(e)); NULL })
+  if (!is.null(cell_scores)) {
+    for (p in colnames(cell_scores)) seu[[paste0("score_", p)]] <- unname(cell_scores[colnames(seu), p])
+    msg("  per-cell panel scores: %s (%d panels)", attr(cell_scores, "method"), ncol(cell_scores))
+  }
+  if (identical(cfg$cluster_label_method, "ucell") && !is.null(cell_scores)) {
+    ps <- cluster_panel_scores_ucell(cell_scores, seu$seurat_clusters, POPULATION_MARKERS)
+    write.csv(cbind(cluster = rownames(ps$cluster_means), as.data.frame(round(ps$cluster_means, 4))),
+              file.path(out_dir, "nepc_panel_ucell_mean_by_cluster.csv"), row.names = FALSE)
+  } else {
+    ps <- cluster_panel_scores(seu, POPULATION_MARKERS, keys = keys)
+  }
+  if (!is.null(ps$frac_top)) {
+    ann <- assign_population_ucell(ps)
+    write.csv(cbind(cluster = rownames(ps$frac_top), as.data.frame(round(ps$frac_top, 3))),
+              file.path(out_dir, "nepc_panel_best_fraction_by_cluster.csv"), row.names = FALSE)
+  } else {
+    ann <- assign_population(ps$scores); ann$label_cell_fraction <- NA_real_
+  }
   write.csv(cbind(cluster = rownames(ps$scores), as.data.frame(round(ps$scores, 4))),
             file.path(out_dir, "nepc_panel_scores_by_cluster.csv"), row.names = FALSE)
   msg("Panel genes detected: %s",
@@ -109,13 +130,15 @@ process_dataset <- function(ds) {
     mutate(frac = n_lab / sum(n_lab)) %>% slice_max(order_by = n_lab, n = 1, with_ties = FALSE) %>%
     ungroup() %>% transmute(cluster, reference_majority = reference_label, reference_fraction = round(frac, 3))
   else data.frame(cluster = character(0), reference_majority = character(0), reference_fraction = numeric(0))
-  # per-cell panel scores (UCell if installed)
-  cell_scores <- tryCatch(score_cells(seu, POPULATION_MARKERS), error = function(e) {
-    warn_msg("per-cell scoring failed: %s", conditionMessage(e)); NULL })
-  if (!is.null(cell_scores)) {
-    for (p in colnames(cell_scores)) seu[[paste0("score_", p)]] <- unname(cell_scores[colnames(seu), p])
-    msg("  per-cell panel scores: %s (%d panels)", attr(cell_scores, "method"), ncol(cell_scores))
-  }
+  # ASPC-high cells: ASPC-specific score above threshold and above the fibroblast matrix score
+  aspc_tbl <- if (!is.null(cell_scores) && all(c("ASPC_specific", "Fibroblast_matrix") %in% colnames(cell_scores))) {
+    seu$aspc_high <- cell_scores[colnames(seu), "ASPC_specific"] >= cfg$aspc_ucell_min &
+                     cell_scores[colnames(seu), "ASPC_specific"] > cell_scores[colnames(seu), "Fibroblast_matrix"]
+    seu@meta.data %>% mutate(cluster = as.character(seurat_clusters)) %>% group_by(cluster) %>%
+      summarise(frac_cells_aspc_high = round(mean(aspc_high), 3),
+                mean_aspc_specific = round(mean(score_ASPC_specific), 4),
+                mean_fibroblast_matrix = round(mean(score_Fibroblast_matrix), 4), .groups = "drop")
+  } else data.frame(cluster = character(0), frac_cells_aspc_high = numeric(0), mean_aspc_specific = numeric(0), mean_fibroblast_matrix = numeric(0))
   sr_major <- seu@meta.data %>%
     mutate(cluster = as.character(seurat_clusters)) %>%
     filter(!is.na(singler_population)) %>%
@@ -135,7 +158,7 @@ process_dataset <- function(ds) {
   use_singler <- identical(cfg$annotation_method, "singler")
   ann <- ann %>% rename(population_panel = population) %>%
     left_join(sizes, by = "cluster") %>% left_join(sr_major, by = "cluster") %>%
-    left_join(top_mk, by = "cluster") %>% left_join(ref_major, by = "cluster") %>%
+    left_join(top_mk, by = "cluster") %>% left_join(ref_major, by = "cluster") %>% left_join(aspc_tbl, by = "cluster") %>%
     mutate(dataset = ds$name, group = ds$group, species = ds$species,
            cluster_name = paste0("Cluster_", cluster),
            annotation_method = if (use_singler) "singler_majority" else "marker_panel",
@@ -146,10 +169,28 @@ process_dataset <- function(ds) {
            compartment_agreement = ifelse(is.na(compartment_singler) | population_panel == "Unassigned", NA,
                                           compartment_panel == compartment_singler)) %>%
     select(dataset, group, species, cluster, cluster_name, n_cells, pct_cells, population, annotation_method,
-           population_panel, singler_majority, singler_fraction, compartment_agreement,
-           reference_majority, reference_fraction,
+           population_panel, label_cell_fraction, singler_majority, singler_fraction, compartment_agreement,
+           reference_majority, reference_fraction, frac_cells_aspc_high, mean_aspc_specific, mean_fibroblast_matrix,
            best_panel, panel_score, runner_up, runner_up_score, margin, top_markers) %>%
     arrange(suppressWarnings(as.numeric(cluster)))
+  # ---- coarse-tier ASPC rule ----
+  ann$aspc_rule_applied <- FALSE
+  if (isTRUE(cfg$aspc_coarse_rule)) {
+    stromal_like <- ann$population %in% c("Fibroblast", "ASPC_adipose_progenitor", "Smooth_muscle_myofibroblast", "Pericyte", "Unassigned") |
+                    ann$singler_majority %in% c("Fibroblast", "Tissue_stem_cell", "Smooth_muscle_cell")
+    msc <- ann$singler_majority %in% "Tissue_stem_cell" & ann$singler_fraction >= 0.5
+    genes_win <- !is.na(ann$mean_aspc_specific) & ann$mean_aspc_specific > ann$mean_fibroblast_matrix &
+                 ann$frac_cells_aspc_high >= 0.5
+    hit <- stromal_like & (msc | genes_win) & ann$population != "ASPC_adipose_progenitor" &
+           !ann$population %in% c("Luminal_epithelial", "Basal_epithelial", "Club_Hillock_epithelial", "Neuroendocrine",
+                                  "T_cell", "NK_cell", "B_cell", "Plasma_cell", "Macrophage_myeloid", "Dendritic_cell",
+                                  "Mast_cell", "Neutrophil", "Endothelial", "Lymphatic_endothelial", "Erythroid")
+    if (any(hit)) {
+      msg("  coarse ASPC rule: cluster(s) %s relabelled ASPC_adipose_progenitor (was %s)",
+          paste(ann$cluster[hit], collapse = ","), paste(ann$population[hit], collapse = ","))
+      ann$population[hit] <- "ASPC_adipose_progenitor"; ann$aspc_rule_applied[hit] <- TRUE
+    }
+  }
   n_dis <- sum(ann$compartment_agreement %in% FALSE)
   if (n_dis > 0) warn_msg("%d cluster(s) where the marker panel and SingleR disagree on the compartment; see nepc_cluster_annotation.csv", n_dis)
   if (use_singler && all(is.na(ann$singler_majority))) {
@@ -197,7 +238,7 @@ process_dataset <- function(ds) {
 
   if (isTRUE(cfg$save_rds)) saveRDS(seu, rds_path)
   msg("Outputs written to %s", out_dir)
-  print(ann[, c("cluster", "n_cells", "population", "singler_majority", "compartment_agreement")])
+  print(ann[, c("cluster", "n_cells", "population", "singler_majority", "frac_cells_aspc_high", "aspc_rule_applied")])
 
   res <- data.frame(dataset = ds$name, group = ds$group, species = ds$species, dir = out_dir, status = "ok",
                     n_samples = length(unique(seu$sample)), n_cells = ncol(seu),

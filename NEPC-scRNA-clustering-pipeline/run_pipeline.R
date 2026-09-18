@@ -80,7 +80,7 @@ if (!file.exists(file.path(PIPELINE_DIR, "config.R")) || !dir.exists(file.path(P
 }
 source(file.path(PIPELINE_DIR, "config.R"))
 for (mod in c("helpers", "readers", "discovery", "clustering", "annotation", "process_dataset",
-              "stromal_aspc", "recurrence", "composition", "signatures_cbioportal")) {
+              "stromal_aspc", "recurrence", "composition", "signatures_cbioportal", "report")) {
   source(file.path(PIPELINE_DIR, "R", paste0(mod, ".R")))
 }
 cat("\n[INFO] Pipeline version", SCRIPT_VERSION, "loaded from", PIPELINE_DIR, "\n")
@@ -162,4 +162,5 @@ if (isTRUE(cfg$run_part3)) {
   }
 }
 
+tryCatch(write_aspc_report(), error = function(e) warn_msg("ASPC report failed: %s", clean_msg(conditionMessage(e))))
 hdr("PIPELINE COMPLETE — cross-dataset outputs in %s", OUT_CROSS)

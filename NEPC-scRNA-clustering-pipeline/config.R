@@ -72,9 +72,21 @@ cfg <- list(
   # "adiposeref", saved as .rds) for a third, reference-based vote.
   stromal_reference_rds       = NULL,
   stromal_reference_label     = "celltype.l2",
+  cluster_label_method = "ucell", # "ucell": mean per-cell UCell score per cluster, z-scored across clusters
+                                  # "zscore": cluster-mean expression z-scored across clusters (v1 behaviour)
+  panel_min_detected_frac = 0.5,  # a panel needs >= this fraction of its genes measured (and >= ann_min_genes)
+  ann_min_cell_fraction = 0.35,   # "ucell": >= this fraction of the cluster's cells must have the panel as best panel
+  ann_min_ucell         = 0.10,   # "ucell": minimum mean per-cell score of the winning panel
   ann_min_genes  = 3,             # panel genes that must be detected
   ann_min_score  = 0.30,          # mean z of the winning panel
   ann_min_margin = 0.10,          # winner minus runner-up
+  # coarse-tier ASPC rule: a stromal / unassigned cluster is called ASPC when its SingleR
+  # majority is the mesenchymal stem cell class (Tissue_stem_cells / MSC) or when the
+  # ASPC-specific genes outscore the fibroblast matrix genes in that cluster
+  aspc_coarse_rule   = TRUE,
+  aspc_ucell_min     = 0.10,      # per-cell ASPC-specific UCell score counted as "ASPC-high"
+  mouse_immune_reference = "ImmGen",  # second SingleR reference for mouse (NULL = MouseRNAseq only)
+  resolution_by_group = NULL,     # e.g. list(NEPC = 0.5) to cluster one group more finely
   save_rds           = TRUE,
 
   # ---- Part 2: recurrence -> group-specific cell sets ----
@@ -215,6 +227,8 @@ SINGLER_LABEL_MAP <- c(
   "Monocyte" = "Monocyte", "Monocytes" = "Monocyte",
   "DC" = "Dendritic_cell", "Dendritic cells" = "Dendritic_cell",
   "Granulocytes" = "Granulocyte", "Neutrophils" = "Granulocyte", "Myelocyte" = "Granulocyte",
+  "Eosinophils" = "Granulocyte", "Basophils" = "Granulocyte", "Mast cells" = "Mast_cell",
+  "Stromal cells" = "Fibroblast", "Stem cells" = "Stem_cell", "Tgd" = "T_cell", "NKT" = "T_cell", "ILC" = "NK_cell",
   "Pro-Myelocyte" = "Granulocyte", "GMP" = "Myeloid_progenitor", "CMP" = "Myeloid_progenitor",
   "MEP" = "Myeloid_progenitor", "HSC_-G-CSF" = "Myeloid_progenitor", "HSC_CD34+" = "Myeloid_progenitor",
   "Erythroblast" = "Erythroid", "Erythrocytes" = "Erythroid", "Platelets" = "Platelet",
@@ -248,6 +262,11 @@ PANEL_COMPARTMENT <- c(
   Macrophage = "immune", Monocyte = "immune", Granulocyte = "immune", Myeloid_progenitor = "immune",
   Platelet = "other", Stem_cell = "other"
 )
+
+# Coarse-tier ASPC rule panels: ASPC-specific genes (not shared with matrix fibroblasts)
+# versus fibroblast matrix genes.
+ASPC_SPECIFIC     <- toupper(c("DPP4","PI16","CD55","CD34","WNT2","CLEC3B","MFAP5","SEMA3C","ANXA3","CD248","IGFBP6","EBF2"))
+FIBROBLAST_MATRIX <- toupper(c("COL1A1","COL1A2","COL3A1","FBLN1","SFRP2","COL6A3","POSTN","CTHRC1"))
 
 # Stromal-tier panels (second tier, mesenchymal cells only). Human symbols.
 STROMAL_MARKERS <- list(

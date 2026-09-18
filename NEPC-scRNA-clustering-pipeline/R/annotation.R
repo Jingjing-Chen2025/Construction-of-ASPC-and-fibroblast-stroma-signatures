@@ -3,8 +3,9 @@
 # ============================================================================
 # cluster x panel score matrix: mean log-normalised expression per cluster,
 # z-scored per gene across clusters, averaged over the panel genes.
-cluster_panel_scores <- function(seu, panels, cluster_col = "seurat_clusters") {
+cluster_panel_scores <- function(seu, panels, cluster_col = "seurat_clusters", keys = NULL) {
   dat <- get_data_layer(seu)
+  if (!is.null(keys)) rownames(dat) <- keys
   cl  <- as.character(seu@meta.data[[cluster_col]])
   lv  <- unique(cl)
   num <- suppressWarnings(as.numeric(lv))
@@ -75,8 +76,34 @@ harmonize_singler_label <- function(x) {
   out
 }
 
+# human: HumanPrimaryCellAtlas; mouse: MouseRNAseq (+ ImmGen for immune cells when
+# cfg$mouse_immune_reference == "ImmGen"). Returns list(refs = list(...), labels = list(...)).
 get_singler_ref <- function(species) {
-  if (identical(species, "mouse")) celldex::MouseRNAseqData() else celldex::HumanPrimaryCellAtlasData()
+  if (identical(species, "mouse")) {
+    refs <- list(MouseRNAseq = celldex::MouseRNAseqData())
+    if (identical(cfg$mouse_immune_reference, "ImmGen")) {
+      im <- tryCatch(celldex::ImmGenData(), error = function(e) { warn_msg("  ImmGen not available: %s", conditionMessage(e)); NULL })
+      if (!is.null(im)) refs$ImmGen <- im
+    }
+  } else refs <- list(HPCA = celldex::HumanPrimaryCellAtlasData())
+  lab_col <- cfg$singler_labels %||% "label.main"
+  list(refs = refs, labels = lapply(refs, function(r) SummarizedExperiment::colData(r)[[lab_col]]))
+}
+
+# human-symbol keys for the rows of a dataset (orthologs for mouse when babelgene is installed)
+gene_keys <- function(genes, species) {
+  keys <- toupper(genes)
+  if (identical(species, "mouse") && isTRUE(cfg$map_mouse_orthologs) && requireNamespace("babelgene", quietly = TRUE)) {
+    orth <- tryCatch(babelgene::orthologs(genes = genes, species = "mouse", human = FALSE), error = function(e) NULL)
+    if (!is.null(orth) && nrow(orth)) {
+      orth <- orth[!duplicated(orth$symbol), ]
+      hs <- orth$human_symbol[match(genes, orth$symbol)]
+      ok <- !is.na(hs) & hs != ""
+      keys[ok] <- toupper(hs[ok])
+      msg("  panel gene keys: %d of %d mouse genes mapped to human orthologs (rest upper-cased)", sum(ok), length(genes))
+    }
+  }
+  keys
 }
 
 run_singler <- function(seu, species) {
@@ -92,11 +119,15 @@ run_singler <- function(seu, species) {
       obj <- subset(obj, cells = sample(colnames(obj), cfg$singler_max_cells))
     }
     sce <- suppressWarnings(Seurat::as.SingleCellExperiment(obj))
-    ref <- get_singler_ref(species)
-    msg("  SingleR reference: %s", if (species == "mouse") "MouseRNAseqData" else "HumanPrimaryCellAtlasData")
-    sr  <- SingleR::SingleR(test = sce, ref = ref,
-                            labels = SummarizedExperiment::colData(ref)[[cfg$singler_labels %||% "label.main"]],
-                            assay.type.test = cfg$singler_assay %||% "counts")
+    rf  <- get_singler_ref(species)
+    msg("  SingleR reference(s): %s", paste(names(rf$refs), collapse = " + "))
+    sr  <- if (length(rf$refs) == 1) {
+      SingleR::SingleR(test = sce, ref = rf$refs[[1]], labels = rf$labels[[1]],
+                       assay.type.test = cfg$singler_assay %||% "counts")
+    } else {
+      SingleR::SingleR(test = sce, ref = unname(rf$refs), labels = unname(rf$labels),
+                       assay.type.test = cfg$singler_assay %||% "counts")
+    }
     out <- setNames(sr$labels, colnames(obj))
     rm(sce, obj, sr); gc(verbose = FALSE)
     out
@@ -107,16 +138,18 @@ run_singler <- function(seu, species) {
 # ============================================================================
 # Per-cell panel scores (UCell if installed, otherwise mean of per-gene z-scores)
 # ============================================================================
-score_cells <- function(seu, panels) {
+score_cells <- function(seu, panels, keys = NULL) {
   dat <- get_data_layer(seu)
-  genes_up <- toupper(rownames(dat))
+  genes_up <- if (is.null(keys)) toupper(rownames(dat)) else keys
+  panel_size <- vapply(panels, length, integer(1))
   panels_present <- lapply(panels, function(g) rownames(dat)[match(intersect(g, genes_up), genes_up)])
   panels_present <- panels_present[vapply(panels_present, length, integer(1)) >= 2]
   if (!length(panels_present)) stop("No panel genes present for per-cell scoring")
+  detected <- vapply(panels_present, length, integer(1))
   if (requireNamespace("UCell", quietly = TRUE)) {
     sc <- UCell::ScoreSignatures_UCell(dat, features = panels_present, name = "")
     sc <- as.matrix(sc)[colnames(dat), , drop = FALSE]
-    attr(sc, "method") <- "UCell"
+    attr(sc, "method") <- "UCell"; attr(sc, "detected") <- detected; attr(sc, "panel_size") <- panel_size[names(detected)]
     return(sc)
   }
   sub <- dat[unique(unlist(panels_present)), , drop = FALSE]
@@ -128,8 +161,50 @@ score_cells <- function(seu, panels) {
     colMeans(z)
   }, numeric(ncol(sub)))
   sc <- matrix(sc, nrow = ncol(sub), dimnames = list(colnames(sub), names(panels_present)))
-  attr(sc, "method") <- "mean_z"
+  attr(sc, "method") <- "mean_z"; attr(sc, "detected") <- detected; attr(sc, "panel_size") <- panel_size[names(detected)]
   sc
+}
+
+# Label from per-cell scores: the panel that is the best panel for the largest
+# fraction of the cluster's cells (magnitude-aware, unlike z-scores across
+# clusters, which let any panel slightly elevated in one cluster reach the
+# same maximum). Unassigned when that fraction or the mean score is too low.
+assign_population_ucell <- function(ps, min_frac = cfg$ann_min_cell_fraction, min_score = cfg$ann_min_ucell) {
+  rows <- lapply(seq_len(nrow(ps$frac_top)), function(i) {
+    f <- ps$frac_top[i, ]; m <- ps$cluster_means[i, ]
+    o <- order(f, m, decreasing = TRUE)
+    top <- names(f)[o[1]]; second <- if (length(o) > 1) names(f)[o[2]] else NA_character_
+    lab <- if (f[top] >= min_frac && m[top] >= min_score) top else "Unassigned"
+    data.frame(cluster = rownames(ps$frac_top)[i], population = lab, best_panel = top,
+               panel_score = unname(m[top]), runner_up = second,
+               runner_up_score = if (is.na(second)) NA_real_ else unname(m[second]),
+               margin = if (is.na(second)) unname(f[top]) else unname(f[top] - f[second]),
+               label_cell_fraction = round(unname(f[top]), 3))
+  })
+  bind_rows(rows)
+}
+
+# cluster x panel scores from per-cell scores: mean per cluster, z-scored across
+# clusters (same scale as cluster_panel_scores); panels with too few measured
+# genes are dropped; frac_top = fraction of cells whose best panel is p.
+cluster_panel_scores_ucell <- function(cell_scores, clusters, panels) {
+  det <- attr(cell_scores, "detected"); size <- attr(cell_scores, "panel_size")
+  keep <- names(det)[det >= cfg$ann_min_genes & det / size >= cfg$panel_min_detected_frac]
+  keep <- intersect(keep, intersect(colnames(cell_scores), names(panels)))
+  dropped <- setdiff(intersect(colnames(cell_scores), names(panels)), keep)
+  if (length(dropped)) msg("  panels not used for labelling (too few genes measured): %s", paste(dropped, collapse = ", "))
+  if (!length(keep)) stop("no panel has enough measured genes")
+  cl <- as.character(clusters)
+  lv <- unique(cl); num <- suppressWarnings(as.numeric(lv)); lv <- if (!anyNA(num)) lv[order(num)] else sort(lv)
+  sc <- cell_scores[, keep, drop = FALSE]
+  means <- t(vapply(lv, function(k) colMeans(sc[cl == k, , drop = FALSE]), numeric(length(keep))))
+  means <- matrix(means, nrow = length(lv), dimnames = list(lv, keep))
+  z <- if (nrow(means) > 1) scale(means) else means
+  z <- matrix(z, nrow = nrow(means), dimnames = dimnames(means)); z[!is.finite(z)] <- 0
+  top <- keep[max.col(sc, ties.method = "first")]
+  frac_top <- t(vapply(lv, function(k) { tt <- top[cl == k]; vapply(keep, function(p) mean(tt == p), numeric(1)) }, numeric(length(keep))))
+  frac_top <- matrix(frac_top, nrow = length(lv), dimnames = list(lv, keep))
+  list(scores = z, cluster_means = means, frac_top = frac_top, detected = det[keep])
 }
 
 # compartment agreement between the panel label and the SingleR majority label
