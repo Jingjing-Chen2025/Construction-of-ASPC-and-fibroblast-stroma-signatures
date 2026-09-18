@@ -1,33 +1,28 @@
 # NEPC scRNA clustering pipeline
 
-R pipeline for neuroendocrine prostate cancer (NEPC) single-cell RNA-seq datasets:
+R pipeline that compares the cell composition of neuroendocrine prostate cancer (NEPC) and prostate adenocarcinoma single-cell RNA-seq datasets:
 
-1. **Per-dataset clustering and cell-population annotation** — every GEO dataset folder is processed on its own: samples are auto-detected, merged, QC-filtered, clustered (Seurat) and every cluster is annotated.
-2. **Recurrent populations** — annotated populations are counted across datasets; those present in more than a configurable number of datasets (default: more than 3) are listed.
-3. **Correlation with the NEPC signature in bulk cohorts** — signatures of the recurrent populations are scored in PRAD TCGA and SU2C/PCF 2019 (both fetched from cBioPortal) and correlated with the Beltran custom NEPC UP signature.
+1. **Per-dataset clustering and annotation** (Part 1) — every GEO dataset folder of either group is processed on its own: samples are auto-detected, QC-filtered, integrated by sample, clustered (Seurat) and every cluster is annotated. A second, stromal tier (Part 1b) pools the mesenchymal cells of each group to resolve adipose stem and progenitor cells (ASPC).
+2. **Group-specific cell sets and cell composition** (Part 2) — within each group, populations present in more than a configurable number of datasets (default: more than 3) are the *NEPC-specific* or *adenocarcinoma-specific cell sets*. The mean composition of every population per sample is reported for each group, and the two groups are compared.
+3. **Correlation with the NEPC signature in bulk cohorts** (Part 3) — signatures of the NEPC-specific cell sets are scored in PRAD TCGA and SU2C/PCF 2019 (cBioPortal) and correlated with the Beltran custom NEPC UP signature.
 
 ## Datasets
 
-One folder = one dataset. The default configuration (`config.R`) expects:
+One folder = one dataset; `config.R` lists both groups (dataset names are `<group>_<accession>` because several accessions occur in both groups).
 
-| Dataset | Species | Folder |
+| Group | Root | Datasets |
 | --- | --- | --- |
-| GSE137829 | human | `<NEPC_ROOT>/GSE137829` |
-| GSE210358 | human | `<NEPC_ROOT>/GSE210358` |
-| GSE210358_TKO | mouse | `<NEPC_ROOT>/GSE210358_TKO` |
-| GSE235036_TKO | mouse | `<NEPC_ROOT>/GSE235036_TKO` |
-| GSE264573 | human | `<NEPC_ROOT>/GSE264573` |
-| GSE292074 | human | `<NEPC_ROOT>/GSE292074` |
-| GSE296986_TKO | mouse | `<NEPC_ROOT>/GSE296986_TKO` |
+| NEPC (7) | `/Volumes/Jingjing_Chen/NEPC scRNA dataset` | GSE137829, GSE210358, GSE210358_TKO (mouse), GSE235036_TKO (mouse), GSE264573, GSE292074, GSE296986_TKO (mouse) |
+| Adeno (9) | `/Volumes/Jingjing_Chen/Adenocarcinoma scRNA dataset` | GSE137829, GSE141445, GSE176031, GSE181294, GSE210358, GSE264573, GSE268307, GSE292074, GSE296986 (mouse) |
 
-`NEPC_ROOT` defaults to `/Volumes/Jingjing_Chen/NEPC scRNA dataset`.
+Cross-dataset results go to `OUT_CROSS` (`/Volumes/Jingjing_Chen/NEPC_vs_Adeno_scRNA_results`); per-dataset results stay in `<dataset folder>/nepc_clustering/`.
 
 **Sample formats.** Inside a dataset folder, one sample is either
 
 * a 10x triplet: `<sample>_barcodes.tsv.gz` + `<sample>_features.tsv.gz` (or `_genes.tsv.gz`) + `<sample>_matrix.mtx.gz`, or
 * one file: `<sample>.txt.gz`, `<sample>.csv.gz`, `<sample>.zip` / `<sample>.matrix.zip`, or `<sample>.tar.gz`.
 
-A `.txt.gz` / `.csv.gz` file holds one delimited matrix, either genes x cells (first column = gene), cells x genes (first column = barcode; annotation columns such as `CLUSTER` are dropped) or a `Gene_ID` + `Symbol` + one-column-per-cell table; the orientation is detected automatically. An archive wraps either a 10x directory or one such text matrix. Every other file in the folder is ignored: uncompressed `.csv` / `.txt` files, `.rds`, `.pdf`, sub-directories and the outputs of the companion analysis scripts. A compressed text file is skipped when it has fewer than `cfg$min_fields_expression` columns or matches a known annotation-table name; `cfg$sample_name_regex` (default `NULL`) can additionally restrict single-file samples by name, e.g. `"^GS[ME][0-9]+"`.
+A `.txt.gz` / `.csv.gz` file holds one delimited matrix, either genes x cells (first column = gene), cells x genes (first column = barcode; annotation columns such as `CLUSTER` are dropped) or a `Gene_ID` + `Symbol` + one-column-per-cell table; the orientation is detected automatically. An archive wraps either a 10x directory or one such text matrix. Every other file in the folder is ignored (uncompressed `.csv` / `.txt`, `.rds`, `.pdf`, sub-directories, outputs of the companion analysis scripts). When a folder holds several matrices for the same GSM (raw and processed, e.g. GSE141445), one is kept: the file with `raw` in its name, otherwise the integer-valued one.
 
 ## Requirements
 
@@ -80,13 +75,16 @@ Adipose stem and progenitor cells (ASPC, PDGFRA+ CD34+ DPP4+ PI16+) are a minori
 2. Mouse genes are mapped to human orthologs (babelgene), all datasets are merged and integrated with Harmony by dataset and sample, and reclustered at `cfg$stromal_resolution` (0.5).
 3. Clusters are labelled with the stromal panels (`STROMAL_MARKERS`): ASPC, committed preadipocyte, matrix fibroblast, myCAF, iCAF, smooth muscle, pericyte, Schwann, cycling, and contaminant panels (epithelial, immune, endothelial) that catch doublets and mis-assigned cells.
 4. ASPC is called per cell by consensus: the cell sits in an ASPC-labelled cluster **and** its per-cell ASPC score is above threshold (median + MAD of non-ASPC clusters, or `cfg$aspc_cell_min_score`) and above every competing stromal panel. `aspc_call` records `ASPC_consensus`, `ASPC_cluster_only`, `ASPC_cell_only` or `non_ASPC`. An optional adipose reference with ASPC labels (`cfg$stromal_reference_rds`, e.g. Emont et al. 2022 via Azimuth) adds a third, reference-based vote (`reference_majority`).
-5. Outputs in `<NEPC_ROOT>/nepc_cross_dataset/stromal/`: the integrated object, cluster annotation with the number of cells per dataset and `n_datasets_present`, per-dataset stromal population counts (fed to Part 2), ASPC calls per dataset, integrated and per-dataset markers (fed to Part 3), and UMAPs by cluster, population, dataset, ASPC call and panel scores.
+5. Outputs in `OUT_CROSS/stromal_<group>/` (the tier runs once per group): the integrated object, cluster annotation with the number of cells per dataset and `n_datasets_present`, per-dataset stromal population counts (fed to Part 2), ASPC calls per dataset, integrated and per-dataset markers (fed to Part 3), and UMAPs by cluster, population, dataset, ASPC call and panel scores.
 
-### Part 2 — recurrent populations
+### Part 2 — group-specific cell sets and cell composition
 
-Every non-`Unassigned` population of both tiers (coarse and stromal, `tier` column) with at least `cfg$min_cells_population` cells in a dataset is counted across datasets. A population is *recurrent* when it is present in **more than** `cfg$recurrence_min_datasets` datasets (default 3, i.e. at least 4 of 7). Set `cfg$recurrence_count_by = "clusters"` to count cluster occurrences instead of datasets.
+* Within each group, every non-`Unassigned` population of both tiers (coarse and stromal, `tier` column) with at least `cfg$min_cells_population` cells in a dataset is counted across the group's datasets. A population present in **more than** `cfg$recurrence_min_datasets` datasets (default 3) is a *group-specific cell set*: `NEPC_specific_cell_sets.csv` and `Adeno_specific_cell_sets.csv` (with `also_recurrent_in_other_group` flagging sets shared by both groups). Set `cfg$recurrence_count_by = "clusters"` to count cluster occurrences instead of datasets.
+* Cell composition is computed per sample: for the coarse tier the % of all cells of the sample in each population; for the stromal tier the % of the sample's stromal cells in each stromal population, and the same rescaled to % of all cells (`pct_of_all`) using the stromal fraction recorded at extraction. Populations absent from a sample count as 0 %. Samples with fewer than `cfg$composition_min_cells_sample` cells are excluded. Means are given across samples (`mean_pct`, `sd_pct`, `median_pct`) and as the mean of dataset means, so a dataset with many samples does not dominate. `<group>_specific_cell_sets_mean_composition.csv` holds the mean composition of each cell set; `nepc_cell_composition_NEPC_vs_Adeno.csv` compares the two groups per population (sample-level Wilcoxon test, BH-adjusted).
 
 ### Part 3 — correlation with the NEPC signature
+
+Run for the groups in `cfg$correlate_groups` (default: NEPC only, i.e. the NEPC-specific cell sets; output files carry a `_<group>` suffix).
 
 * Two signatures per recurrent population: the **canonical** marker panel (for SingleR-derived populations via `SINGLER_TO_PANEL`, e.g. `Neuron` → neuroendocrine panel, `Tissue_stem_cell` → ASPC-like progenitor panel) and a **consensus-marker** signature (positive cluster markers of that population found in at least `cfg$consensus_min_datasets` datasets, top `cfg$consensus_top_n` by recurrence and mean log2FC; mitochondrial/ribosomal/haemoglobin genes excluded). Genes that overlap the NEPC signature are excluded from population signatures by default (`cfg$exclude_nepc_genes_from_signatures`) to avoid circular correlations.
 * Bulk mRNA expression for `prad_tcga` and `prad_su2c_2019` is fetched from the cBioPortal REST API. The mRNA profile is chosen at run time from the study's non-z-score `MRNA_EXPRESSION` profiles using the preference patterns in `cfg$cbio_studies`, and the choice is logged and written to `nepc_cbioportal_profiles_used.csv`. A profile can be pinned with `profile_id`. Without API access, point `cfg$cbio_local_files` at downloaded cBioPortal datahub expression files.
@@ -108,7 +106,7 @@ Per dataset, in `<dataset folder>/nepc_clustering/`:
 | `nepc_umap_*.pdf` | UMAPs: named clusters, populations, sample, SingleR cell types, clusters + cell types |
 | `nepc_seurat_annotated.rds` | annotated Seurat object |
 
-Cross-dataset, in `<NEPC_ROOT>/nepc_cross_dataset/`:
+Cross-dataset, in `OUT_CROSS`:
 
 | File | Content |
 | --- | --- |
@@ -116,19 +114,23 @@ Cross-dataset, in `<NEPC_ROOT>/nepc_cross_dataset/`:
 | `nepc_all_cluster_annotations.csv` | all cluster annotations stacked |
 | `nepc_population_recurrence.csv` | every population with number of datasets/clusters and where it occurs |
 | `nepc_population_presence_matrix.csv` | population x dataset matrix of cluster counts |
-| `nepc_recurrent_populations.csv` | populations (coarse and stromal tier) present in more than `cfg$recurrence_min_datasets` datasets |
-| `stromal/nepc_stromal_cluster_annotation.csv` | integrated stromal clusters: population, panel score, fraction of cells passing the ASPC score, cells per dataset |
-| `stromal/nepc_aspc_calls_by_dataset.csv` | ASPC consensus / cluster-only / cell-only / non-ASPC counts per dataset |
-| `stromal/nepc_stromal_markers_integrated.csv`, `stromal/nepc_stromal_markers_by_dataset.csv` | stromal population markers (integrated, and per dataset for consensus signatures) |
-| `stromal/nepc_stromal_umap*.pdf`, `stromal/nepc_stromal_integrated.rds` | stromal-tier plots and object |
-| `nepc_recurrent_population_signatures.csv` | canonical and consensus signatures per recurrent population |
+| `<group>_specific_cell_sets.csv` | populations (coarse and stromal tier) present in more than `cfg$recurrence_min_datasets` datasets of the group |
+| `nepc_population_recurrence_<group>.csv`, `nepc_population_presence_matrix_<group>.csv` | recurrence of every population within the group |
+| `nepc_cell_composition_by_sample_<group>.csv` | % of cells per population per sample (both tiers) |
+| `nepc_cell_composition_mean_<group>.csv`, `<group>_specific_cell_sets_mean_composition.csv` | mean, SD, median and mean-of-dataset-means composition per population / per cell set |
+| `nepc_cell_composition_<group>.pdf`, `nepc_cell_composition_NEPC_vs_Adeno.csv/.pdf` | composition plots and the NEPC vs adenocarcinoma comparison |
+| `stromal_<group>/nepc_stromal_cluster_annotation.csv` | integrated stromal clusters: population, panel score, fraction of cells passing the ASPC score, cells per dataset |
+| `stromal_<group>/nepc_aspc_calls_by_dataset.csv` | ASPC consensus / cluster-only / cell-only / non-ASPC counts per dataset |
+| `stromal_<group>/nepc_stromal_markers_integrated.csv`, `..._by_dataset.csv` | stromal population markers (integrated, and per dataset for consensus signatures) |
+| `stromal_<group>/nepc_stromal_umap*.pdf`, `stromal_<group>/nepc_stromal_integrated.rds` | stromal-tier plots and object |
+| `nepc_recurrent_population_signatures_<group>.csv` | canonical and consensus signatures per recurrent population |
 | `nepc_cbioportal_profiles_used.csv` | study, molecular profile and sample list used |
 | `nepc_bulk_log2_expression_<study>.csv` | fetched expression (log2) |
 | `nepc_bulk_signature_scores_<study>.csv` | per-sample NEPC and population scores |
-| `nepc_nepc_correlation_summary.csv`, `nepc_nepc_correlation_wide.csv` | signature-level correlations with the NEPC score |
-| `nepc_nepc_correlation_per_gene.csv` | gene-level Spearman correlations with the NEPC score |
+| `nepc_nepc_correlation_summary_<group>.csv`, `nepc_nepc_correlation_wide_<group>.csv` | signature-level correlations with the NEPC score |
+| `nepc_nepc_correlation_per_gene_<group>.csv` | gene-level Spearman correlations with the NEPC score |
 | `nepc_nepc_correlation_scatter_<study>.pdf`, `nepc_nepc_correlation_heatmap.pdf` | plots |
-| `nepc_PROVENANCE.txt` | parameters and profiles used for the run |
+| `nepc_PROVENANCE_<group>.txt` | parameters and profiles used for the run |
 
 ## Notes
 

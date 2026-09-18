@@ -1,18 +1,27 @@
 # ============================================================================
-# NEPC scRNA-seq: per-dataset clustering + cell-population annotation,
-#     recurrent populations across datasets, and correlation of their
-#     signatures with the NEPC (Beltran, custom UP) signature in bulk
+# NEPC vs adenocarcinoma scRNA-seq: per-dataset clustering + annotation,
+#     group-specific cell sets (populations recurring across datasets of a
+#     group), cell composition per group, and correlation of the NEPC-specific
+#     cell-set signatures with the NEPC (Beltran, custom UP) signature in bulk
 #     RNA-seq from PRAD TCGA and prad_su2c_2019 (cBioPortal)
 # ============================================================================
 #
-# INPUT  — seven NEPC dataset folders (one folder = one dataset):
-#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE137829         human
-#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE210358         human
-#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE210358_TKO     mouse
-#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE235036_TKO     mouse
-#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE264573         human
-#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE292074         human
-#   /Volumes/Jingjing_Chen/NEPC scRNA dataset/GSE296986_TKO     mouse
+# INPUT — two dataset groups, one folder per dataset (config.R):
+#   NEPC  (7):  <NEPC_ROOT>/GSE137829, GSE210358, GSE210358_TKO (mouse), GSE235036_TKO (mouse),
+#               GSE264573, GSE292074, GSE296986_TKO (mouse)
+#   Adeno (9):  <ADENO_ROOT>/GSE137829, GSE141445, GSE176031, GSE181294, GSE210358, GSE264573,
+#               GSE268307, GSE292074, GSE296986 (mouse)
+#
+# SAMPLE FORMATS (one sample = one of these inside a dataset folder)
+#   <sample>_barcodes.tsv.gz + <sample>_features.tsv.gz + <sample>_matrix.mtx.gz
+#   <sample>.txt.gz | <sample>.csv.gz | <sample>.zip | <sample>.matrix.zip | <sample>.tar.gz
+#   All other files are ignored.
+#
+# PART 1  coarse clustering + annotation per dataset;  PART 1b stromal tier per group (ASPC)
+# PART 2  populations in > cfg$recurrence_min_datasets datasets of a group = group-specific
+#         cell sets; mean cell composition per group (per sample, coarse and stromal tiers)
+# PART 3  signatures of the NEPC-specific cell sets vs the NEPC signature in PRAD TCGA and
+#         prad_su2c_2019 (cBioPortal)
 #
 # FILE LAYOUT
 #   config.R                    paths, parameters, dataset list, signatures, marker panels
