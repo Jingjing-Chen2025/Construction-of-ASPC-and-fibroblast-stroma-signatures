@@ -40,7 +40,7 @@ map_to_human_symbols <- function(mat, species) {
 }
 
 extract_stromal_cells <- function(ds) {   # returns list(obj = Seurat, by_sample = data.frame)
-  rds <- file.path(ds$dir, "nepc_clustering", "nepc_seurat_annotated.rds")
+  rds <- file.path(dataset_out_dir(ds), "nepc_seurat_annotated.rds")
   if (!file.exists(rds)) { warn_msg("  %s: no coarse result (%s)", ds$name, rds); return(NULL) }
   seu <- readRDS(rds)
   md  <- seu@meta.data
@@ -53,7 +53,7 @@ extract_stromal_cells <- function(ds) {   # returns list(obj = Seurat, by_sample
   by_sample <- data.frame(dataset = ds$name, group = ds$group, sample = md$sample, stromal = pick) %>%
     group_by(dataset, group, sample) %>%
     summarise(n_total_cells = n(), n_stromal_cells = sum(stromal), .groups = "drop")
-  if (length(cells) < cfg$min_cells_population) { warn_msg("  %s: too few stromal cells; skipped", ds$name); return(NULL) }
+  if (length(cells) < cfg$min_cells_population) { warn_msg("  %s: too few stromal cells (%d); skipped", ds$name, length(cells)); return(NULL) }
   if (length(cells) > cfg$stromal_max_cells_per_dataset) {
     cells <- sample(cells, cfg$stromal_max_cells_per_dataset)
     msg("  %s: subsampled to %d stromal cells", ds$name, length(cells))
@@ -160,7 +160,7 @@ run_stromal_tier <- function(group) {
   comp <- md %>% count(stromal_cluster, dataset, name = "n") %>%
     pivot_wider(names_from = dataset, values_from = n, values_fill = 0)
   ds_cols <- setdiff(colnames(comp), "stromal_cluster")
-  comp$n_datasets_present <- rowSums(comp[, ds_cols, drop = FALSE] >= cfg$min_cells_population)
+  comp$n_datasets_present <- rowSums(comp[, ds_cols, drop = FALSE] >= cfg$min_cells_population_stromal)
   sizes <- md %>% count(stromal_cluster, name = "n_cells") %>%
     mutate(pct_cells = round(100 * n_cells / sum(n_cells), 2))
   aspc_frac <- md %>% group_by(stromal_cluster) %>%
@@ -200,7 +200,7 @@ run_stromal_tier <- function(group) {
     sub <- subset(seu, cells = colnames(seu)[seu$dataset == d])
     for (p in pops) {
       n_in <- sum(sub$stromal_population == p); n_out <- sum(sub$stromal_population != p)
-      if (n_in < cfg$min_cells_population || n_out < cfg$min_cells_population) next
+      if (n_in < cfg$min_cells_population_stromal || n_out < cfg$min_cells_population_stromal) next
       m <- tryCatch(FindMarkers(sub, ident.1 = p, group.by = "stromal_population", only.pos = TRUE,
                                 min.pct = cfg$marker_min_pct, logfc.threshold = cfg$marker_logfc, verbose = FALSE),
                     error = function(e) NULL)

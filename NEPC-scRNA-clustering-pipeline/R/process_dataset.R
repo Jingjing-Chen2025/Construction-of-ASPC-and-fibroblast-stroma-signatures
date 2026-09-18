@@ -4,17 +4,23 @@
 process_dataset <- function(ds) {
   hdr("DATASET: %s (%s, %s)", ds$name, ds$group %||% "?", ds$species)
   if (!dir.exists(ds$dir)) stop("Dataset directory not found: ", ds$dir)
-  out_dir <- file.path(ds$dir, "nepc_clustering")
+  out_dir <- dataset_out_dir(ds)
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
   rds_path <- file.path(out_dir, "nepc_seurat_annotated.rds")
 
+  ver_file <- file.path(out_dir, "nepc_pipeline_version.txt")
+  prev_ver <- if (file.exists(ver_file)) readLines(ver_file, n = 1, warn = FALSE) else "unknown"
   if (isTRUE(cfg$reuse_existing) && file.exists(rds_path) &&
-      file.exists(file.path(out_dir, "nepc_cluster_annotation.csv"))) {
-    msg("Existing outputs found in %s; skipping (cfg$reuse_existing = TRUE).", out_dir)
+      file.exists(file.path(out_dir, "nepc_cluster_annotation.csv")) &&
+      !(!isTRUE(cfg$reuse_any_version) && !identical(prev_ver, SCRIPT_VERSION))) {
+    msg("Existing outputs (version %s) found in %s; skipping (cfg$reuse_existing = TRUE).", prev_ver, out_dir)
     ann <- read.csv(file.path(out_dir, "nepc_cluster_annotation.csv"))
     return(data.frame(dataset = ds$name, group = ds$group, species = ds$species, dir = out_dir, status = "reused",
                       n_samples = NA_integer_, n_cells = sum(ann$n_cells), n_clusters = nrow(ann)))
   }
+
+  if (file.exists(rds_path) && !identical(prev_ver, SCRIPT_VERSION))
+    msg("Existing outputs are from version %s; recomputing with %s.", prev_ver, SCRIPT_VERSION)
 
   # ---- STEP 1: discover + load samples ----
   samples <- scan_dataset(ds$dir)
@@ -237,6 +243,7 @@ process_dataset <- function(ds) {
   pdf(file.path(out_dir, "nepc_umap_clusters_and_populations.pdf"), width = 18, height = 6); print(p1 + p2); dev.off()
 
   if (isTRUE(cfg$save_rds)) saveRDS(seu, rds_path)
+  writeLines(SCRIPT_VERSION, ver_file)
   msg("Outputs written to %s", out_dir)
   print(ann[, c("cluster", "n_cells", "population", "singler_majority", "frac_cells_aspc_high", "aspc_rule_applied")])
 

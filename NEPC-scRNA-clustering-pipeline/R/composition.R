@@ -21,7 +21,7 @@ composition_by_sample <- function(group) {
   rows <- list()
   # ---- coarse tier ----
   for (ds in group_datasets(group)) {
-    f <- file.path(ds$dir, "nepc_clustering", "nepc_cell_metadata.csv")
+    f <- file.path(dataset_out_dir(ds), "nepc_cell_metadata.csv")
     if (!file.exists(f)) { warn_msg("  %s: no cell metadata (%s)", ds$name, f); next }
     md <- read_cell_metadata(f, c("sample", "population"))
     md$population[is.na(md$population) | md$population == ""] <- "Unassigned"

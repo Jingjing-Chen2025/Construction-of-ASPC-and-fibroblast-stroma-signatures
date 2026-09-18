@@ -15,7 +15,7 @@ One folder = one dataset; `config.R` lists both groups (dataset names are `<grou
 | NEPC (7) | `/Volumes/Jingjing_Chen/NEPC scRNA dataset` | GSE137829, GSE210358, GSE210358_TKO (mouse), GSE235036_TKO (mouse), GSE264573, GSE292074, GSE296986_TKO (mouse) |
 | Adeno (9) | `/Volumes/Jingjing_Chen/Adenocarcinoma scRNA dataset` | GSE137829, GSE141445, GSE176031, GSE181294, GSE210358, GSE264573, GSE268307, GSE292074, GSE296986 (mouse) |
 
-Cross-dataset results go to `OUT_CROSS` (`/Volumes/Jingjing_Chen/NEPC_vs_Adeno_scRNA_results`); per-dataset results stay in `<dataset folder>/nepc_clustering/`.
+Cross-dataset results go to `OUT_CROSS`, by default `NEPC_vs_Adeno_scRNA_results/` inside the iCloud folder `ICLOUD` (`.../Adipocyte NEPC/cj719`). Per-dataset results (tables, plots and the annotated Seurat object, which can be several GB) stay in `<dataset folder>/nepc_clustering/` on the data volume unless `PER_DATASET_OUT` is set to another root. Each per-dataset folder records the pipeline version that produced it; results from another version are recomputed rather than reused (`cfg$reuse_any_version`).
 
 **Sample formats.** Inside a dataset folder, one sample is either
 
@@ -80,7 +80,7 @@ Adipose stem and progenitor cells (ASPC, PDGFRA+ CD34+ DPP4+ PI16+) are a minori
 
 ### Part 2 — group-specific cell sets and cell composition
 
-* Within each group, every non-`Unassigned` population of both tiers (coarse and stromal, `tier` column) with at least `cfg$min_cells_population` cells in a dataset is counted across the group's datasets. A population present in **more than** `cfg$recurrence_min_datasets` datasets (default 3) is a *group-specific cell set*: `NEPC_specific_cell_sets.csv` and `Adeno_specific_cell_sets.csv` (with `also_recurrent_in_other_group` flagging sets shared by both groups). Set `cfg$recurrence_count_by = "clusters"` to count cluster occurrences instead of datasets.
+* Within each group, every non-`Unassigned` population of both tiers (coarse and stromal, `tier` column) with at least `cfg$min_cells_population` cells (coarse tier) or `cfg$min_cells_population_stromal` cells (stromal tier, which is subsampled and holds minority populations such as ASPC) in a dataset is counted across the group's datasets. A population present in **more than** `cfg$recurrence_min_datasets` datasets (default 3) is a *group-specific cell set*: `NEPC_specific_cell_sets.csv` and `Adeno_specific_cell_sets.csv` (with `also_recurrent_in_other_group` flagging sets shared by both groups). Set `cfg$recurrence_count_by = "clusters"` to count cluster occurrences instead of datasets.
 * Cell composition is computed per sample: for the coarse tier the % of all cells of the sample in each population; for the stromal tier the % of the sample's stromal cells in each stromal population, and the same rescaled to % of all cells (`pct_of_all`) using the stromal fraction recorded at extraction. Populations absent from a sample count as 0 %. Samples with fewer than `cfg$composition_min_cells_sample` cells are excluded. Means are given across samples (`mean_pct`, `sd_pct`, `median_pct`) and as the mean of dataset means, so a dataset with many samples does not dominate. `<group>_specific_cell_sets_mean_composition.csv` holds the mean composition of each cell set; `nepc_cell_composition_NEPC_vs_Adeno.csv` compares the two groups per population (sample-level Wilcoxon test, BH-adjusted).
 
 ### Part 3 — correlation with the NEPC signature

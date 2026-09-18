@@ -3,7 +3,7 @@
 # ============================================================================
 read_all_annotations <- function(group) {
   tbls <- lapply(group_datasets(group), function(ds) {
-    f <- file.path(ds$dir, "nepc_clustering", "nepc_cluster_annotation.csv")
+    f <- file.path(dataset_out_dir(ds), "nepc_cluster_annotation.csv")
     if (!file.exists(f)) { warn_msg("Missing annotation for %s (%s)", ds$name, f); return(NULL) }
     d <- read.csv(f, colClasses = c(cluster = "character")); d$tier <- "coarse"; d$group <- group; d
   })
@@ -20,7 +20,7 @@ read_all_annotations <- function(group) {
 
 read_all_markers <- function(group) {
   tbls <- lapply(group_datasets(group), function(ds) {
-    f <- file.path(ds$dir, "nepc_clustering", "nepc_cluster_markers_sig.csv")
+    f <- file.path(dataset_out_dir(ds), "nepc_cluster_markers_sig.csv")
     if (!file.exists(f)) return(NULL)
     d <- read.csv(f, colClasses = c(cluster = "character")); d$tier <- "coarse"; d
   })
@@ -40,7 +40,7 @@ run_recurrence <- function(group) {
   if (!nrow(all_ann)) stop("No Part 1 annotation tables found; run Part 1 first.")
   write.csv(all_ann, file.path(OUT_CROSS, paste0("nepc_all_cluster_annotations_", group, ".csv")), row.names = FALSE)
   
-  all_ann <- all_ann %>% filter(n_cells >= cfg$min_cells_population)
+  all_ann <- all_ann %>% filter(n_cells >= ifelse(tier == "stromal", cfg$min_cells_population_stromal, cfg$min_cells_population))
   recurrence <- all_ann %>%
     filter(!population %in% c("Unassigned", "Contaminant")) %>%
     group_by(tier, population) %>%

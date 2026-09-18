@@ -6,14 +6,24 @@
 # ============================================================================
 NEPC_ROOT  <- "/Volumes/Jingjing_Chen/NEPC scRNA dataset"
 ADENO_ROOT <- "/Volumes/Jingjing_Chen/Adenocarcinoma scRNA dataset"
-# cross-dataset results (both groups) — per-dataset results stay in <dataset>/nepc_clustering/
-OUT_CROSS  <- "/Volumes/Jingjing_Chen/NEPC_vs_Adeno_scRNA_results"
+# Results folder (iCloud). Cross-dataset results go to OUT_CROSS.
+ICLOUD     <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719"
+OUT_CROSS  <- file.path(ICLOUD, "NEPC_vs_Adeno_scRNA_results")
+# Per-dataset results (tables, plots and the annotated Seurat .rds, which can be several GB):
+#   NULL  -> <dataset folder>/nepc_clustering/ on the data volume (default, keeps big RDS off iCloud)
+#   a path -> <path>/<group>_<accession>/nepc_clustering/
+PER_DATASET_OUT <- NULL
+dataset_out_dir <- function(ds) {
+  if (is.null(PER_DATASET_OUT)) file.path(ds$dir, "nepc_clustering")
+  else file.path(PER_DATASET_OUT, ds$name, "nepc_clustering")
+}
 
 cfg <- list(
   run_part1 = TRUE,
   run_part2 = TRUE,
   run_part3 = TRUE,
-  reuse_existing = TRUE,          # skip Part 1 for datasets already processed
+  reuse_existing = TRUE,          # skip Part 1 for datasets already processed ...
+  reuse_any_version = FALSE,      # ... only when they were produced by this pipeline version (nepc_pipeline_version.txt)
 
   # ---- Part 1: QC + clustering ----
   min_cells_gene       = 3,
@@ -53,7 +63,8 @@ cfg <- list(
   # Henry et al. 2018 as a Seurat or SingleCellExperiment .rds with a label column).
   prostate_reference_rds   = NULL,
   prostate_reference_label = "cell_type",
-  min_cells_population = 20,      # a population counts for a dataset with at least this many cells
+  min_cells_population = 20,      # coarse tier: a population counts for a dataset with at least this many cells
+  min_cells_population_stromal = 10,  # stromal tier (subsampled, minority populations such as ASPC): lower bar
 
   # ---- Part 1b: stromal tier (ASPC) ----
   run_stromal_tier            = TRUE,

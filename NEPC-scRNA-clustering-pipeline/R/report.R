@@ -24,7 +24,7 @@ write_aspc_report <- function(out_file = file.path(OUT_CROSS, "nepc_ASPC_report.
   for (g in GROUPS) {
     add("\n================ %s ================", g)
     for (ds in group_datasets(g)) {
-      ann <- .rd(file.path(ds$dir, "nepc_clustering", "nepc_cluster_annotation.csv"))
+      ann <- .rd(file.path(dataset_out_dir(ds), "nepc_cluster_annotation.csv"))
       if (is.null(ann)) { add("\n-- %s: no coarse result", ds$name); next }
       add("\n-- %s: %d clusters, %d cells; populations: %s", ds$name, nrow(ann), sum(ann$n_cells),
           paste(sort(unique(ann$population)), collapse = ", "))
